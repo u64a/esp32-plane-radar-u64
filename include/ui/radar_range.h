@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "core/radar_range.h"
+
 namespace ui::radar {
 
 /**
@@ -16,23 +18,10 @@ namespace ui::radar {
  *
  * Outer radius (for aircraft math) is ring-3 distance ÷ 0.75.
  */
-struct RangePreset {
-  /** Distance shown on ring 3 (¾ of outer radius), always stored in km. */
-  float ring3_km;
-  float outer_km;
-};
-
-constexpr float kRing3ToOuterKm = 4.0f / 3.0f;
-
-constexpr RangePreset kRangePresets[] = {
-    {5.0f, 5.0f * kRing3ToOuterKm},
-    {10.0f, 10.0f * kRing3ToOuterKm},
-    {15.0f, 15.0f * kRing3ToOuterKm},
-    {25.0f, 25.0f * kRing3ToOuterKm},
-};
-
-constexpr size_t kRangePresetCount =
-    sizeof(kRangePresets) / sizeof(kRangePresets[0]);
+using core::range::kRangePresetCount;
+using core::range::kRangePresets;
+using core::range::kRing3ToOuterKm;
+using core::range::RangePreset;
 
 /** Load saved range and distance units from flash. Call once after boot. */
 void rangeInit();

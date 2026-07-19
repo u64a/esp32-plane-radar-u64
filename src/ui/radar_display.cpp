@@ -7,6 +7,7 @@
 #include <cstdlib>
 
 #include "config.h"
+#include "core/geo_projection.h"
 #include "hardware/display.h"
 #include "hardware/display_font.h"
 #include "services/adsb_client.h"
@@ -203,17 +204,6 @@ void initPalette() {
                                           radar::kRunwayLabelB);
 }
 
-constexpr float kKmPerDeg = 111.0f;
-
-void offsetKmFromCenter(float lat, float lon, float* dx_km, float* dy_km,
-                        float* dist_km) {
-  *dx_km =
-      static_cast<float>(lon - services::location::lon()) * kKmPerDeg;
-  *dy_km =
-      static_cast<float>(lat - services::location::lat()) * kKmPerDeg;
-  *dist_km = sqrtf((*dx_km) * (*dx_km) + (*dy_km) * (*dy_km));
-}
-
 float innerRingMaxKm() {
   const float outer_km = radar::rangeCurrent().outer_km;
   return outer_km * (static_cast<float>(radar::kGridOuterRadius -
@@ -221,18 +211,15 @@ float innerRingMaxKm() {
                      static_cast<float>(radar::kGridOuterRadius));
 }
 
-/** Flat lat/lon as x/y: 1° ≈ 111 km, north = screen up. */
-void latLonToScreen(float lat, float lon, int* out_x, int* out_y) {
+void offsetKmToScreen(const core::LocalOffsetKm& offset, int* out_x,
+                      int* out_y) {
   const float outer_km = radar::rangeCurrent().outer_km;
   const float px_per_km = static_cast<float>(radar::kGridOuterRadius) / outer_km;
 
-  float dx_km = 0.0f;
-  float dy_km = 0.0f;
-  float dist_km = 0.0f;
-  offsetKmFromCenter(lat, lon, &dx_km, &dy_km, &dist_km);
-
-  *out_x = radar::kCenterX + static_cast<int>(lroundf(dx_km * px_per_km));
-  *out_y = radar::kCenterY - static_cast<int>(lroundf(dy_km * px_per_km));
+  *out_x = radar::kCenterX +
+           static_cast<int>(lroundf(offset.east_km * px_per_km));
+  *out_y = radar::kCenterY -
+           static_cast<int>(lroundf(offset.north_km * px_per_km));
 }
 
 bool isInsideOuterRingKm(float dist_km) { return dist_km <= innerRingMaxKm(); }
@@ -248,23 +235,20 @@ bool isInsideOuterRing(int x, int y) {
   return distSqFromCenter(x, y) <= max_r * max_r;
 }
 
-/** Rim dot from true bearing; always on screen edge (even if target is 50+ km away). */
-bool beyondRingEdgeDotFromLatLon(float lat, float lon, int* out_x, int* out_y) {
-  float dx_km = 0.0f;
-  float dy_km = 0.0f;
-  float dist_km = 0.0f;
-  offsetKmFromCenter(lat, lon, &dx_km, &dy_km, &dist_km);
-  if (dist_km < 0.01f) {
+/** Rim dot from projected bearing; always on screen edge. */
+bool beyondRingEdgeDotFromOffset(const core::LocalOffsetKm& offset, int* out_x,
+                                 int* out_y) {
+  if (offset.distance_km < 0.01f) {
     return false;
   }
-  if (isInsideOuterRingKm(dist_km)) {
+  if (isInsideOuterRingKm(offset.distance_km)) {
     return false;
   }
 
   const int cx = radar::kCenterX;
   const int cy = radar::kCenterY;
   const int rim_r = radar::kCenterX - radar::kBeyondRingScreenMarginPx;
-  const float angle_rad = atan2f(dx_km, dy_km);
+  const float angle_rad = atan2f(offset.east_km, offset.north_km);
 
   *out_x = cx + static_cast<int>(lroundf(sinf(angle_rad) * rim_r));
   *out_y = cy - static_cast<int>(lroundf(cosf(angle_rad) * rim_r));
@@ -491,6 +475,8 @@ void drawAircraft() {
 
   const size_t n = services::adsb::aircraftCount();
   const services::adsb::Aircraft* planes = services::adsb::aircraftList();
+  const core::LocalProjection projection(services::location::lat(),
+                                         services::location::lon());
 
   AircraftDrawItem items[services::adsb::kMaxAircraft];
   BeyondDotDrawItem dots[services::adsb::kMaxAircraft];
@@ -498,15 +484,13 @@ void drawAircraft() {
   size_t dot_count = 0;
 
   for (size_t i = 0; i < n; ++i) {
-    float dx_km = 0.0f;
-    float dy_km = 0.0f;
-    float dist_km = 0.0f;
-    offsetKmFromCenter(planes[i].lat, planes[i].lon, &dx_km, &dy_km, &dist_km);
+    const core::LocalOffsetKm offset =
+        projection.project(planes[i].lat, planes[i].lon);
 
-    if (isInsideOuterRingKm(dist_km)) {
+    if (isInsideOuterRingKm(offset.distance_km)) {
       int x = 0;
       int y = 0;
-      latLonToScreen(planes[i].lat, planes[i].lon, &x, &y);
+      offsetKmToScreen(offset, &x, &y);
       items[draw_count].index = i;
       items[draw_count].x = x;
       items[draw_count].y = y;
@@ -517,8 +501,7 @@ void drawAircraft() {
 
     int dot_x = 0;
     int dot_y = 0;
-    if (!beyondRingEdgeDotFromLatLon(planes[i].lat, planes[i].lon, &dot_x,
-                                     &dot_y)) {
+    if (!beyondRingEdgeDotFromOffset(offset, &dot_x, &dot_y)) {
       continue;
     }
     dots[dot_count].x = dot_x;
