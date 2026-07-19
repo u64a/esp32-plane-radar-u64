@@ -5,9 +5,11 @@
 
 #include <ArduinoJson.h>
 
+#include <cmath>
 #include <cstring>
 
 #include "config.h"
+#include "core/coordinates.h"
 #include "core/time_math.h"
 
 namespace services::adsb {
@@ -207,6 +209,10 @@ size_t aircraftCount() { return s_aircraft_count; }
 const Aircraft* aircraftList() { return s_aircraft; }
 
 bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
+  if (!core::coordinatesValid(center_lat, center_lon) ||
+      !std::isfinite(fetch_radius_km) || fetch_radius_km <= 0.0f) {
+    return false;
+  }
   const float dist_nm = kmToNauticalMiles(fetch_radius_km);
 
   String url = kApiBase;
@@ -266,8 +272,13 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
       continue;
     }
 
-    s_aircraft[n].lat = plane["lat"].as<float>();
-    s_aircraft[n].lon = plane["lon"].as<float>();
+    const float lat = plane["lat"].as<float>();
+    const float lon = plane["lon"].as<float>();
+    if (!core::coordinatesValid(lat, lon)) {
+      continue;
+    }
+    s_aircraft[n].lat = lat;
+    s_aircraft[n].lon = lon;
     s_aircraft[n].nose_deg = pickNoseHeading(plane);
     s_aircraft[n].track_deg = pickTrackHeading(plane);
     s_aircraft[n].gs_knots = pickGroundSpeed(plane);

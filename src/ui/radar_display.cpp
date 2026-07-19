@@ -8,6 +8,7 @@
 
 #include "config.h"
 #include "core/geo_projection.h"
+#include "core/screen_geometry.h"
 #include "hardware/display.h"
 #include "hardware/display_font.h"
 #include "services/adsb_client.h"
@@ -211,80 +212,33 @@ float innerRingMaxKm() {
                      static_cast<float>(radar::kGridOuterRadius));
 }
 
-void offsetKmToScreen(const core::LocalOffsetKm& offset, int* out_x,
-                      int* out_y) {
-  const float outer_km = radar::rangeCurrent().outer_km;
-  const float px_per_km = static_cast<float>(radar::kGridOuterRadius) / outer_km;
-
-  *out_x = radar::kCenterX +
-           static_cast<int>(lroundf(offset.east_km * px_per_km));
-  *out_y = radar::kCenterY -
-           static_cast<int>(lroundf(offset.north_km * px_per_km));
-}
-
-bool isInsideOuterRingKm(float dist_km) { return dist_km <= innerRingMaxKm(); }
-
-int distSqFromCenter(int x, int y) {
-  const int dx = x - radar::kCenterX;
-  const int dy = y - radar::kCenterY;
-  return dx * dx + dy * dy;
-}
-
-bool isInsideOuterRing(int x, int y) {
-  const int max_r = radar::kGridOuterRadius - radar::kAircraftInsideRingInsetPx;
-  return distSqFromCenter(x, y) <= max_r * max_r;
+bool isInsideOuterRingKm(const core::LocalOffsetKm& offset) {
+  return core::isWithinDistanceKm(offset, innerRingMaxKm());
 }
 
 /** Rim dot from projected bearing; always on screen edge. */
 bool beyondRingEdgeDotFromOffset(const core::LocalOffsetKm& offset, int* out_x,
                                  int* out_y) {
-  if (offset.distance_km < 0.01f) {
+  if (out_x == nullptr || out_y == nullptr ||
+      !core::localOffsetValid(offset) || offset.distance_km < 0.01f) {
     return false;
   }
-  if (isInsideOuterRingKm(offset.distance_km)) {
+  if (isInsideOuterRingKm(offset)) {
     return false;
   }
 
-  const int cx = radar::kCenterX;
-  const int cy = radar::kCenterY;
   const int rim_r = radar::kCenterX - radar::kBeyondRingScreenMarginPx;
-  const float angle_rad = atan2f(offset.east_km, offset.north_km);
-
-  *out_x = cx + static_cast<int>(lroundf(sinf(angle_rad) * rim_r));
-  *out_y = cy - static_cast<int>(lroundf(cosf(angle_rad) * rim_r));
+  const core::geometry::ScreenPoint point = core::geometry::pointOnDiscRim(
+      offset.east_km, -offset.north_km,
+      {radar::kCenterX, radar::kCenterY}, rim_r);
+  *out_x = point.x;
+  *out_y = point.y;
   return true;
 }
 
 void drawBeyondRingDot(int x, int y) {
   s_draw->fillSmoothCircle(x, y, radar::kBeyondRingDotRadiusPx,
                            radar::kColorAircraft);
-}
-
-void clipPointToOuterRing(int x0, int y0, int* x1, int* y1) {
-  const int max_r = radar::kGridOuterRadius;
-  const int max_r_sq = max_r * max_r;
-  if (distSqFromCenter(*x1, *y1) <= max_r_sq) {
-    return;
-  }
-
-  const int dx = *x1 - x0;
-  const int dy = *y1 - y0;
-  float t = 1.0f;
-  for (int step = 0; step < 20; ++step) {
-    const int px = x0 + static_cast<int>(lroundf(dx * t));
-    const int py = y0 + static_cast<int>(lroundf(dy * t));
-    if (distSqFromCenter(px, py) <= max_r_sq) {
-      *x1 = px;
-      *y1 = py;
-      return;
-    }
-    t -= 0.05f;
-    if (t <= 0.0f) {
-      *x1 = x0;
-      *y1 = y0;
-      return;
-    }
-  }
 }
 
 int speedLineLengthPx(float gs_knots) {
@@ -350,12 +304,17 @@ void drawSpeedVector(int cx, int cy, float heading_deg, float track_deg,
   const float rad = track_deg * kDegToRad;
   int ex = tip_x + static_cast<int>(lroundf(sinf(rad) * len));
   int ey = tip_y - static_cast<int>(lroundf(cosf(rad) * len));
-  clipPointToOuterRing(tip_x, tip_y, &ex, &ey);
-  if (ex == tip_x && ey == tip_y) {
+  core::geometry::ScreenSegment clipped{};
+  if (!core::geometry::clipSegmentToDisc(
+          {{tip_x, tip_y}, {ex, ey}},
+          {radar::kCenterX, radar::kCenterY}, radar::kGridOuterRadius,
+          &clipped) ||
+      (clipped.start.x == clipped.end.x &&
+       clipped.start.y == clipped.end.y)) {
     return;
   }
-  s_draw->drawWideLine(tip_x, tip_y, ex, ey, radar::kAircraftTrackLineHalfWidth,
-                       color);
+  s_draw->drawWideLine(clipped.start.x, clipped.start.y, clipped.end.x,
+                       clipped.end.y, radar::kAircraftTrackLineHalfWidth, color);
 }
 
 void applyTagStyle() {
@@ -437,13 +396,13 @@ struct AircraftDrawItem {
   size_t index = 0;
   int x = 0;
   int y = 0;
-  int dist_sq = 0;
+  int32_t dist_sq = 0;
 };
 
 struct BeyondDotDrawItem {
   int x = 0;
   int y = 0;
-  int dist_sq = 0;
+  int32_t dist_sq = 0;
 };
 
 void sortDrawItemsFarFirst(AircraftDrawItem* items, size_t count) {
@@ -477,6 +436,9 @@ void drawAircraft() {
   const services::adsb::Aircraft* planes = services::adsb::aircraftList();
   const core::LocalProjection projection(services::location::lat(),
                                          services::location::lon());
+  const float pixels_per_km =
+      static_cast<float>(radar::kGridOuterRadius) /
+      radar::rangeCurrent().outer_km;
 
   AircraftDrawItem items[services::adsb::kMaxAircraft];
   BeyondDotDrawItem dots[services::adsb::kMaxAircraft];
@@ -486,15 +448,22 @@ void drawAircraft() {
   for (size_t i = 0; i < n; ++i) {
     const core::LocalOffsetKm offset =
         projection.project(planes[i].lat, planes[i].lon);
+    if (!core::localOffsetValid(offset)) {
+      continue;
+    }
 
-    if (isInsideOuterRingKm(offset.distance_km)) {
-      int x = 0;
-      int y = 0;
-      offsetKmToScreen(offset, &x, &y);
+    if (isInsideOuterRingKm(offset)) {
+      const core::geometry::ScreenPoint point =
+          core::geometry::clampPointToDisc(
+              core::geometry::offsetToScreen(
+                  offset, {radar::kCenterX, radar::kCenterY}, pixels_per_km),
+              {radar::kCenterX, radar::kCenterY}, radar::kGridOuterRadius);
       items[draw_count].index = i;
-      items[draw_count].x = x;
-      items[draw_count].y = y;
-      items[draw_count].dist_sq = distSqFromCenter(x, y);
+      items[draw_count].x = point.x;
+      items[draw_count].y = point.y;
+      const int64_t distance_sq = core::geometry::squaredDistance(
+          point, {radar::kCenterX, radar::kCenterY});
+      items[draw_count].dist_sq = static_cast<int32_t>(distance_sq);
       ++draw_count;
       continue;
     }
@@ -506,7 +475,9 @@ void drawAircraft() {
     }
     dots[dot_count].x = dot_x;
     dots[dot_count].y = dot_y;
-    dots[dot_count].dist_sq = distSqFromCenter(dot_x, dot_y);
+    const int64_t distance_sq = core::geometry::squaredDistance(
+        {dot_x, dot_y}, {radar::kCenterX, radar::kCenterY});
+    dots[dot_count].dist_sq = static_cast<int32_t>(distance_sq);
     ++dot_count;
   }
 
