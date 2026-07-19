@@ -1,0 +1,18 @@
+{
+  "now": 1784515200,
+  "total": 1,
+  "ac": [
+    {
+      "hex": "7c0001",
+      "flight": "TEST123 ",
+      "lat": -33.9461,
+      "lon": 151.1772,
+      "true_heading": 92.5,
+      "track": 90.0,
+      "gs": 210.0,
+      "alt_baro": 12000,
+      "t": "A320"
+    }
+  ],
+  "msg": "No error"
+}

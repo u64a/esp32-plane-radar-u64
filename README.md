@@ -174,6 +174,23 @@ For a clean Windows build that deletes the project `.pio` directory first:
 .\scripts\clean-build.ps1
 ```
 
+### Native tests
+
+Native tests use PlatformIO's Unity runner and do not require ESP32 hardware or
+firmware libraries:
+
+```powershell
+py -m pip install -r requirements-dev.txt
+.\scripts\setup-native-toolchain.ps1
+.\scripts\native-test.ps1
+```
+
+The setup step explicitly downloads the pinned, signed w64devkit release into
+`$env:LOCALAPPDATA\esp32-plane-radar\native-toolchains`. It verifies the asset
+SHA-256, Authenticode signature, and GCC version before caching it. The test script
+uses that compiler only for its child PlatformIO process; it does not change the
+user or system `PATH`. No Arduino or ESP32 packages are linked into native tests.
+
 ### Initial memory budget
 
 Measured values from a clean `supermini` build:
