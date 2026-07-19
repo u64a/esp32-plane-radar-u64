@@ -153,6 +153,12 @@ src/
 
 ## Build
 
+PlatformIO Core is pinned for local/scripted builds:
+
+```powershell
+py -m pip install -r requirements-dev.txt
+```
+
 ```bash
 pio run -t upload
 pio device monitor
@@ -161,6 +167,40 @@ pio device monitor
 - PlatformIO env: **`supermini`**
 - Serial: **115200** baud
 - USB CDC on boot enabled in `platformio.ini` for the Super Mini
+
+For a clean Windows build that deletes the project `.pio` directory first:
+
+```powershell
+.\scripts\clean-build.ps1
+```
+
+### Initial memory budget
+
+Measured values from a clean `supermini` build:
+
+| Build measurement | Bytes | Basis |
+|-------------------|------:|-------|
+| Linker-reported static RAM | 50,908 | 15.5% of 327,680 bytes; already includes the existing `Aircraft[64]` array (64 × 48 = 3,072 bytes) |
+| Linker-reported firmware flash | 1,238,058 | 39.4% of the 3,145,728-byte application space |
+
+The RAM figures below are explicit planning reservations. The future two-snapshot
+design uses 6,400 bytes total and replaces the existing 3,072-byte aircraft array,
+so only its 3,328-byte increase is added to the measured static-RAM baseline.
+
+| Projected RAM category | Bytes | Basis |
+|------------------------|------:|-------|
+| Current linker-reported static RAM | 50,908 | Measured baseline, including the existing aircraft array |
+| Incremental fixed snapshot storage | 3,328 | 6,400-byte future snapshots minus the existing 3,072-byte array |
+| Single 240×240 RGB565 frame sprite | 115,200 | Required; no second framebuffer |
+| Future bounded parser workspace | 4,608 | 4,096-byte per-object JSON arena plus 512-byte transport scratch |
+| Future static request/result queues | 2,048 | Combined fixed queue-storage ceiling |
+| Provisional disabled-worker stack cap | 8,192 | Worker stays disabled until its real high-water mark is measured on hardware |
+| **Projected accounted RAM** | **184,284** | 50,908 + 3,328 + 115,200 + 4,608 + 2,048 + 8,192 |
+
+This subtotal is a design-accounting check, not a free-heap prediction. It excludes
+framework runtime allocations, Wi-Fi/TLS heap peaks, fragmentation, and
+largest-free-block constraints. Those values and the worker stack high-water mark
+are hardware-only measurements; the worker remains disabled until measured.
 
 ### Web-flashable release image
 
@@ -185,22 +225,6 @@ pio run -t merge -e supermini
 ```
 
 Put the board in download mode (hold **BOOT**, tap **RESET**), then flash with Chrome/Edge over USB.
-
-### CI and releases (GitHub Actions)
-
-| Workflow | When | Output |
-|----------|------|--------|
-| [Build](.github/workflows/build.yml) | Push / PR to `main` | Artifact `plane-radar-supermini` (merged + split `.bin` files, ~90 days) |
-| [Release](.github/workflows/release.yml) | Git tag `v*` (e.g. `v1.0.0`) | GitHub Release asset `plane-radar-v1.0.0.bin` + `.sha256` |
-
-To ship a version users can download:
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-The release workflow builds firmware in CI and attaches the merged image to the release. Download from **Releases** on GitHub, then flash at **0x0** (ESP32-C3, 4 MB).
 
 ## Dependencies
 

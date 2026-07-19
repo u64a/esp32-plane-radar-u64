@@ -70,6 +70,9 @@ void setup() {
 
   bootButtonInit();
   displayInit();
+  const bool frame_buffered = ui::radarDisplayPrepareFrame();
+  Serial.printf("radar: rendering mode: %s\n",
+                frame_buffered ? "frame sprite" : "direct draw");
   if (wifiShowsSetupScreenOnBoot()) {
     statusScreenPortal();
   }
