@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "config.h"
+#include "core/time_math.h"
 
 namespace services::adsb {
 
@@ -30,8 +31,8 @@ void pollNetwork() {
 
 int performGetWithPoll(HTTPClient& http) {
   http.setConnectTimeout(kConnectAttemptMs);
-  const unsigned long deadline = millis() + kRequestTimeoutMs;
-  while (millis() < deadline) {
+  const uint32_t started_ms = millis();
+  while (!core::elapsedAtLeast(millis(), started_ms, kRequestTimeoutMs)) {
     pollNetwork();
     const int code = http.GET();
     if (code > 0) {
@@ -58,8 +59,8 @@ bool readResponseBodyWithPoll(HTTPClient& http, String& payload) {
   }
 
   uint8_t buffer[512];
-  const unsigned long deadline = millis() + kRequestTimeoutMs;
-  while (millis() < deadline) {
+  const uint32_t started_ms = millis();
+  while (!core::elapsedAtLeast(millis(), started_ms, kRequestTimeoutMs)) {
     pollNetwork();
     const int available = stream->available();
     if (available > 0) {

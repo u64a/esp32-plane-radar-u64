@@ -14,28 +14,35 @@
 #endif
 
 #include "config.h"
+#include "core/button_gesture.h"
+#include "core/time_math.h"
 #include "services/radar_location.h"
 #include "ui/radar_range.h"
 #include "ui/status_screens.h"
 
 portMUX_TYPE s_boot_mux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool s_boot_tap_pending = false;
+volatile bool s_boot_long_hold_pending = false;
 volatile bool s_boot_is_down = false;
-volatile unsigned long s_boot_down_ms = 0;
+volatile uint32_t s_boot_down_ms = 0;
 bool s_long_press_handled = false;
 bool s_boot_interrupt_attached = false;
 
 void IRAM_ATTR onBootButtonIsr() {
-  const bool down = digitalRead(config::kBootPin) == LOW;
-  const unsigned long now = millis();
   portENTER_CRITICAL_ISR(&s_boot_mux);
+  const bool down = digitalRead(config::kBootPin) == LOW;
+  const uint32_t now = millis();
   if (down) {
     s_boot_is_down = true;
     s_boot_down_ms = now;
   } else if (s_boot_is_down) {
-    const unsigned long held = now - s_boot_down_ms;
-    if (held >= config::kBootTapMinMs && held < config::kBootResetHoldMs) {
+    const uint32_t held = now - s_boot_down_ms;
+    const core::ButtonEvent event = core::classifyReleasedPress(
+        held, config::kBootTapMinMs, config::kBootResetHoldMs);
+    if (event == core::ButtonEvent::Tap) {
       s_boot_tap_pending = true;
+    } else if (event == core::ButtonEvent::LongHold) {
+      s_boot_long_hold_pending = true;
     }
     s_boot_is_down = false;
   }
@@ -274,8 +281,8 @@ void startStaConnect(const String& ssid, const String& pass) {
 }
 
 bool waitForLinkWithUi(const char* ssid_for_ui, unsigned long attempt_ms) {
-  const unsigned long deadline = millis() + attempt_ms;
-  while (millis() < deadline) {
+  const uint32_t started_ms = millis();
+  while (!core::elapsedAtLeast(millis(), started_ms, attempt_ms)) {
     if (wifiLinkUp()) {
       return true;
     }
@@ -379,26 +386,50 @@ bool bootButtonConsumeTap() {
 }
 
 void bootButtonPollLongPress() {
-  if (wifiBootButtonPressed()) {
-    portENTER_CRITICAL(&s_boot_mux);
+  bool physical_down = false;
+  bool trigger_long_hold = false;
+
+  portENTER_CRITICAL(&s_boot_mux);
+  // ISR and task sample level/time under this mux, so neither can stale the state.
+  physical_down = wifiBootButtonPressed();
+  const uint32_t now_ms = millis();
+  if (physical_down) {
     if (!s_boot_is_down) {
       s_boot_is_down = true;
-      s_boot_down_ms = millis();
+      s_boot_down_ms = now_ms;
     }
-    const unsigned long down_ms = s_boot_down_ms;
-    portEXIT_CRITICAL(&s_boot_mux);
 
-    if (!s_long_press_handled &&
-        millis() - down_ms >= config::kBootResetHoldMs) {
-      s_long_press_handled = true;
-      Serial.println("BOOT held — resetting WiFi");
-      wifiResetCredentialsAndReboot();
+    if (core::classifyActiveHold(now_ms, s_boot_down_ms,
+                                 config::kBootResetHoldMs,
+                                 s_long_press_handled) ==
+        core::ButtonEvent::LongHold) {
+      s_boot_long_hold_pending = true;
     }
-  } else {
-    portENTER_CRITICAL(&s_boot_mux);
+  } else if (s_boot_is_down) {
+    const core::ButtonEvent event = core::classifyReleasedPress(
+        now_ms - s_boot_down_ms, config::kBootTapMinMs,
+        config::kBootResetHoldMs);
+    if (event == core::ButtonEvent::Tap) {
+      s_boot_tap_pending = true;
+    } else if (event == core::ButtonEvent::LongHold) {
+      s_boot_long_hold_pending = true;
+    }
     s_boot_is_down = false;
-    portEXIT_CRITICAL(&s_boot_mux);
+  }
+
+  const bool long_hold_pending = s_boot_long_hold_pending;
+  s_boot_long_hold_pending = false;
+  trigger_long_hold = long_hold_pending && !s_long_press_handled;
+  if (trigger_long_hold) {
+    s_long_press_handled = true;
+  } else if (!physical_down) {
     s_long_press_handled = false;
+  }
+  portEXIT_CRITICAL(&s_boot_mux);
+
+  if (trigger_long_hold) {
+    Serial.println("BOOT held — resetting WiFi");
+    wifiResetCredentialsAndReboot();
   }
 }
 

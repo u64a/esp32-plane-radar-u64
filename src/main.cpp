@@ -6,6 +6,7 @@
 #include <WiFi.h>
 
 #include "config.h"
+#include "core/poll_policy.h"
 #include "hardware/display.h"
 #include "services/adsb_client.h"
 #include "services/radar_location.h"
@@ -17,17 +18,18 @@
 namespace {
 
 bool g_radar_visible = false;
-unsigned long g_wifi_down_since = 0;
-unsigned long g_last_reconnect_ms = 0;
-unsigned long g_last_adsb_fetch_ms = 0;
+core::ReconnectState g_reconnect_state = {};
+core::AdsbPollState g_adsb_poll_state = {};
 
 void showRadarIfConnected() {
   if (WiFi.status() != WL_CONNECTED) {
     g_radar_visible = false;
+    core::adsbRadarHidden(&g_adsb_poll_state);
     return;
   }
   ui::radarDisplayDraw();
   g_radar_visible = true;
+  core::adsbRadarDisplayed(&g_adsb_poll_state);
 }
 
 void onRangeTap() {
@@ -93,28 +95,28 @@ void loop() {
     if (g_radar_visible) {
       Serial.println("WiFi lost — will reconnect");
       g_radar_visible = false;
+      core::adsbRadarHidden(&g_adsb_poll_state);
     }
 
-    if (g_wifi_down_since == 0) {
-      g_wifi_down_since = millis();
-    }
-
-    const unsigned long down_ms = millis() - g_wifi_down_since;
-    if (down_ms >= config::kWifiDownGraceMs &&
-        millis() - g_last_reconnect_ms >= config::kWifiReconnectIntervalMs) {
-      g_last_reconnect_ms = millis();
-      if (wifiReconnect()) {
-        g_wifi_down_since = 0;
+    const uint32_t now_ms = millis();
+    core::reconnectDisconnected(&g_reconnect_state, now_ms);
+    if (core::reconnectAttemptDue(
+            g_reconnect_state, now_ms, config::kWifiDownGraceMs,
+            config::kWifiReconnectIntervalMs)) {
+      const bool connected = wifiReconnect();
+      core::reconnectAttemptCompleted(&g_reconnect_state, millis(), connected);
+      if (connected) {
         showRadarIfConnected();
       }
     }
   } else {
-    g_wifi_down_since = 0;
+    core::reconnectConnected(&g_reconnect_state);
     if (!g_radar_visible) {
       showRadarIfConnected();
-    } else if (millis() - g_last_adsb_fetch_ms >= config::kAdsbFetchIntervalMs) {
-      g_last_adsb_fetch_ms = millis();
+    } else if (core::adsbFetchDue(g_adsb_poll_state, millis(),
+                                  config::kAdsbFetchIntervalMs)) {
       fetchAndDrawAircraft();
+      core::adsbFetchCompleted(&g_adsb_poll_state, millis());
     }
   }
 
