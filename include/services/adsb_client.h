@@ -2,20 +2,12 @@
 
 #include <cstddef>
 
+#include "services/adsb_types.h"
+
 namespace services::adsb {
 
-struct Aircraft {
-  float lat;
-  float lon;
-  float nose_deg;
-  float track_deg;
-  float gs_knots;
-  char callsign[9];
-  char type[5];
-  char alt[12];
-};
-
-constexpr size_t kMaxAircraft = 64;
+// Aircraft, kMaxAircraft, AircraftSnapshot, FetchOutcome, and FetchResult are
+// defined in adsb_types.h and remain the renderer/main compatibility surface.
 
 size_t aircraftCount();
 const Aircraft* aircraftList();
@@ -26,5 +18,13 @@ void setPollFn(PollFn fn);
 
 /** Fetch aircraft within fetch_radius_km of center_lat/lon from adsb.fi. */
 bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km);
+
+/**
+ * Richer Phase 5 seam: performs the same bounded fetch as fetchUpdate() and
+ * returns full outcome detail. On FetchOutcome::Ok the nearest-64 snapshot is
+ * published; every other outcome preserves the prior snapshot byte-for-byte.
+ */
+FetchResult fetchLatest(double center_lat, double center_lon,
+                        float fetch_radius_km);
 
 }  // namespace services::adsb

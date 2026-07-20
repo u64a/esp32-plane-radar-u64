@@ -89,6 +89,15 @@ As range decreases (or aircraft approach), targets move inward; beyond-ring dots
 - Poll interval: `kAdsbFetchIntervalMs` (5 s) in `config.h`
 - Ground aircraft hidden by default (`kAdsbShowGroundAircraft`)
 
+**Transport timeouts** (`config.h`) are cumulative, not fresh per phase:
+
+- `kAdsbConnectTimeoutMs` (8 s) budgets DNS + TCP + TLS **together**: the timer starts before DNS, and only the time left after DNS bounds the socket connect and TLS handshake. Because `WiFiClientSecure::connect(IP, port, host, …)` uses `setTimeout()` for the TCP select and a **separate** `setHandshakeTimeout()` for the handshake, the post-DNS remainder is split into **non-overlapping whole-second TCP and TLS slices** (a conservative ~40 % TCP / ~60 % TLS split favoring the slower handshake, ≥ 1 s each, summed ms ≤ the remainder) — never the full remainder handed to both. If fewer than two whole seconds remain the split is not viable and the connect is classified `Timeout` before it starts, and a *late* success (one reported only after the absolute budget is spent) is rejected with `stop()` + `Timeout` rather than accepted. The resolved IP is reused for an SNI-capable connect, so DNS runs once. **DNS exception:** `WiFi.hostByName()` exposes no timeout, so name resolution *alone* can take up to the ESP-IDF resolver's ~15 s core timeout, which this budget cannot preempt; this is the **only** phase not bounded by the split. Its elapsed time is still charged, so the socket/handshake get only what remains (a fetch that spends the whole budget on DNS returns `Timeout`).
+- `kAdsbOverallTimeoutMs` (10 s) budgets the request send **and** the response decode together; the send draws from it first and only the remainder is passed to the decoder — neither gets a fresh 10 s.
+- `kAdsbStallTimeoutMs` (5 s) is a response-local inactivity cap between received bytes.
+- A clean TLS close (`close_notify`) that delimits a `Connection: close` body is treated as a normal end of stream, not a receive error.
+
+Worst case for one fetch: up to ~15 s of uninterruptible DNS *only if the resolver itself stalls*, then at most the remaining connect budget for TCP + TLS, then at most 10 s shared across send + response.
+
 ## Configuration
 
 Edit **`include/config.h`** for hardware and behavior:
@@ -100,7 +109,7 @@ Edit **`include/config.h`** for hardware and behavior:
 | BOOT | `kBootPin`, `kBootResetHoldMs`, `kBootTapMinMs` |
 | Display SPI | pins, `kDisplayInvert`, `kDisplayRgbOrder`, `kDisplaySpiWriteHz` |
 | Default location | `kDefaultRadarLat`, `kDefaultRadarLon` (until portal overrides) |
-| ADS-B | `kAdsbFetchIntervalMs`, `kAdsbShowGroundAircraft` |
+| ADS-B | `kAdsbFetchIntervalMs`, `kAdsbShowGroundAircraft`; cumulative transport budgets `kAdsbConnectTimeoutMs` / `kAdsbOverallTimeoutMs` / `kAdsbStallTimeoutMs` |
 
 Range presets: `include/ui/radar_range.h` (`kRangePresets`).
 
@@ -191,33 +200,41 @@ SHA-256, Authenticode signature, and GCC version before caching it. The test scr
 uses that compiler only for its child PlatformIO process; it does not change the
 user or system `PATH`. No Arduino or ESP32 packages are linked into native tests.
 
-### Initial memory budget
+### Memory budget
 
-Measured values from a clean `supermini` build:
+Measured with a pinned clean `supermini` build (`scripts\clean-build.ps1`), Phase 5
+bounded ADS-B transport and parser implemented, against the `ea3039f` baseline:
 
-| Build measurement | Bytes | Basis |
-|-------------------|------:|-------|
-| Linker-reported static RAM | 50,908 | 15.5% of 327,680 bytes; already includes the existing `Aircraft[64]` array (64 × 48 = 3,072 bytes) |
-| Linker-reported firmware flash | 1,238,058 | 39.4% of the 3,145,728-byte application space |
+| Build measurement | Baseline `ea3039f` | Phase 5 | Delta |
+|-------------------|------:|------:|------:|
+| Linker-reported static RAM | 50,924 | 61,460 | +10,536 |
+| Linker-reported firmware flash | 1,241,252 | 1,231,868 | −9,384 |
+| `firmware.bin` image | 1,305,200 | 1,296,816 | −8,384 |
+| `firmware-merged.bin` image | 1,370,736 | 1,362,352 | −8,384 |
 
-The RAM figures below are explicit planning reservations. The future two-snapshot
-design uses 6,400 bytes total and replaces the existing 3,072-byte aircraft array,
-so only its 3,328-byte increase is added to the measured static-RAM baseline.
+Flash shrank because Arduino `HTTPClient`, its dynamic-`String` header parser, and the
+whole-payload `String`/`JsonDocument` path were removed. The static RAM increase is the
+fixed, caller-owned Phase 5 workspace (no per-response allocation, no second framebuffer):
 
-| Projected RAM category | Bytes | Basis |
-|------------------------|------:|-------|
-| Current linker-reported static RAM | 50,908 | Measured baseline, including the existing aircraft array |
-| Incremental fixed snapshot storage | 3,328 | 6,400-byte future snapshots minus the existing 3,072-byte array |
-| Single 240×240 RGB565 frame sprite | 115,200 | Required; no second framebuffer |
-| Future bounded parser workspace | 4,608 | 4,096-byte per-object JSON arena plus 512-byte transport scratch |
-| Future static request/result queues | 2,048 | Combined fixed queue-storage ceiling |
-| Provisional disabled-worker stack cap | 8,192 | Worker stays disabled until its real high-water mark is measured on hardware |
-| **Projected accounted RAM** | **184,284** | 50,908 + 3,328 + 115,200 + 4,608 + 2,048 + 8,192 |
+| Fixed workspace (static BSS) | Bytes | Basis |
+|------------------------------|------:|-------|
+| Two `AircraftSnapshot` buffers | 6,160 | `2 × sizeof(AircraftSnapshot)` (double-buffered publish) |
+| ArduinoJson per-object arena | 4,096 | Bounded allocator; `NoMemory` is explicit |
+| Per-object JSON buffer | 2,049 | `kMaxObjectBytes (2,048) + NUL` |
+| HTTP line/header buffer | 513 | Largest header-line limit `+ NUL` |
+| Transport read scratch | 512 | One TLS read unit |
+| Distance side array (`float[64]`) | 256 | Nearest-64 ranking |
+| Source-ordinal side array (`uint16_t[64]`) | 128 | Deterministic tie-break |
+| Buffer indices / revision / poll hook | ~16 | Publish index switch + poll callback |
+| Single 240×240 RGB565 frame sprite | 115,200 | Required; still exactly one, heap-allocated once |
 
-This subtotal is a design-accounting check, not a free-heap prediction. It excludes
-framework runtime allocations, Wi-Fi/TLS heap peaks, fragmentation, and
-largest-free-block constraints. Those values and the worker stack high-water mark
-are hardware-only measurements; the worker remains disabled until measured.
+The two snapshots (6,160 bytes) replace the previous single `Aircraft[64]` array
+(3,072 bytes), so the net static increase attributable to the new fixed buffers is
++10,536 bytes as measured above. Every large buffer is static and caller-owned, so the
+per-fetch **application** stack stays well under 1 KB (small frames plus the parser's
+fixed 16-entry container stack); the only deeper transient stack is ArduinoJson's
+per-object recursion, which is bounded by the JSON depth limit of 16. Wi-Fi/TLS heap
+peaks, fragmentation, and largest-free-block behavior remain hardware-only measurements.
 
 ### Web-flashable release image
 

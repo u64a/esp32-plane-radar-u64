@@ -55,6 +55,28 @@ constexpr float kAdsbFetchRadiusScale = 1.0f;
 /** false = hide aircraft with alt_baro "ground"; true = show them too. */
 constexpr bool kAdsbShowGroundAircraft = false;
 
+// --- ADS-B bounded HTTPS transport (opendata.adsb.fi) ---
+constexpr char kAdsbHost[] = "opendata.adsb.fi";
+constexpr uint16_t kAdsbPort = 443;
+/**
+ * Cumulative DNS + TCP + TLS connect budget for one fetch. The timer starts
+ * before DNS and only the remainder bounds the socket connect and TLS handshake
+ * (each at the core's whole-second granularity). Exception: WiFi.hostByName()
+ * exposes no timeout, so DNS alone may run up to the ESP-IDF resolver's ~15 s
+ * core timeout that this budget cannot preempt; its elapsed time is still
+ * charged here, so the socket/handshake get whatever is left (possibly nothing).
+ */
+constexpr uint32_t kAdsbConnectTimeoutMs = 8000;
+/**
+ * Cumulative request/response budget once connected: it spans BOTH the request
+ * send and the response decode. The send draws from it first and only the
+ * remainder is handed to the decoder -- send and response never each receive a
+ * fresh budget.
+ */
+constexpr uint32_t kAdsbOverallTimeoutMs = 10000;
+/** Response-local max idle gap between received bytes before a stall (Timeout). */
+constexpr uint32_t kAdsbStallTimeoutMs = 5000;
+
 // --- UI colors (RGB565) — status screens ---
 constexpr uint16_t kColorBlack = 0x0000;
 constexpr uint16_t kColorYellow = 0xFFE0;

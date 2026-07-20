@@ -26,6 +26,31 @@ void test_elapsed_before_exact_after_threshold_across_rollover() {
   TEST_ASSERT_EQUAL_UINT32(99U, core::elapsedMs(49U, started));
 }
 
+void test_remaining_budget_saturates_at_exact_expiry() {
+  // No time elapsed yet: the whole budget remains.
+  TEST_ASSERT_EQUAL_UINT32(8000U, core::remainingBudgetMs(1000U, 1000U, 8000U));
+  // Partial elapsed leaves the remainder (3000 ms used of 8000).
+  TEST_ASSERT_EQUAL_UINT32(5000U, core::remainingBudgetMs(4000U, 1000U, 8000U));
+  // Exactly expired (8000 ms elapsed) yields 0, never a wrapped huge value.
+  TEST_ASSERT_EQUAL_UINT32(0U, core::remainingBudgetMs(9000U, 1000U, 8000U));
+  // Over-elapsed also saturates at 0.
+  TEST_ASSERT_EQUAL_UINT32(0U, core::remainingBudgetMs(9500U, 1000U, 8000U));
+  // A zero budget is always exhausted.
+  TEST_ASSERT_EQUAL_UINT32(0U, core::remainingBudgetMs(1000U, 1000U, 0U));
+}
+
+void test_remaining_budget_is_rollover_safe() {
+  constexpr uint32_t started = UINT32_MAX - 100U;  // 100 ms before the wrap
+  constexpr uint32_t now = 49U;  // (UINT32_MAX - 100) + 150 wraps to 49
+  TEST_ASSERT_EQUAL_UINT32(150U, core::elapsedMs(now, started));
+  // 150 ms of a 200 ms budget elapsed across the rollover: 50 ms remains.
+  TEST_ASSERT_EQUAL_UINT32(50U, core::remainingBudgetMs(now, started, 200U));
+  // Exact expiry across the rollover still yields 0.
+  TEST_ASSERT_EQUAL_UINT32(0U, core::remainingBudgetMs(now, started, 150U));
+  // Over-elapsed across the rollover still saturates at 0 (no wrap).
+  TEST_ASSERT_EQUAL_UINT32(0U, core::remainingBudgetMs(now, started, 100U));
+}
+
 void test_coordinates_reject_null_empty_and_whitespace_only() {
   double lat = 12.0;
   double lon = 34.0;
@@ -180,6 +205,8 @@ int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_elapsed_before_exact_after_threshold);
   RUN_TEST(test_elapsed_before_exact_after_threshold_across_rollover);
+  RUN_TEST(test_remaining_budget_saturates_at_exact_expiry);
+  RUN_TEST(test_remaining_budget_is_rollover_safe);
   RUN_TEST(test_coordinates_reject_null_empty_and_whitespace_only);
   RUN_TEST(
       test_coordinates_preserve_leading_whitespace_but_reject_trailing_data);
