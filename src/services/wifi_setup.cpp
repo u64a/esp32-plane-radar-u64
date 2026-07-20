@@ -21,6 +21,7 @@
 #include "core/time_math.h"
 #include "services/radar_location.h"
 #include "services/settings_events.h"
+#include "services/timekeeper.h"
 #include "ui/radar_range.h"
 #include "ui/status_screens.h"
 
@@ -233,7 +234,18 @@ void resetWifiCredentials() {
   eraseWifiCredentials();
   services::location::clear();
   ui::radar::unitsReset();
-  Serial.println("WiFi credentials, location, and units cleared");
+  // Also wipe the dedicated persisted time-floor record so a user can recover
+  // from corrupted/poisoned trust metadata. Surface the outcome honestly: never
+  // claim a clean reset if the floor namespace could not be cleared (the record
+  // may survive and keep an elevated/poisoned floor).
+  const bool floor_cleared = services::timekeeper::clearPersistedFloor();
+  if (floor_cleared) {
+    Serial.println("WiFi credentials, location, units, and time-floor cleared");
+  } else {
+    Serial.println(
+        "WiFi credentials, location, and units cleared; "
+        "WARNING: time-floor record NOT cleared");
+  }
 }
 
 void onConfigPortalApStarted(WiFiManager*) {

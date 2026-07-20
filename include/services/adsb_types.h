@@ -49,6 +49,15 @@ struct AircraftSnapshot {
 // (HttpOutcome::TransportError). It is kept distinct from ParseError so a link
 // interruption (which is transient and should back off briefly) is never
 // conflated with a genuinely malformed HTTP/JSON payload (which is permanent).
+//
+// TimeUnavailable and CertInvalid are Phase 7 fail-closed trust outcomes. They
+// are NOT parse results and must never be reported as Ok. TimeUnavailable means
+// trusted UTC was not established, so the fetch was refused BEFORE any network
+// I/O (it can never trigger an insecure TLS attempt). CertInvalid means the TLS
+// handshake verified the CA chain and hostname but the peer certificate was
+// missing, not yet valid, expired, or malformed at the trusted UTC time -- the
+// application check that stands in for the disabled mbedTLS notBefore/notAfter
+// enforcement; the request body is never sent and the parser is never reached.
 enum class FetchOutcome : uint8_t {
   Ok,
   Timeout,
@@ -62,6 +71,8 @@ enum class FetchOutcome : uint8_t {
   ParseError,
   NoMemory,
   Obsolete,
+  TimeUnavailable,
+  CertInvalid,
 };
 
 struct FetchResult {
@@ -71,6 +82,13 @@ struct FetchResult {
   bool retry_after_present;  // true only when a valid Retry-After delta parsed
   uint32_t retry_after_ms;   // meaningful only when retry_after_present is true
   uint16_t aircraft_count;
+  // CA-authenticated peer leaf certificate notBefore epoch (UTC seconds) for the
+  // persisted-floor ratchet. Non-zero ONLY on a complete FetchOutcome::Ok stamped
+  // by realFetch from the verified peer certificate; 0 in every generic, native,
+  // partial, or failure path (a merely-connected or non-Ok response ratchets
+  // nothing). It is an authenticated value an unauthenticated NTP attacker cannot
+  // choose -- never an SNTP-derived timestamp.
+  int64_t authenticated_cert_not_before_unix;
 };
 
 // Streaming JSON parser limits. Production values live in kDefaultParseLimits;

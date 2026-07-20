@@ -91,6 +91,10 @@ FetchResult runFetch(ByteSource& source, Clock& clock, IdleHandler& idle,
   result.retry_after_present = false;
   result.retry_after_ms = 0;
   result.aircraft_count = 0;
+  // runFetch cannot see the peer certificate (that seam is ESP-only); leave the
+  // authenticated floor candidate at 0 here. Only realFetch, which holds the
+  // verified leaf notBefore, stamps it -- and only on a complete Ok.
+  result.authenticated_cert_not_before_unix = 0;
 
   switch (http.outcome) {
     case HttpOutcome::Timeout:
@@ -133,6 +137,15 @@ FetchResult runFetch(ByteSource& source, Clock& clock, IdleHandler& idle,
   return result;
 }
 
+int64_t authenticatedNotBeforeForResult(FetchOutcome outcome,
+                                        int64_t leaf_not_before_unix) {
+  // Only a complete, fully verified response (Ok) may carry the authenticated
+  // floor candidate. Every other outcome -- a partial body, a transport/parse
+  // failure, or a merely-connected result -- forces 0 so it can never ratchet the
+  // persisted floor.
+  return outcome == FetchOutcome::Ok ? leaf_not_before_unix : 0;
+}
+
 core::PollOutcome pollOutcomeFor(FetchOutcome outcome) {
   switch (outcome) {
     case FetchOutcome::Ok:
@@ -144,6 +157,12 @@ core::PollOutcome pollOutcomeFor(FetchOutcome outcome) {
     case FetchOutcome::TlsFailure:
     case FetchOutcome::TransportFailure:
     case FetchOutcome::Http5xx:
+    case FetchOutcome::TimeUnavailable:
+      // TimeUnavailable is a "not ready yet" refusal: the main loop gates on
+      // trusted time BEFORE calling the transport (serviceAdsb keeps the
+      // immediate latch pending), so this only reaches here via a defense-in-
+      // depth call site. Treat it as transient so it retries once time syncs,
+      // rather than backing off hard or hot-looping.
       return core::PollOutcome::Transient;
     case FetchOutcome::Http429:
       return core::PollOutcome::RateLimited;
@@ -151,6 +170,10 @@ core::PollOutcome pollOutcomeFor(FetchOutcome outcome) {
     case FetchOutcome::ResponseTooLarge:
     case FetchOutcome::ParseError:
     case FetchOutcome::NoMemory:
+    case FetchOutcome::CertInvalid:
+      // CertInvalid is a hard trust failure (a peer cert invalid at trusted UTC,
+      // or a MITM presenting an old/forged cert): back off hard rather than
+      // hammering a misconfigured or hostile endpoint.
       return core::PollOutcome::Permanent;
   }
   return core::PollOutcome::Permanent;  // unreachable; keeps the compiler happy
@@ -186,6 +209,11 @@ bool fetchOutcomeNetworkAbortSensitive(FetchOutcome outcome) {
     case FetchOutcome::ResponseTooLarge:
     case FetchOutcome::NoMemory:
     case FetchOutcome::Obsolete:
+    case FetchOutcome::TimeUnavailable:
+    case FetchOutcome::CertInvalid:
+      // TimeUnavailable and CertInvalid are deterministic trust decisions, not
+      // link-abort artifacts: a spurious Wi-Fi flap does not cause them, so they
+      // must never be reinterpreted as a pause.
       return false;
   }
   return false;  // unreachable; keeps the compiler happy

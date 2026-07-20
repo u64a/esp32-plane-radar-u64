@@ -264,6 +264,10 @@ void test_network_abort_sensitive_classification() {
       fetchOutcomeNetworkAbortSensitive(FetchOutcome::ResponseTooLarge));
   TEST_ASSERT_FALSE(fetchOutcomeNetworkAbortSensitive(FetchOutcome::NoMemory));
   TEST_ASSERT_FALSE(fetchOutcomeNetworkAbortSensitive(FetchOutcome::Obsolete));
+  // Phase 7 trust decisions are deterministic, not link-abort artifacts.
+  TEST_ASSERT_FALSE(
+      fetchOutcomeNetworkAbortSensitive(FetchOutcome::TimeUnavailable));
+  TEST_ASSERT_FALSE(fetchOutcomeNetworkAbortSensitive(FetchOutcome::CertInvalid));
 }
 
 void test_effective_outcome_after_flap() {
@@ -348,6 +352,14 @@ void test_poll_outcome_mapping_covers_every_fetch_outcome() {
                         static_cast<int>(pollOutcomeFor(FetchOutcome::NoMemory)));
   TEST_ASSERT_EQUAL_INT(static_cast<int>(PollOutcome::Obsolete),
                         static_cast<int>(pollOutcomeFor(FetchOutcome::Obsolete)));
+  // TimeUnavailable is a "not ready yet" refusal (transient); CertInvalid is a
+  // hard trust failure that backs off hard (permanent).
+  TEST_ASSERT_EQUAL_INT(
+      static_cast<int>(PollOutcome::Transient),
+      static_cast<int>(pollOutcomeFor(FetchOutcome::TimeUnavailable)));
+  TEST_ASSERT_EQUAL_INT(
+      static_cast<int>(PollOutcome::Permanent),
+      static_cast<int>(pollOutcomeFor(FetchOutcome::CertInvalid)));
 }
 
 void test_publish_outcome_mapping_covers_every_publish_result() {
@@ -369,6 +381,46 @@ void test_publish_outcome_mapping_covers_every_publish_result() {
       static_cast<int>(pollOutcomeForPublish(PublishResult::NoCandidate)));
 }
 
+void test_authenticated_notbefore_is_zero_in_native_runfetch_paths() {
+  // runFetch cannot see the peer certificate (that seam is ESP-only), so it must
+  // ALWAYS leave the authenticated floor candidate at 0 -- on a complete Ok AND
+  // on every failure path. Only realFetch stamps it, and only on Ok.
+  FetchResult ok = fetch(resp(R"({"ac":[{"lat":1,"lon":2}]})"), 4);
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(FetchOutcome::Ok),
+                        static_cast<int>(ok.outcome));
+  TEST_ASSERT_EQUAL_INT64(0, ok.authenticated_cert_not_before_unix);
+
+  // A malformed body (ParseError) also preserves the zero default.
+  FetchResult bad = fetch(resp(R"({"ac":[{"lat":1 "lon":2}]})"), 5);
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(FetchOutcome::ParseError),
+                        static_cast<int>(bad.outcome));
+  TEST_ASSERT_EQUAL_INT64(0, bad.authenticated_cert_not_before_unix);
+}
+
+void test_authenticated_notbefore_stamp_seam() {
+  // The pure stamping seam realFetch uses: only a complete Ok carries the
+  // verified leaf notBefore; every other outcome forces 0 so nothing that did not
+  // fully verify a response can ratchet the persisted floor.
+  const int64_t leaf = 1784592000;  // some CA-signed notBefore epoch
+  TEST_ASSERT_EQUAL_INT64(
+      leaf, authenticatedNotBeforeForResult(FetchOutcome::Ok, leaf));
+
+  const FetchOutcome non_ok[] = {
+      FetchOutcome::Timeout,          FetchOutcome::DnsFailure,
+      FetchOutcome::TlsFailure,       FetchOutcome::TransportFailure,
+      FetchOutcome::Http429,          FetchOutcome::Http5xx,
+      FetchOutcome::HttpOther,        FetchOutcome::ResponseTooLarge,
+      FetchOutcome::ParseError,       FetchOutcome::NoMemory,
+      FetchOutcome::Obsolete,         FetchOutcome::TimeUnavailable,
+      FetchOutcome::CertInvalid,
+  };
+  for (const FetchOutcome o : non_ok) {
+    TEST_ASSERT_EQUAL_INT64(0, authenticatedNotBeforeForResult(o, leaf));
+  }
+  // A zero leaf (e.g. an unverified cert) stays zero even on Ok.
+  TEST_ASSERT_EQUAL_INT64(0, authenticatedNotBeforeForResult(FetchOutcome::Ok, 0));
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_success_with_aircraft_publishes_and_bumps_revision);
@@ -385,5 +437,7 @@ int main(int, char**) {
   RUN_TEST(test_effective_outcome_after_flap);
   RUN_TEST(test_poll_outcome_mapping_covers_every_fetch_outcome);
   RUN_TEST(test_publish_outcome_mapping_covers_every_publish_result);
+  RUN_TEST(test_authenticated_notbefore_is_zero_in_native_runfetch_paths);
+  RUN_TEST(test_authenticated_notbefore_stamp_seam);
   return UNITY_END();
 }

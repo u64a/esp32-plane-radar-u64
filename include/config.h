@@ -120,6 +120,82 @@ static_assert(kRadarStaleMs == core::kDefaultRadarFreshnessPolicy.stale_ms,
 static_assert(kRadarOfflineMs == core::kDefaultRadarFreshnessPolicy.offline_ms,
               "config offline threshold drifted from core freshness policy");
 
+// --- Phase 7: trusted UTC time + verified TLS --------------------------------
+//
+// ADS-B network connections are forbidden until trusted UTC is established after
+// boot. The CA chain and hostname are verified by mbedTLS via the pinned CA
+// bundle (services/adsb_ca_bundle.h); because the pinned ESP32-C3 SDK builds
+// mbedTLS without CONFIG_MBEDTLS_HAVE_TIME_DATE, the app additionally checks the
+// peer certificate's notBefore/notAfter against trusted UTC after the handshake.
+
+// Deterministic release/build epoch floor (UTC seconds) -- NOT __DATE__/__TIME__.
+// Lower bound on plausible "now": SNTP samples earlier than this (minus a small
+// rollback tolerance) are rejected, and every boot must accept a fresh sample at
+// or after this floor before the first ADS-B connection. Corresponds to the
+// Phase 7 release date 2026-07-20T00:00:00Z. Reproducible update procedure:
+//   PLANE_RADAR_RELEASE_EPOCH = 1784505600 = `date -u -d 2026-07-20 +%s`.
+// For a new release bump this constant (or pass -DPLANE_RADAR_RELEASE_EPOCH).
+#ifndef PLANE_RADAR_RELEASE_EPOCH
+#define PLANE_RADAR_RELEASE_EPOCH 1784505600
+#endif
+constexpr int64_t kReleaseEpochFloorUnix = PLANE_RADAR_RELEASE_EPOCH;
+static_assert(kReleaseEpochFloorUnix >= 1704067200,
+              "release epoch floor looks unset/too old (expected >= 2024-01-01)");
+
+// Trusted-time acceptance policy (mirrors core::TimeTrustPolicy). A sample is
+// accepted only within [floor - rollback, floor + future_ceiling]; otherwise the
+// service stays/returns untrusted and ADS-B fetches stay blocked.
+//
+// Rollback tolerance is deliberately small (5 min): a genuine SNTP resync from a
+// disciplined stratum-1/2 source is accurate to well under a second, so the only
+// reason to allow ANY backward slack is bounded jitter between resyncs -- not a
+// clock that runs an hour slow. Anything further below the floor is a rollback or
+// a hostile server and is rejected (fail closed).
+//
+// The future ceiling stays generous (~10 y) so a device that is first powered on
+// long after its build still accepts today's genuine time. This is safe because
+// forward time can no longer be persistently poisoned: the persisted floor
+// advances ONLY to a CA-signed peer leaf certificate's notBefore epoch (never an
+// SNTP-derived value), and only when that authenticated notBefore is at least
+// kTimeFloorMinAdvanceSec (24 h) beyond the stored floor. An unauthenticated NTP
+// attacker cannot choose a CA-signed notBefore, so a spoofed SNTP sample can
+// cause only a non-persistent, in-session DoS -- it can never poison NVS. The
+// CA-authenticated candidate -- not the ceiling -- is the security boundary
+// (proven by the native ratchet tests).
+constexpr int64_t kTimeRollbackToleranceSec = 300;                 // <= 5 min below floor
+constexpr int64_t kTimeFutureCeilingSec = 10LL * 365 * 24 * 3600;   // <= ~10 y above floor
+constexpr uint32_t kTimeSyncTimeoutMs = 30000;                      // SyncPending -> Retry
+constexpr uint32_t kTimeRetryBackoffInitialMs = 15000;             // first Retry wait
+constexpr uint32_t kTimeRetryBackoffMaxMs = 300000;                // Retry wait ceiling (5 min)
+// Maximum age of an accepted sample before trust is revoked and SNTP re-armed.
+// Chosen finite and well below the uint32 millis wrap (~49.7 d) so the derived
+// clock's rollover-safe elapsed stays exact, and comfortably above the normal
+// SNTP resync interval so a healthy device re-anchors long before this fires.
+constexpr uint32_t kTimeTrustedSampleMaxAgeMs = 12UL * 60 * 60 * 1000;  // 12 h
+
+// SNTP: default server is time.cloudflare.com ONLY (adsb.fi is already behind
+// Cloudflare, so this adds no additional operator). Up to two optional
+// compile-time fallbacks, empty by default. DHCP-provided NTP stays disabled.
+constexpr char kSntpServerPrimary[] = "time.cloudflare.com";
+constexpr char kSntpServerFallback1[] = "";  // optional; "" = unused
+constexpr char kSntpServerFallback2[] = "";  // optional; "" = unused
+
+// Persisted CA-authenticated time floor (NVS). Dedicated namespace/key so it
+// never collides with the "radar" / "wifi" / "planeradar" Preferences users.
+// Stored ONLY as a lower bound (never as current time) inside a single versioned,
+// checksummed blob (core::PersistedFloorRecord: version + floor + FNV-1a). The
+// floor value is the CA-signed peer leaf certificate's notBefore epoch from a
+// COMPLETE verified ADS-B response -- an authenticated value an unauthenticated
+// NTP attacker cannot choose. It is written only when that authenticated notBefore
+// advances the stored floor by at least kTimeFloorMinAdvanceSec (24 h), so a
+// same/older/concurrently-served alternate cert neither writes nor rolls back and
+// a genuine cert rotation advances it once. An in-session flash-wear guard caps
+// writes per session; there is NO attacker-controlled cross-reboot time throttle.
+constexpr char kTimeFloorNvsNamespace[] = "timefloor";
+constexpr char kTimeFloorNvsKey[] = "floorrec";                          // versioned blob
+constexpr uint32_t kTimeFloorPersistIntervalMs = 24UL * 60 * 60 * 1000;  // in-session flash-wear guard
+constexpr int64_t kTimeFloorMinAdvanceSec = 24LL * 60 * 60;              // >= 24 h authenticated advance per write
+
 // --- UI colors (RGB565) — status screens ---
 constexpr uint16_t kColorBlack = 0x0000;
 constexpr uint16_t kColorYellow = 0xFFE0;

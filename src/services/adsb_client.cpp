@@ -9,11 +9,14 @@
 #include <cstdio>
 
 #include "config.h"
+#include "core/cert_time.h"
 #include "core/coordinates.h"
 #include "core/time_math.h"
+#include "services/adsb_ca_bundle.h"
 #include "services/adsb_fetch.h"
 #include "services/adsb_transport_esp.h"
 #include "services/settings_events.h"
+#include "services/timekeeper.h"
 
 namespace services::adsb {
 
@@ -44,6 +47,7 @@ FetchResult makeFailure(FetchOutcome outcome) {
   result.retry_after_present = false;
   result.retry_after_ms = 0;
   result.aircraft_count = 0;
+  result.authenticated_cert_not_before_unix = 0;  // no verified cert on a failure
   return result;
 }
 
@@ -85,15 +89,54 @@ FetchResult realFetch(const FetchRequest& request, AircraftSnapshot& out,
   }
 
   WiFiClientSecure client;
-  // Phase 5 temporary policy: Phase 7 replaces this with CA validation + SNTP.
-  client.setInsecure();
+  // Defense in depth: never open a connection until trusted UTC is established
+  // this boot. serviceAdsb() already gates on trusted time, but guarding the
+  // transport too means no future call site can bypass the time requirement.
+  if (!services::timekeeper::trusted()) {
+    return makeFailure(FetchOutcome::TimeUnavailable);
+  }
 
-  const ConnectOutcome connected = espTlsConnect(
-      client, config::kAdsbHost, config::kAdsbPort, config::kAdsbConnectTimeoutMs);
+  // No setInsecure(): the pinned CA bundle is passed straight into the verified
+  // IP+host connect overload so mbedTLS enforces the CA chain and the hostname.
+  const ConnectOutcome connected =
+      espTlsConnect(client, config::kAdsbHost, config::kAdsbPort,
+                    config::kAdsbConnectTimeoutMs, kAdsbCaBundle);
   if (connected != ConnectOutcome::Connected) {
     client.stop();
     return makeFailure(connectFailure(connected));
   }
+
+  // Close the callback TOCTOU / pre-handshake staleness: obtain the DERIVED
+  // trusted timestamp AGAIN here -- AFTER DNS + TCP + the TLS handshake and
+  // immediately before the peer notBefore/notAfter check -- never a value
+  // captured before the connection. If trust expired or was revoked while the
+  // (blocking) handshake ran, or no derived time is available, stop now and
+  // return TimeUnavailable BEFORE any HTTP is sent. No certificate date decision
+  // may use a timestamp captured before the connection existed.
+  const int64_t trusted_now_unix = services::timekeeper::nowUnix();
+  if (trusted_now_unix <= 0) {
+    client.stop();
+    return makeFailure(FetchOutcome::TimeUnavailable);
+  }
+
+  // The handshake verified the CA chain + hostname, but the pinned SDK builds
+  // mbedTLS without notBefore/notAfter enforcement for ANY node. Explicitly walk
+  // the full retained peer chain (leaf + intermediates/cross-certs) and check
+  // every node's validity against the just-derived trusted UTC, failing closed
+  // (missing / not yet valid / expired / malformed node, or an over-long chain)
+  // BEFORE sending any HTTP request, so a wrong date anywhere in the chain never
+  // reaches the parser or the send path. The same seam returns the CA-signed leaf
+  // notBefore epoch ONLY when the whole chain is valid, captured here BEFORE the
+  // send as the authenticated persisted-floor candidate (an unauthenticated NTP
+  // attacker cannot choose it, and an invalid intermediate forces it to 0); it is
+  // only stamped onto a complete Ok below.
+  const core::CertVerification peer =
+      espVerifyPeerCertValidity(client, trusted_now_unix);
+  if (core::certValidityBlocksFetch(peer.validity)) {
+    client.stop();
+    return makeFailure(FetchOutcome::CertInvalid);
+  }
+  const int64_t authenticated_leaf_not_before_unix = peer.not_before_unix;
 
   EspMillisClock clock;
   EspPollIdle idle(s_poll_fn);
@@ -136,9 +179,15 @@ FetchResult realFetch(const FetchRequest& request, AircraftSnapshot& out,
   workspace.distances = s_distances;
   workspace.ordinals = s_ordinals;
 
-  const FetchResult result = runFetch(
+  FetchResult result = runFetch(
       source, clock, idle, request.lat, request.lon, parse_options,
       kDefaultHttpLimits, deadlines, workspace, out, request.settings_revision);
+  // Stamp the authenticated floor candidate ONLY on a complete Ok (a partial or
+  // failed response, even over a verified connection, must ratchet nothing). The
+  // value is the CA-signed leaf notBefore captured before the send -- never an
+  // SNTP-derived timestamp.
+  result.authenticated_cert_not_before_unix = authenticatedNotBeforeForResult(
+      result.outcome, authenticated_leaf_not_before_unix);
   client.stop();
   return result;
 }

@@ -46,6 +46,15 @@ FetchResult runFetch(ByteSource& source, Clock& clock, IdleHandler& idle,
 // 429 is RateLimited; all remaining errors are Permanent.
 core::PollOutcome pollOutcomeFor(FetchOutcome outcome);
 
+// Resolve the CA-authenticated peer notBefore to stamp onto a fetch result: only
+// a complete FetchOutcome::Ok may carry the verified leaf notBefore, so every
+// other outcome (partial, failure, merely-connected) forces 0 -- nothing that did
+// not fully verify a response can ever ratchet the persisted floor. Pure and
+// native-testable; realFetch calls it after runFetch with the leaf notBefore it
+// captured from the verified peer certificate before sending.
+int64_t authenticatedNotBeforeForResult(FetchOutcome outcome,
+                                        int64_t leaf_not_before_unix);
+
 // Map the explicit result of a two-step publishCandidate() onto the poll-policy
 // class. Only Published is a real success; ObsoleteRevision is a successful
 // fetch discarded for a stale revision (Obsolete, streak untouched, prior

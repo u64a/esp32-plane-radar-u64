@@ -7,6 +7,9 @@
 
 #include <WiFiClientSecure.h>
 
+#include <cstdint>
+
+#include "core/cert_time.h"
 #include "services/adsb_transport.h"
 
 namespace services::adsb {
@@ -56,10 +59,39 @@ class EspPollIdle : public IdleHandler {
 // TlsFailure. Exception: WiFi.hostByName() has no timeout knob, so DNS may run up
 // to the ESP-IDF resolver's ~15 s core timeout that connect_timeout_ms cannot
 // preempt. This connect call blocks; the poll callback cannot run inside it.
-// Phase 5 keeps the caller's explicit insecure policy (no CA); Phase 7 will pass
-// CA material through the connect overload.
+// TLS trust (Phase 7): pass the pinned CA bundle (services/adsb_ca_bundle.h) as
+// ca_bundle. Because it is non-null and setInsecure() is NEVER called, mbedTLS
+// runs with MBEDTLS_SSL_VERIFY_REQUIRED and verifies BOTH the CA chain and the
+// hostname (host drives SNI and CN/SAN verification). There is no insecure
+// fallback: a chain/hostname failure returns TlsFailure and the body is never
+// sent. Callers MUST additionally call espVerifyPeerCertValidity() before
+// sending, because the pinned SDK disables mbedTLS notBefore/notAfter checks.
 ConnectOutcome espTlsConnect(WiFiClientSecure& client, const char* host,
-                             uint16_t port, uint32_t connect_timeout_ms);
+                             uint16_t port, uint32_t connect_timeout_ms,
+                             const char* ca_bundle);
+
+// After a verified handshake, walk the FULL retained peer certificate chain (leaf
+// plus every peer-supplied intermediate / cross-cert, via mbedtls_x509_crt::next)
+// and classify every node's validity at now_unix (trusted UTC epoch seconds),
+// returning the whole-chain validity AND the CA-signed leaf notBefore epoch
+// (core::CertVerification). This performs the explicit notBefore/notAfter
+// enforcement that the pinned mbedTLS build omits for EVERY node
+// (CONFIG_MBEDTLS_HAVE_TIME_DATE is disabled), not just the leaf. A missing/empty
+// chain, any not-yet-valid / expired / malformed (or inverted-window) node, or a
+// chain longer than core::kMaxPeerChainLen is treated as {Malformed, ...} so the
+// caller fails closed. The head pointer is fetched once and the walk makes no
+// further SSL call and no allocation. not_before_unix is meaningful only when
+// validity == Valid, i.e. only when the WHOLE chain is Valid (0 for any invalid
+// node, including an invalid intermediate under a valid leaf), so the caller may
+// feed it straight into the authenticated persisted-floor ratchet without further
+// trust checks -- an invalid intermediate forces a 0 floor candidate. The caller
+// must reject the connection (stop + fail) whenever core::certValidityBlocksFetch()
+// is true, BEFORE sending any HTTP request. NOTE: getPeerCertificate() does not
+// expose the locally pinned trust anchor that actually terminated verification,
+// so this enforces the dates of what the PEER supplied; the pinned root's own
+// identity/validity is guaranteed offline by scripts/verify-ca-bundle.ps1.
+core::CertVerification espVerifyPeerCertValidity(WiFiClientSecure& client,
+                                                 int64_t now_unix);
 
 // Send the whole request, tolerating partial writes and yielding on back-pressure.
 bool espSendAll(WiFiClientSecure& client, const uint8_t* data, size_t length,

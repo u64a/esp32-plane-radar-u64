@@ -3,7 +3,9 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <mbedtls/ssl.h>  // MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY
+#include <mbedtls/x509_crt.h>  // mbedtls_x509_crt, mbedtls_x509_time
 
+#include "core/cert_time.h"
 #include "core/connect_budget.h"
 #include "core/time_math.h"
 
@@ -46,7 +48,8 @@ ReadStatus EspTlsByteSource::read(uint8_t* buffer, size_t capacity,
 uint32_t EspMillisClock::nowMs() const { return millis(); }
 
 ConnectOutcome espTlsConnect(WiFiClientSecure& client, const char* host,
-                             uint16_t port, uint32_t connect_timeout_ms) {
+                             uint16_t port, uint32_t connect_timeout_ms,
+                             const char* ca_bundle) {
   // The connect budget (DNS + TCP + TLS) starts here, BEFORE DNS, so resolution
   // time is charged against it and the socket/handshake only get what remains.
   const uint32_t started = millis();
@@ -78,11 +81,12 @@ ConnectOutcome espTlsConnect(WiFiClientSecure& client, const char* host,
   client.setHandshakeTimeout(split.tls_seconds);  // TLS handshake ceiling (s)
 
   // Reuse the already-resolved address (NO second DNS lookup) while still
-  // sending SNI via the public IP+host overload. Phase 5 policy is explicit
-  // insecure with no fallback: the caller has called setInsecure(), so CA/cert/
-  // key are null here. Phase 7 seam -- pass real CA material (and enable
-  // verification) through these three arguments to add TLS trust later.
-  const int ok = client.connect(address, port, host, nullptr, nullptr, nullptr);
+  // sending SNI via the public IP+host overload. Pass the pinned CA bundle as
+  // the 4th argument and NEVER call setInsecure(): mbedTLS therefore runs with
+  // MBEDTLS_SSL_VERIFY_REQUIRED and verifies the CA chain plus the hostname
+  // (host drives SNI and CN/SAN verification). The IP+host overload is required
+  // here so the certificate is checked against `host`, not the IP address.
+  const int ok = client.connect(address, port, host, ca_bundle, nullptr, nullptr);
 
   // Classify against the ORIGINAL absolute budget: a success reported only after
   // the budget is spent is a late success and must not be honored (it would
@@ -103,6 +107,46 @@ ConnectOutcome espTlsConnect(WiFiClientSecure& client, const char* host,
       return ConnectOutcome::TlsFailure;
   }
   return ConnectOutcome::TlsFailure;  // unreachable: switch is exhaustive
+}
+
+core::CertVerification espVerifyPeerCertValidity(WiFiClientSecure& client,
+                                                 int64_t now_unix) {
+  // The pinned SDK builds mbedTLS WITHOUT CONFIG_MBEDTLS_HAVE_TIME_DATE, so the
+  // handshake enforces neither the leaf's nor any intermediate's notBefore/
+  // notAfter. Enforce them here on the FULL retained peer chain (leaf + every
+  // peer-supplied intermediate / cross-cert), so an expired or not-yet-valid
+  // intermediate the peer presented is rejected too -- not just the leaf.
+  //
+  // getPeerCertificate() returns the retained peer leaf
+  // (CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE is enabled in the pinned SDK) and
+  // each mbedtls_x509_crt::next is the next certificate the peer sent. The
+  // trusted UTC anchor was derived AFTER the handshake and is applied uniformly
+  // to every node. We obtain the head pointer with a SINGLE getPeerCertificate()
+  // call and then make NO further SSL API call and NO allocation while walking:
+  // each iteration only reads the already-parsed mbedtls_x509_time fields and
+  // copies them into the Arduino-free accumulator. The walk is bounded by
+  // core::kMaxPeerChainLen so a cyclic or absurdly long ::next list cannot spin;
+  // if a node still remains past the bound the chain fails closed as Malformed.
+  // certChainFinalize returns the CA-signed leaf notBefore ONLY when EVERY node
+  // is Valid, so an invalid intermediate forces the authenticated floor to 0.
+  core::CertChainAccumulator acc;
+  core::certChainBegin(&acc, now_unix);
+  for (const mbedtls_x509_crt* node = client.getPeerCertificate();
+       node != nullptr; node = node->next) {
+    // mbedtls_x509_time is already broken-down UTC; copy each field into the
+    // core type so the comparison AND leaf notBefore extraction stay testable.
+    const core::CertDateTime not_before{
+        node->valid_from.year, node->valid_from.mon, node->valid_from.day,
+        node->valid_from.hour, node->valid_from.min, node->valid_from.sec};
+    const core::CertDateTime not_after{
+        node->valid_to.year, node->valid_to.mon, node->valid_to.day,
+        node->valid_to.hour, node->valid_to.min, node->valid_to.sec};
+    if (!core::certChainAddNode(&acc, not_before, not_after)) {
+      break;  // chain longer than kMaxPeerChainLen: stop; finalize fails closed
+    }
+  }
+  // Null/empty chain naturally yields count == 0 here -> Malformed (fail closed).
+  return core::certChainFinalize(&acc);
 }
 
 bool espSendAll(WiFiClientSecure& client, const uint8_t* data, size_t length,

@@ -15,11 +15,13 @@
 #include "core/frame_render.h"
 #include "core/poll_policy.h"
 #include "core/radar_data_state.h"
+#include "core/time_trust.h"
 #include "hardware/display.h"
 #include "services/adsb_client.h"
 #include "services/adsb_fetch.h"
 #include "services/radar_location.h"
 #include "services/settings_events.h"
+#include "services/timekeeper.h"
 #include "services/wifi_setup.h"
 #include "ui/radar_display.h"
 #include "ui/radar_range.h"
@@ -156,7 +158,12 @@ const char* publishName(services::adsb::PublishResult result) {
 // changed during the blocking I/O, and publishes only against the still-current
 // revision.
 void serviceAdsb() {
-  if (!core::adsbFetchDue(g_poll, millis())) {
+  // Defense in depth: hold the (possibly immediate) fetch latch pending until
+  // trusted UTC is established this boot. adsbFetchAllowed() does NOT mutate poll
+  // state, so a pending immediate-fetch survives untrusted time and fires on the
+  // first loop after trust. ADS-B connections are forbidden before trusted UTC.
+  if (!core::adsbFetchAllowed(core::adsbFetchDue(g_poll, millis()),
+                              services::timekeeper::trusted())) {
     return;
   }
 
@@ -198,6 +205,15 @@ void serviceAdsb() {
   bool published_success = false;
   core::PollOutcome outcome;
   if (candidate.fetch.outcome == services::adsb::FetchOutcome::Ok) {
+    // A complete, CA + hostname + date verified response arrived (runFetch only
+    // returns Ok after a full 200 body decode). Offer to ratchet the persisted
+    // floor using the CA-signed peer leaf notBefore stamped on the result -- an
+    // authenticated value an unauthenticated NTP attacker cannot choose (NOT
+    // SNTP-derived time). This counts even if publication is skipped for a stale
+    // revision, because the fetch itself was fully verified. It is NEVER gated on
+    // a mere TCP/TLS connect.
+    services::timekeeper::noteVerifiedCertFloor(
+        candidate.fetch.authenticated_cert_not_before_unix, completed_ms);
     publish_result =
         services::adsb::publishCandidate(candidate.handle, current_revision);
     outcome = services::adsb::pollOutcomeForPublish(publish_result);
@@ -305,6 +321,9 @@ void setup() {
   services::location::init();
   ui::radar::rangeInit();
   services::adsb::setPollFn(wifiLoop);
+  // Seed the trusted-time service (reads/validates the persisted floor, registers
+  // the SNTP callback). Starts UNTRUSTED; ADS-B is gated until a fresh sample.
+  services::timekeeper::init();
 
   // Register the filtered Wi-Fi disconnect event callback BEFORE any network
   // setup so a mid-fetch disconnect that auto-reconnects is still counted.
@@ -334,6 +353,11 @@ void loop() {
   applyPendingSettings(millis());
   wifiLoop();
   applyPendingSettings(millis());
+
+  // Advance the non-blocking trusted-time state machine before servicing ADS-B
+  // so serviceAdsb() sees the freshest trust state (and fetches immediately on
+  // the first loop after trust is established).
+  services::timekeeper::update(wifiConnected(), millis());
 
   if (wifiConnected()) {
     serviceConnected();
