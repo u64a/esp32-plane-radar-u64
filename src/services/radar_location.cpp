@@ -46,15 +46,17 @@ double lat() { return s_lat; }
 
 double lon() { return s_lon; }
 
-bool saveFromStrings(const char* lat_str, const char* lon_str) {
+core::CoordinateSaveResult saveFromStrings(const char* lat_str,
+                                           const char* lon_str) {
   double lat = 0.0;
   double lon = 0.0;
-  if (!core::parseCoordinates(lat_str, lon_str, &lat, &lon)) {
-    return false;
+  const core::CoordinateSaveResult result =
+      core::classifyCoordinateSave(lat_str, lon_str, s_lat, s_lon, &lat, &lon);
+  if (result == core::CoordinateSaveResult::Changed) {
+    persist(lat, lon);
+    Serial.printf("Radar location saved: %.6f, %.6f\n", lat, lon);
   }
-  persist(lat, lon);
-  Serial.printf("Radar location saved: %.6f, %.6f\n", lat, lon);
-  return true;
+  return result;
 }
 
 void clear() {

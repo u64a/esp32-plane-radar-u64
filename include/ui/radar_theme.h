@@ -88,6 +88,18 @@ constexpr uint8_t kRunwayB = 170;
 constexpr uint8_t kRunwayLabelR = 110;
 constexpr uint8_t kRunwayLabelG = 210;
 constexpr uint8_t kRunwayLabelB = 230;
+/** Warning yellow for the compact STALE status badge. */
+constexpr uint8_t kWarningR = 255;
+constexpr uint8_t kWarningG = 220;
+constexpr uint8_t kWarningB = 0;
+
+/** Compact status badge: fill-background padding (mirrors the scale label). */
+constexpr int kStatusLabelPadX = 3;
+constexpr int kStatusLabelPadY = 2;
+/** Keep the padded status rectangle this many px inside the radar disc. */
+constexpr int kStatusDiscInsetPx = 3;
+/** Vertical gap between the status rect bottom and the center-dot disc top. */
+constexpr int kStatusCenterClearPx = 3;
 
 extern uint16_t kColorBackground;
 extern uint16_t kColorGrid;
@@ -99,5 +111,6 @@ extern uint16_t kColorTagType;
 extern uint16_t kColorTagAltitude;
 extern uint16_t kColorRunway;
 extern uint16_t kColorRunwayLabel;
+extern uint16_t kColorWarning;
 
 }  // namespace ui::radar

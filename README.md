@@ -11,7 +11,7 @@ Firmware for an **ESP32-C3 Super Mini** and a **1.28″ round GC9A01** display (
 1. **Wi‑Fi setup** (if needed) — captive portal on AP **`PlaneRadar-Setup`**
 2. **Radar** — live aircraft from [adsb.fi](https://opendata.adsb.fi/) on a sonar-style grid
 
-After Wi‑Fi is saved, the device reconnects automatically; the radar runs in the main loop with periodic ADS-B updates (~5 s).
+After Wi‑Fi is saved, the device reconnects automatically; the radar runs in the main loop and refreshes on a **3 s completion‑relative** ADS‑B poll, backing off on errors and ageing to a stale/offline state when data stops arriving.
 
 ## Controls (BOOT, GPIO 9, active LOW)
 
@@ -86,7 +86,7 @@ As range decreases (or aircraft approach), targets move inward; beyond-ring dots
 
 - Source: `https://opendata.adsb.fi/api/v3/`
 - Fetch radius: `ui::radar::fetchRadiusKm()` — scales with the active preset to roughly the screen edge (so rim dots have data)
-- Poll interval: `kAdsbFetchIntervalMs` (5 s) in `config.h`
+- Poll schedule: **completion-relative** — the next fetch is timed from the previous fetch's *completion*, not its start, so a slow request never stacks. Normal cadence is `kAdsbSuccessIntervalMs` (**3 s**, equal to `kAdsbFetchIntervalMs`); errors back off (see **Poll backoff, freshness & offline** below)
 - Ground aircraft hidden by default (`kAdsbShowGroundAircraft`)
 
 **Transport timeouts** (`config.h`) are cumulative, not fresh per phase:
@@ -94,9 +94,31 @@ As range decreases (or aircraft approach), targets move inward; beyond-ring dots
 - `kAdsbConnectTimeoutMs` (8 s) budgets DNS + TCP + TLS **together**: the timer starts before DNS, and only the time left after DNS bounds the socket connect and TLS handshake. Because `WiFiClientSecure::connect(IP, port, host, …)` uses `setTimeout()` for the TCP select and a **separate** `setHandshakeTimeout()` for the handshake, the post-DNS remainder is split into **non-overlapping whole-second TCP and TLS slices** (a conservative ~40 % TCP / ~60 % TLS split favoring the slower handshake, ≥ 1 s each, summed ms ≤ the remainder) — never the full remainder handed to both. If fewer than two whole seconds remain the split is not viable and the connect is classified `Timeout` before it starts, and a *late* success (one reported only after the absolute budget is spent) is rejected with `stop()` + `Timeout` rather than accepted. The resolved IP is reused for an SNI-capable connect, so DNS runs once. **DNS exception:** `WiFi.hostByName()` exposes no timeout, so name resolution *alone* can take up to the ESP-IDF resolver's ~15 s core timeout, which this budget cannot preempt; this is the **only** phase not bounded by the split. Its elapsed time is still charged, so the socket/handshake get only what remains (a fetch that spends the whole budget on DNS returns `Timeout`).
 - `kAdsbOverallTimeoutMs` (10 s) budgets the request send **and** the response decode together; the send draws from it first and only the remainder is passed to the decoder — neither gets a fresh 10 s.
 - `kAdsbStallTimeoutMs` (5 s) is a response-local inactivity cap between received bytes.
-- A clean TLS close (`close_notify`) that delimits a `Connection: close` body is treated as a normal end of stream, not a receive error.
+- A clean TLS close (`close_notify`) that delimits a `Connection: close` body is treated as a normal end of stream, not a receive error. A **premature** end of stream or read error (a body cut short of its `Content-Length`/chunk framing) is a `TransportError`, mapped to a **transient** `TransportFailure` — a network read/EOF abort is never conflated with a genuinely malformed HTTP/JSON payload (which stays a permanent `ParseError`).
 
 Worst case for one fetch: up to ~15 s of uninterruptible DNS *only if the resolver itself stalls*, then at most the remaining connect budget for TCP + TLS, then at most 10 s shared across send + response.
+
+### Poll backoff, freshness & offline
+
+The main loop schedules ADS-B polls **from each fetch's completion** and classifies the outcome (`config.h` mirrors the canonical `core::kDefaultAdsbPollPolicy`):
+
+| Outcome | Next fetch | Transient streak |
+|---------|-----------|------------------|
+| Success (incl. empty aircraft list) | `kAdsbSuccessIntervalMs` (3 s) | reset to 0 |
+| Transient — timeout / DNS / TLS / transport read-EOF / HTTP 5xx | shared backoff `5 → 10 → 20 → 40 → 60 → 60 s` (`kAdsbTransientInitialMs`…`kAdsbTransientCapMs`) | +1 (saturating) |
+| Rate-limited — HTTP 429 | `Retry-After` clamped to `[kAdsbRetryAfterMinMs, kAdsbRetryAfterMaxMs]` (5 s…5 min), else `kAdsbRateDefaultMs` (60 s) | untouched |
+| Permanent — other HTTP / too-large / parse / no-memory | `kAdsbPermanentBackoffMs` (5 min) | untouched |
+| Obsolete — a successful response discarded because the query revision changed mid-flight | success cadence (3 s) | untouched |
+
+Only a genuine success resets the shared transient streak. A **range** or **location** change forces one immediate fetch for the new query revision (miles/runway toggles are visual-only and never do); the in-flight response for the old revision is discarded, and the previously published snapshot is preserved and hidden until fresh data arrives.
+
+**Freshness** is measured from the last successful publish for the current query revision:
+
+- **Live** → **Stale** at `kRadarStaleMs` (15 s): targets are retained and flagged `STALE <age>s`.
+- **Stale** → **Offline** at `kRadarOfflineMs` (60 s): targets are hidden; the grid remains.
+- **Loading** (no success yet) becomes **Offline** at 60 s. A published zero-aircraft list is **Live** (not Offline).
+
+**Wi-Fi drop** pauses fetches but never hides the radar: the last targets keep showing with a `NO WIFI` badge and age to Stale/Offline normally, and a drop is **not** counted as an ADS-B failure. On reconnect the radar redraws and one immediate fetch is forced (the transient streak is preserved). A drop that occurs **and auto-reconnects entirely inside one blocking fetch** is caught even though `WiFi.status()` reads connected before and after: a filtered `ARDUINO_EVENT_WIFI_STA_DISCONNECTED` callback advances a lock-free 32-bit disconnect counter (registered once before network setup; the callback only bumps the atomic — no logging, drawing, or allocation), and the loop compares that counter before each fetch with its value after all post-fetch pumps. A detected mid-fetch flap forces one immediate refresh afterward (surviving the in-flight completion even if the link is already back), and — unless the fetch fully published a success — a link-interruption-sensitive outcome (timeout / DNS / TLS / transport read-EOF, and a plausibly-truncated parse error) is resolved as a pause so the spurious drop never advances the transient or permanent backoff. If the link is still down, polling stays paused and the immediate latch survives until reconnect. The frame is redrawn only on real changes — initial display, a settings change, a Wi-Fi edge, a fetch/publish, or a freshness transition — plus the `LOADING` dots animating every 500 ms and the `STALE` age ticking each second; Live/Offline frames are not redrawn continuously.
 
 ## Configuration
 
@@ -109,7 +131,7 @@ Edit **`include/config.h`** for hardware and behavior:
 | BOOT | `kBootPin`, `kBootResetHoldMs`, `kBootTapMinMs` |
 | Display SPI | pins, `kDisplayInvert`, `kDisplayRgbOrder`, `kDisplaySpiWriteHz` |
 | Default location | `kDefaultRadarLat`, `kDefaultRadarLon` (until portal overrides) |
-| ADS-B | `kAdsbFetchIntervalMs`, `kAdsbShowGroundAircraft`; cumulative transport budgets `kAdsbConnectTimeoutMs` / `kAdsbOverallTimeoutMs` / `kAdsbStallTimeoutMs` |
+| ADS-B | `kAdsbFetchIntervalMs`, `kAdsbShowGroundAircraft`; cumulative transport budgets `kAdsbConnectTimeoutMs` / `kAdsbOverallTimeoutMs` / `kAdsbStallTimeoutMs`; poll backoff `kAdsbSuccessIntervalMs` / `kAdsbTransientInitialMs` / `kAdsbTransientCapMs` / `kAdsbRateDefaultMs` / `kAdsbRetryAfterMinMs` / `kAdsbRetryAfterMaxMs` / `kAdsbPermanentBackoffMs`; freshness `kRadarStaleMs` / `kRadarOfflineMs` |
 
 Range presets: `include/ui/radar_range.h` (`kRangePresets`).
 
@@ -211,6 +233,29 @@ bounded ADS-B transport and parser implemented, against the `ea3039f` baseline:
 | Linker-reported firmware flash | 1,241,252 | 1,231,868 | −9,384 |
 | `firmware.bin` image | 1,305,200 | 1,296,816 | −8,384 |
 | `firmware-merged.bin` image | 1,370,736 | 1,362,352 | −8,384 |
+
+**Phase 6 runtime integration** (deterministic `RadarDisplayModel` frames, completion-relative
+poll backoff, data freshness, and the settings query/visual seams) adds only a small,
+fixed cost over Phase 5, measured with the same pinned clean build:
+
+| Build measurement | Phase 5 | Phase 6 | Δ vs Phase 5 |
+|-------------------|------:|------:|------:|
+| Linker-reported static RAM | 61,460 | 61,588 | +128 |
+| Linker-reported firmware flash | 1,231,868 | 1,236,204 | +4,336 |
+| `firmware.bin` image | 1,296,816 | 1,302,432 | +5,616 |
+| `firmware-merged.bin` image | 1,362,352 | 1,367,968 | +5,616 |
+
+The +128 B static RAM is a handful of runtime latches (freshness, poll, reconnect,
+last-rendered frame-key state, and the lock-free Wi-Fi disconnect-sequence counter); there
+is **no** new per-frame or per-fetch allocation. The
+radar still composites into **exactly one** 240×240 RGB565 frame sprite (heap-allocated once),
+and each frame is a `RadarDisplayModel` passed by const reference — the published aircraft are
+referenced through a copy-free `SnapshotView` (pointer + count + revision), never copied. The
+deepest render frame is the pre-existing `drawAircraftFromSnapshot` (≈2.0 KB of on-stack
+nearest-64 ranking arrays); the new main-loop/render frames are small (`loop` 128 B,
+`renderIfNeeded` 128 B, `renderFrame` 160 B, `radarDisplayDraw` 80 B, measured via
+`-fstack-usage`), so the application stack stays well within the Arduino loop-task budget.
+Wi-Fi/TLS heap peaks and largest-free-block behavior remain hardware-only measurements.
 
 Flash shrank because Arduino `HTTPClient`, its dynamic-`String` header parser, and the
 whole-payload `String`/`JsonDocument` path were removed. The static RAM increase is the

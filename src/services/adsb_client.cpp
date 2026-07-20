@@ -13,6 +13,7 @@
 #include "core/time_math.h"
 #include "services/adsb_fetch.h"
 #include "services/adsb_transport_esp.h"
+#include "services/settings_events.h"
 
 namespace services::adsb {
 
@@ -20,11 +21,10 @@ namespace {
 
 constexpr float kKmPerNm = 1.852f;
 
-// Double-buffered snapshots: aircraftList() reads the active one while a fetch
-// fills the inactive one. Publishing is a single index switch.
-AircraftSnapshot s_snapshots[2] = {};
-uint8_t s_active = 0;
-uint32_t s_revision = 0;
+// Two-slot double-buffered publication store. aircraftList() reads the active
+// snapshot while a fetch fills the inactive one; publication is a single index
+// switch. Replaces the former hand-rolled s_snapshots/s_active/s_revision trio.
+SnapshotStore s_store;
 
 // Fixed per-fetch workspace (documented in the README RAM budget).
 uint8_t s_http_scratch[kTransportScratchBytes];
@@ -41,6 +41,7 @@ FetchResult makeFailure(FetchOutcome outcome) {
   result.outcome = outcome;
   result.http_status = -1;
   result.bytes_received = 0;
+  result.retry_after_present = false;
   result.retry_after_ms = 0;
   result.aircraft_count = 0;
   return result;
@@ -58,32 +59,28 @@ FetchOutcome connectFailure(ConnectOutcome outcome) {
   }
 }
 
-}  // namespace
-
-void setPollFn(PollFn fn) { s_poll_fn = fn; }
-
-size_t aircraftCount() { return s_snapshots[s_active].count; }
-
-const Aircraft* aircraftList() { return s_snapshots[s_active].aircraft; }
-
-FetchResult fetchLatest(double center_lat, double center_lon,
-                        float fetch_radius_km) {
-  if (!core::coordinatesValid(center_lat, center_lon) ||
-      !std::isfinite(fetch_radius_km) || fetch_radius_km <= 0.0f) {
+// Arduino-side fetch seam handed to SnapshotStore::fetchCandidate. It performs
+// the bounded HTTPS request into the caller-owned inactive snapshot `out` and
+// returns the FetchResult; it never publishes. `ctx` is unused (workspace and
+// poll hook are file-scope statics).
+FetchResult realFetch(const FetchRequest& request, AircraftSnapshot& out,
+                      void* /*ctx*/) {
+  if (!core::coordinatesValid(request.lat, request.lon) ||
+      !std::isfinite(request.radius_km) || request.radius_km <= 0.0f) {
     return makeFailure(FetchOutcome::ParseError);
   }
-  const float dist_nm = fetch_radius_km / kKmPerNm;
+  const float dist_nm = request.radius_km / kKmPerNm;
 
-  char request[256];
+  char http_request[256];
   const int req_len = std::snprintf(
-      request, sizeof(request),
+      http_request, sizeof(http_request),
       "GET /api/v3/lat/%.6f/lon/%.6f/dist/%.1f HTTP/1.1\r\n"
       "Host: %s\r\n"
       "Accept: application/json\r\n"
       "Accept-Encoding: identity\r\n"
       "Connection: close\r\n\r\n",
-      center_lat, center_lon, static_cast<double>(dist_nm), config::kAdsbHost);
-  if (req_len <= 0 || req_len >= static_cast<int>(sizeof(request))) {
+      request.lat, request.lon, static_cast<double>(dist_nm), config::kAdsbHost);
+  if (req_len <= 0 || req_len >= static_cast<int>(sizeof(http_request))) {
     return makeFailure(FetchOutcome::ParseError);
   }
 
@@ -105,7 +102,7 @@ FetchResult fetchLatest(double center_lat, double center_lon,
   // of it, and only what remains is handed to the decoder -- send and response
   // do NOT each get a fresh kAdsbOverallTimeoutMs.
   const uint32_t overall_started = clock.nowMs();
-  if (!espSendAll(client, reinterpret_cast<const uint8_t*>(request),
+  if (!espSendAll(client, reinterpret_cast<const uint8_t*>(http_request),
                   static_cast<size_t>(req_len), clock, idle,
                   config::kAdsbOverallTimeoutMs)) {
     client.stop();
@@ -121,7 +118,6 @@ FetchResult fetchLatest(double center_lat, double center_lon,
     return makeFailure(FetchOutcome::Timeout);
   }
 
-  const uint8_t inactive = s_active ^ 1;
   EspTlsByteSource source(client);
   const ParseOptions parse_options{kDefaultParseLimits,
                                    config::kAdsbShowGroundAircraft};
@@ -140,20 +136,76 @@ FetchResult fetchLatest(double center_lat, double center_lon,
   workspace.distances = s_distances;
   workspace.ordinals = s_ordinals;
 
-  const FetchResult result =
-      runFetch(source, clock, idle, center_lat, center_lon, parse_options,
-               kDefaultHttpLimits, deadlines, workspace, s_snapshots[inactive],
-               s_revision + 1);
+  const FetchResult result = runFetch(
+      source, clock, idle, request.lat, request.lon, parse_options,
+      kDefaultHttpLimits, deadlines, workspace, out, request.settings_revision);
   client.stop();
+  return result;
+}
 
-  if (result.outcome == FetchOutcome::Ok) {
-    s_revision += 1;
-    s_active = inactive;  // publish with one index switch
+}  // namespace
+
+void setPollFn(PollFn fn) { s_poll_fn = fn; }
+
+size_t aircraftCount() { return s_store.aircraftCount(); }
+
+const Aircraft* aircraftList() { return s_store.aircraftList(); }
+
+SnapshotView publishedSnapshot() { return s_store.view(); }
+
+CandidateResult fetchCandidate(double center_lat, double center_lon,
+                               float fetch_radius_km,
+                               uint32_t settings_revision) {
+  const FetchRequest request{center_lat, center_lon, fetch_radius_km,
+                             settings_revision};
+  return s_store.fetchCandidate(request, &realFetch, nullptr);
+}
+
+PublishResult publishCandidate(const CandidateHandle& handle,
+                               uint32_t current_settings_revision) {
+  return s_store.publishCandidate(handle, current_settings_revision);
+}
+
+FetchResult fetchLatest(double center_lat, double center_lon,
+                        float fetch_radius_km) {
+  // Compatibility path for the current main loop. Bind the fetch to the settings
+  // revision in effect *before* the (potentially slow) request instead of a
+  // hardcoded zero, so a location/range change mid-fetch is detected.
+  const uint32_t query_revision = services::settings::revision();
+  const CandidateResult candidate =
+      fetchCandidate(center_lat, center_lon, fetch_radius_km, query_revision);
+  FetchResult result = candidate.fetch;
+  if (result.outcome != FetchOutcome::Ok) {
+    return result;  // transport/parse failure: nothing to publish; cause is kept
+  }
+
+  // Re-read the revision after the fetch and publish only against the current
+  // one. A slow fetch may span a settings change; publishing then would overwrite
+  // fresh data with a stale query, so it is rejected instead.
+  const uint32_t current_revision = services::settings::revision();
+  switch (publishCandidate(candidate.handle, current_revision)) {
+    case PublishResult::Published:
+      break;  // active snapshot switched; result stays Ok
+    case PublishResult::ObsoleteRevision:
+      // Successful fetch, but the query is stale: report it explicitly as
+      // Obsolete (a "nothing published" result) rather than Ok or ParseError.
+      result.outcome = FetchOutcome::Obsolete;
+      break;
+    case PublishResult::InvalidHandle:
+    case PublishResult::NoCandidate:
+      // Unreachable in this synchronous wrapper (the handle we just issued is the
+      // sole outstanding candidate). Kept explicit and non-publishing: never
+      // report Ok for a publish that did not happen.
+      result.outcome = FetchOutcome::ParseError;
+      break;
   }
   return result;
 }
 
 bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
+  // True only when a fresh snapshot was actually published for the current
+  // revision; an Obsolete (stale) or failed fetch returns false so the caller
+  // does not redraw stale data.
   return fetchLatest(center_lat, center_lon, fetch_radius_km).outcome ==
          FetchOutcome::Ok;
 }

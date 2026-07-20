@@ -28,31 +28,48 @@ constexpr size_t kMaxAircraft = 64;
 
 // Double-buffered publish target. Never returned or queued by value; callers
 // fill an inactive instance by reference and publish with one index switch.
+// settings_revision records the runtime settings revision (location/radar range)
+// this snapshot was fetched for, so a stale in-flight response can be discarded
+// instead of published against a newer revision.
 struct AircraftSnapshot {
   Aircraft aircraft[kMaxAircraft];
   uint16_t count;
-  uint32_t source_revision;
+  uint32_t settings_revision;
 };
 
-// Every terminal result of a fetch. All error causes are explicit.
+// Every terminal result of a fetch. All error causes are explicit. Obsolete is
+// not a fetch error: it marks a fetch that itself succeeded (Ok) but whose
+// candidate was rejected at publish time because the settings revision advanced
+// while the request was in flight. The compatibility wrapper returns it so a
+// stale-but-successful fetch is reported as "nothing published" instead of being
+// mislabeled Ok or ParseError; runFetch itself never returns it.
+//
+// TransportFailure is a network read/EOF failure below the HTTP grammar: a byte
+// source error or a premature end of stream that framed no complete response
+// (HttpOutcome::TransportError). It is kept distinct from ParseError so a link
+// interruption (which is transient and should back off briefly) is never
+// conflated with a genuinely malformed HTTP/JSON payload (which is permanent).
 enum class FetchOutcome : uint8_t {
   Ok,
   Timeout,
   DnsFailure,
   TlsFailure,
+  TransportFailure,
   Http429,
   Http5xx,
   HttpOther,
   ResponseTooLarge,
   ParseError,
   NoMemory,
+  Obsolete,
 };
 
 struct FetchResult {
   FetchOutcome outcome;
   int http_status;
   uint32_t bytes_received;  // decoded body bytes, independent of framing
-  uint32_t retry_after_ms;
+  bool retry_after_present;  // true only when a valid Retry-After delta parsed
+  uint32_t retry_after_ms;   // meaningful only when retry_after_present is true
   uint16_t aircraft_count;
 };
 

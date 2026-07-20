@@ -98,7 +98,7 @@ void test_success_with_aircraft_publishes_and_bumps_revision() {
   TEST_ASSERT_EQUAL_INT(static_cast<int>(FetchOutcome::Ok), static_cast<int>(r.outcome));
   TEST_ASSERT_EQUAL_UINT16(1, r.aircraft_count);
   TEST_ASSERT_EQUAL_UINT16(1, g_b.snapshots[g_active].count);
-  TEST_ASSERT_EQUAL_UINT32(g_revision, g_b.snapshots[g_active].source_revision);
+  TEST_ASSERT_EQUAL_UINT32(g_revision, g_b.snapshots[g_active].settings_revision);
 }
 
 void test_empty_success_publishes_once() {
@@ -191,13 +191,28 @@ void test_status_mapping_with_retry_after() {
   TEST_ASSERT_EQUAL_INT(static_cast<int>(FetchOutcome::HttpOther), static_cast<int>(fetch(statusResp(204), 5).outcome));
   FetchResult r429 = fetch(statusResp(429, "Retry-After: 12\r\n"), 5);
   TEST_ASSERT_EQUAL_INT(static_cast<int>(FetchOutcome::Http429), static_cast<int>(r429.outcome));
+  TEST_ASSERT_TRUE(r429.retry_after_present);
   TEST_ASSERT_EQUAL_UINT32(12000, r429.retry_after_ms);
   FetchResult r503 = fetch(statusResp(503, "Retry-After: 5\r\n"), 5);
   TEST_ASSERT_EQUAL_INT(static_cast<int>(FetchOutcome::Http5xx), static_cast<int>(r503.outcome));
+  TEST_ASSERT_TRUE(r503.retry_after_present);
   TEST_ASSERT_EQUAL_UINT32(5000, r503.retry_after_ms);
   FetchResult r500 = fetch(statusResp(500), 5);
   TEST_ASSERT_EQUAL_INT(static_cast<int>(FetchOutcome::Http5xx), static_cast<int>(r500.outcome));
+  TEST_ASSERT_FALSE(r500.retry_after_present);
   TEST_ASSERT_EQUAL_UINT32(0, r500.retry_after_ms);
+  // Presence bit distinguishes a header value of 0 from an absent header.
+  FetchResult r429_zero = fetch(statusResp(429, "Retry-After: 0\r\n"), 5);
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(FetchOutcome::Http429), static_cast<int>(r429_zero.outcome));
+  TEST_ASSERT_TRUE(r429_zero.retry_after_present);
+  TEST_ASSERT_EQUAL_UINT32(0, r429_zero.retry_after_ms);
+  FetchResult r429_absent = fetch(statusResp(429), 5);
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(FetchOutcome::Http429), static_cast<int>(r429_absent.outcome));
+  TEST_ASSERT_FALSE(r429_absent.retry_after_present);
+  // A malformed/date Retry-After is treated as absent (presence bit false).
+  FetchResult r429_date = fetch(statusResp(429, "Retry-After: Wed, 21 Oct 2099 07:28:00 GMT\r\n"), 5);
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(FetchOutcome::Http429), static_cast<int>(r429_date.outcome));
+  TEST_ASSERT_FALSE(r429_date.retry_after_present);
 }
 
 void test_one_byte_reads_and_split_offsets() {
@@ -208,6 +223,150 @@ void test_one_byte_reads_and_split_offsets() {
     TEST_ASSERT_EQUAL_INT(static_cast<int>(FetchOutcome::Ok), static_cast<int>(r.outcome));
     TEST_ASSERT_EQUAL_UINT16(2, g_b.snapshots[g_active].count);
   }
+}
+
+void test_premature_eof_maps_to_transport_failure() {
+  // Seed a prior published snapshot to prove the failure preserves it.
+  fetch(resp(R"({"ac":[{"lat":10,"lon":20,"flight":"KEEP"}]})"), 5);
+  const uint8_t saved_active = g_active;
+  const uint32_t saved_rev = g_revision;
+
+  // Content-Length claims 9 body bytes but the stream ends after 4: a premature
+  // EOF is a network read failure (HttpOutcome::TransportError). It must map to
+  // FetchOutcome::TransportFailure (transient), NOT ParseError (permanent), so a
+  // mid-fetch link drop is never conflated with genuinely malformed JSON.
+  const std::string truncated =
+      "HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n{\"ac";
+  FetchResult r = fetch(truncated, 5);
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(FetchOutcome::TransportFailure),
+                        static_cast<int>(r.outcome));
+  TEST_ASSERT_EQUAL_UINT8(saved_active, g_active);  // nothing published
+  TEST_ASSERT_EQUAL_UINT32(saved_rev, g_revision);
+  TEST_ASSERT_EQUAL_STRING("KEEP", g_b.snapshots[g_active].aircraft[0].callsign);
+}
+
+void test_network_abort_sensitive_classification() {
+  // Link-interruption-sensitive: the network read/abort family plus ParseError
+  // (a truncated body from a dropped link is indistinguishable from bad JSON).
+  TEST_ASSERT_TRUE(fetchOutcomeNetworkAbortSensitive(FetchOutcome::Timeout));
+  TEST_ASSERT_TRUE(fetchOutcomeNetworkAbortSensitive(FetchOutcome::DnsFailure));
+  TEST_ASSERT_TRUE(fetchOutcomeNetworkAbortSensitive(FetchOutcome::TlsFailure));
+  TEST_ASSERT_TRUE(
+      fetchOutcomeNetworkAbortSensitive(FetchOutcome::TransportFailure));
+  TEST_ASSERT_TRUE(fetchOutcomeNetworkAbortSensitive(FetchOutcome::ParseError));
+  // Server-attributable / content-limit / non-failure: the link stayed up long
+  // enough to frame a full response (or there is no failure at all).
+  TEST_ASSERT_FALSE(fetchOutcomeNetworkAbortSensitive(FetchOutcome::Ok));
+  TEST_ASSERT_FALSE(fetchOutcomeNetworkAbortSensitive(FetchOutcome::Http429));
+  TEST_ASSERT_FALSE(fetchOutcomeNetworkAbortSensitive(FetchOutcome::Http5xx));
+  TEST_ASSERT_FALSE(fetchOutcomeNetworkAbortSensitive(FetchOutcome::HttpOther));
+  TEST_ASSERT_FALSE(
+      fetchOutcomeNetworkAbortSensitive(FetchOutcome::ResponseTooLarge));
+  TEST_ASSERT_FALSE(fetchOutcomeNetworkAbortSensitive(FetchOutcome::NoMemory));
+  TEST_ASSERT_FALSE(fetchOutcomeNetworkAbortSensitive(FetchOutcome::Obsolete));
+}
+
+void test_effective_outcome_after_flap() {
+  using core::PollOutcome;
+  auto po = [](PollOutcome o) { return static_cast<int>(o); };
+
+  // No flap: the base class passes through untouched, whatever it is.
+  TEST_ASSERT_EQUAL_INT(
+      po(PollOutcome::Permanent),
+      po(effectiveOutcomeAfterFlap(FetchOutcome::ParseError,
+                                   PollOutcome::Permanent, false, false)));
+  TEST_ASSERT_EQUAL_INT(
+      po(PollOutcome::Transient),
+      po(effectiveOutcomeAfterFlap(FetchOutcome::Timeout,
+                                   PollOutcome::Transient, false, false)));
+
+  // Flap + fully published success: stays Success (caller still forces the
+  // immediate refresh separately).
+  TEST_ASSERT_EQUAL_INT(
+      po(PollOutcome::Success),
+      po(effectiveOutcomeAfterFlap(FetchOutcome::Ok, PollOutcome::Success, true,
+                                   true)));
+
+  // Flap + non-published link-sensitive failure -> Obsolete (pause, no streak).
+  TEST_ASSERT_EQUAL_INT(
+      po(PollOutcome::Obsolete),
+      po(effectiveOutcomeAfterFlap(FetchOutcome::TransportFailure,
+                                   PollOutcome::Transient, false, true)));
+  TEST_ASSERT_EQUAL_INT(
+      po(PollOutcome::Obsolete),
+      po(effectiveOutcomeAfterFlap(FetchOutcome::Timeout,
+                                   PollOutcome::Transient, false, true)));
+  // Flap + ParseError (base Permanent) -> Obsolete: a truncation is plausible.
+  TEST_ASSERT_EQUAL_INT(
+      po(PollOutcome::Obsolete),
+      po(effectiveOutcomeAfterFlap(FetchOutcome::ParseError,
+                                   PollOutcome::Permanent, false, true)));
+
+  // Flap + non-link failure (server responded fully): base passes through.
+  TEST_ASSERT_EQUAL_INT(
+      po(PollOutcome::Transient),
+      po(effectiveOutcomeAfterFlap(FetchOutcome::Http5xx,
+                                   PollOutcome::Transient, false, true)));
+  TEST_ASSERT_EQUAL_INT(
+      po(PollOutcome::RateLimited),
+      po(effectiveOutcomeAfterFlap(FetchOutcome::Http429,
+                                   PollOutcome::RateLimited, false, true)));
+  TEST_ASSERT_EQUAL_INT(
+      po(PollOutcome::Permanent),
+      po(effectiveOutcomeAfterFlap(FetchOutcome::HttpOther,
+                                   PollOutcome::Permanent, false, true)));
+}
+
+void test_poll_outcome_mapping_covers_every_fetch_outcome() {
+  using core::PollOutcome;
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PollOutcome::Success),
+                        static_cast<int>(pollOutcomeFor(FetchOutcome::Ok)));
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PollOutcome::Transient),
+                        static_cast<int>(pollOutcomeFor(FetchOutcome::Timeout)));
+  TEST_ASSERT_EQUAL_INT(
+      static_cast<int>(PollOutcome::Transient),
+      static_cast<int>(pollOutcomeFor(FetchOutcome::DnsFailure)));
+  TEST_ASSERT_EQUAL_INT(
+      static_cast<int>(PollOutcome::Transient),
+      static_cast<int>(pollOutcomeFor(FetchOutcome::TlsFailure)));
+  TEST_ASSERT_EQUAL_INT(
+      static_cast<int>(PollOutcome::Transient),
+      static_cast<int>(pollOutcomeFor(FetchOutcome::TransportFailure)));
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PollOutcome::Transient),
+                        static_cast<int>(pollOutcomeFor(FetchOutcome::Http5xx)));
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PollOutcome::RateLimited),
+                        static_cast<int>(pollOutcomeFor(FetchOutcome::Http429)));
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PollOutcome::Permanent),
+                        static_cast<int>(pollOutcomeFor(FetchOutcome::HttpOther)));
+  TEST_ASSERT_EQUAL_INT(
+      static_cast<int>(PollOutcome::Permanent),
+      static_cast<int>(pollOutcomeFor(FetchOutcome::ResponseTooLarge)));
+  TEST_ASSERT_EQUAL_INT(
+      static_cast<int>(PollOutcome::Permanent),
+      static_cast<int>(pollOutcomeFor(FetchOutcome::ParseError)));
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PollOutcome::Permanent),
+                        static_cast<int>(pollOutcomeFor(FetchOutcome::NoMemory)));
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(PollOutcome::Obsolete),
+                        static_cast<int>(pollOutcomeFor(FetchOutcome::Obsolete)));
+}
+
+void test_publish_outcome_mapping_covers_every_publish_result() {
+  using core::PollOutcome;
+  // Only a real publication is a success.
+  TEST_ASSERT_EQUAL_INT(
+      static_cast<int>(PollOutcome::Success),
+      static_cast<int>(pollOutcomeForPublish(PublishResult::Published)));
+  // A successful fetch discarded for a stale revision is Obsolete (streak intact).
+  TEST_ASSERT_EQUAL_INT(
+      static_cast<int>(PollOutcome::Obsolete),
+      static_cast<int>(pollOutcomeForPublish(PublishResult::ObsoleteRevision)));
+  // Internal publish-path faults never published: back off hard (Permanent).
+  TEST_ASSERT_EQUAL_INT(
+      static_cast<int>(PollOutcome::Permanent),
+      static_cast<int>(pollOutcomeForPublish(PublishResult::InvalidHandle)));
+  TEST_ASSERT_EQUAL_INT(
+      static_cast<int>(PollOutcome::Permanent),
+      static_cast<int>(pollOutcomeForPublish(PublishResult::NoCandidate)));
 }
 
 int main(int, char**) {
@@ -221,5 +380,10 @@ int main(int, char**) {
   RUN_TEST(test_oversized_object_after_64_retained_fails_without_publishing);
   RUN_TEST(test_status_mapping_with_retry_after);
   RUN_TEST(test_one_byte_reads_and_split_offsets);
+  RUN_TEST(test_premature_eof_maps_to_transport_failure);
+  RUN_TEST(test_network_abort_sensitive_classification);
+  RUN_TEST(test_effective_outcome_after_flap);
+  RUN_TEST(test_poll_outcome_mapping_covers_every_fetch_outcome);
+  RUN_TEST(test_publish_outcome_mapping_covers_every_publish_result);
   return UNITY_END();
 }

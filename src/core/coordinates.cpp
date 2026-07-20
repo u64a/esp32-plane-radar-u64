@@ -47,4 +47,26 @@ bool parseCoordinates(const char* lat_text, const char* lon_text, double* lat_ou
   return true;
 }
 
+CoordinateSaveResult classifyCoordinateSave(const char* lat_text,
+                                            const char* lon_text,
+                                            double current_lat,
+                                            double current_lon, double* lat_out,
+                                            double* lon_out) {
+  double lat = 0.0;
+  double lon = 0.0;
+  if (!parseCoordinates(lat_text, lon_text, &lat, &lon)) {
+    return CoordinateSaveResult::Invalid;
+  }
+  if (lat_out != nullptr) {
+    *lat_out = lat;
+  }
+  if (lon_out != nullptr) {
+    *lon_out = lon;
+  }
+  if (lat == current_lat && lon == current_lon) {
+    return CoordinateSaveResult::Unchanged;
+  }
+  return CoordinateSaveResult::Changed;
+}
+
 }  // namespace core

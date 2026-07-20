@@ -3,6 +3,8 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 
+#include <atomic>
+#include <cstdint>
 #include <cstdio>
 
 #include <Preferences.h>
@@ -15,8 +17,10 @@
 
 #include "config.h"
 #include "core/button_gesture.h"
+#include "core/coordinates.h"
 #include "core/time_math.h"
 #include "services/radar_location.h"
+#include "services/settings_events.h"
 #include "ui/radar_range.h"
 #include "ui/status_screens.h"
 
@@ -60,6 +64,30 @@ void initBootButton() {
 }
 
 namespace {
+
+// --- Wi-Fi STA disconnect sequence (mid-fetch flap detection) ---------------
+// A disconnect can occur and auto-reconnect entirely inside one blocking fetch
+// (DNS/TCP/TLS/HTTP), leaving WiFi.status() reading WL_CONNECTED both before and
+// after so the level-based edge in the main loop misses it. This monotonic
+// counter is bumped once per ARDUINO_EVENT_WIFI_STA_DISCONNECTED from the
+// Arduino event task and read from the main-loop task; a lock-free 32-bit atomic
+// (always lock-free on ESP32/ESP32-C3) keeps the single-writer/single-reader
+// counter race-free without a critical section. Comparing a value captured
+// before a fetch with one captured after reveals the flap.
+std::atomic<uint32_t> s_wifi_disconnect_seq{0};
+bool s_wifi_events_registered = false;
+
+// Pinned Arduino-ESP32 2.0.14 WiFiEventCb signature: void(arduino_event_id_t).
+// Registered filtered to ARDUINO_EVENT_WIFI_STA_DISCONNECTED, so that is the
+// only id delivered; the guard keeps it correct should the filter ever widen.
+// Runs in the Arduino event task: it MUST NOT log, draw, or allocate -- it only
+// performs one relaxed atomic increment (ordering is immaterial for a free-
+// running counter sampled across a long blocking fetch).
+void onWifiStaDisconnectedEvent(arduino_event_id_t event) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    s_wifi_disconnect_seq.fetch_add(1U, std::memory_order_relaxed);
+  }
+}
 
 /** Separate from planeradar prefs (rangeInit) to avoid NVS handle conflicts. */
 constexpr char kWifiPrefsNamespace[] = "wifi";
@@ -107,9 +135,16 @@ void refreshPortalParamDefaults() {
 }
 
 void onPortalParamsSaved() {
-  if (!services::location::saveFromStrings(s_param_lat.getValue(),
-                                           s_param_lon.getValue())) {
+  // Callback contract: update state/flags only, never draw. Location is part of
+  // the query, so an effective change marks the settings revision; miles and
+  // runways are visual-only and never do.
+  const core::CoordinateSaveResult location_result =
+      services::location::saveFromStrings(s_param_lat.getValue(),
+                                          s_param_lon.getValue());
+  if (location_result == core::CoordinateSaveResult::Invalid) {
     Serial.println("Invalid lat/lon in portal — keeping previous location");
+  } else if (location_result == core::CoordinateSaveResult::Changed) {
+    services::settings::markQueryChanged();
   }
   ui::radar::saveMilesFromPortal(s_param_miles.getValue());
   ui::radar::saveRunwaysFromPortal(s_param_runways.getValue());
@@ -374,6 +409,20 @@ bool wifiBootButtonPressed() {
 }
 
 void bootButtonInit() { initBootButton(); }
+
+void wifiRegisterEventHandlers() {
+  if (s_wifi_events_registered) {
+    return;  // register exactly once, before any network setup
+  }
+  // Filtered plain-function-pointer callback (no std::function, no capture, no
+  // allocation in the delivery path). Registration happens once at boot.
+  WiFi.onEvent(&onWifiStaDisconnectedEvent, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  s_wifi_events_registered = true;
+}
+
+uint32_t wifiDisconnectSeq() {
+  return s_wifi_disconnect_seq.load(std::memory_order_relaxed);
+}
 
 bool bootButtonConsumeTap() {
   portENTER_CRITICAL(&s_boot_mux);

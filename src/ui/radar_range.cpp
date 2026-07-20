@@ -5,6 +5,8 @@
 #include <Preferences.h>
 #include <cstring>
 
+#include "services/settings_events.h"
+
 namespace ui::radar {
 
 namespace {
@@ -69,9 +71,17 @@ void rangeInit() {
   s_prefs.end();
 }
 
-void rangeNext() {
+bool rangeNext() {
+  const uint8_t previous = s_range_index;
   s_range_index = core::range::nextIndex(s_range_index);
   saveRangeIndex();
+  if (s_range_index == previous) {
+    return false;
+  }
+  // Radar range is part of the query: mark an effective settings change so the
+  // main loop forces one immediate fetch and resets freshness for the new revision.
+  services::settings::markQueryChanged();
+  return true;
 }
 
 const RangePreset& rangeCurrent() { return kRangePresets[s_range_index]; }
@@ -90,14 +100,27 @@ bool useMiles() { return s_use_miles; }
 bool showRunways() { return s_show_runways; }
 
 void saveMilesFromPortal(const char* checkbox_value) {
-  s_use_miles = portalCheckboxChecked(checkbox_value);
+  const bool next = portalCheckboxChecked(checkbox_value);
+  if (next == s_use_miles) {
+    return;  // no effective change: persist nothing, latch no redraw
+  }
+  s_use_miles = next;
   saveUseMiles();
+  // Distance units are visual-only: mark a redraw-only change (never a query
+  // revision bump, freshness reset, or backoff change).
+  services::settings::markVisualChanged();
   Serial.printf("Distance units: %s\n", s_use_miles ? "miles" : "km");
 }
 
 void saveRunwaysFromPortal(const char* checkbox_value) {
-  s_show_runways = portalCheckboxChecked(checkbox_value);
+  const bool next = portalCheckboxChecked(checkbox_value);
+  if (next == s_show_runways) {
+    return;  // no effective change: persist nothing, latch no redraw
+  }
+  s_show_runways = next;
   saveShowRunways();
+  // Runway overlay is visual-only: redraw only, no query revision change.
+  services::settings::markVisualChanged();
   Serial.printf("Runway overlay: %s\n", s_show_runways ? "on" : "off");
 }
 

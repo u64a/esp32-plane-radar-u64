@@ -88,6 +88,7 @@ FetchResult runFetch(ByteSource& source, Clock& clock, IdleHandler& idle,
   result.outcome = FetchOutcome::ParseError;
   result.http_status = http.status;
   result.bytes_received = http.decoded_body_bytes;
+  result.retry_after_present = false;
   result.retry_after_ms = 0;
   result.aircraft_count = 0;
 
@@ -97,7 +98,10 @@ FetchResult runFetch(ByteSource& source, Clock& clock, IdleHandler& idle,
       break;
     case HttpOutcome::TransportError:
       // A premature end or read error means no complete response was framed.
-      result.outcome = FetchOutcome::ParseError;
+      // This is a network read/EOF failure, not a grammar violation: report it
+      // as a transient TransportFailure so a link interruption backs off briefly
+      // instead of being mislabeled a permanent ParseError.
+      result.outcome = FetchOutcome::TransportFailure;
       break;
     case HttpOutcome::ResponseTooLarge:
       result.outcome = FetchOutcome::ResponseTooLarge;
@@ -111,19 +115,96 @@ FetchResult runFetch(ByteSource& source, Clock& clock, IdleHandler& idle,
     case HttpOutcome::Ok:
       if (sink.parseMode()) {
         out.count = static_cast<uint16_t>(parser.count());
-        out.source_revision = revision;
+        out.settings_revision = revision;
         result.outcome = FetchOutcome::Ok;
         result.aircraft_count = static_cast<uint16_t>(parser.count());
       } else {
         result.outcome = mapStatus(http.status);
-        if ((http.status == 429 || http.status == 503) &&
-            http.retry_after_present) {
+        // Surface the parsed Retry-After to the poll policy. The presence bit
+        // lets a header value of 0 (clamped to the rate minimum) be told apart
+        // from an absent/malformed header (which uses the default wait).
+        result.retry_after_present = http.retry_after_present;
+        if (http.retry_after_present) {
           result.retry_after_ms = http.retry_after_ms;
         }
       }
       break;
   }
   return result;
+}
+
+core::PollOutcome pollOutcomeFor(FetchOutcome outcome) {
+  switch (outcome) {
+    case FetchOutcome::Ok:
+      return core::PollOutcome::Success;
+    case FetchOutcome::Obsolete:
+      return core::PollOutcome::Obsolete;
+    case FetchOutcome::Timeout:
+    case FetchOutcome::DnsFailure:
+    case FetchOutcome::TlsFailure:
+    case FetchOutcome::TransportFailure:
+    case FetchOutcome::Http5xx:
+      return core::PollOutcome::Transient;
+    case FetchOutcome::Http429:
+      return core::PollOutcome::RateLimited;
+    case FetchOutcome::HttpOther:
+    case FetchOutcome::ResponseTooLarge:
+    case FetchOutcome::ParseError:
+    case FetchOutcome::NoMemory:
+      return core::PollOutcome::Permanent;
+  }
+  return core::PollOutcome::Permanent;  // unreachable; keeps the compiler happy
+}
+
+core::PollOutcome pollOutcomeForPublish(PublishResult result) {
+  switch (result) {
+    case PublishResult::Published:
+      return core::PollOutcome::Success;
+    case PublishResult::ObsoleteRevision:
+      return core::PollOutcome::Obsolete;
+    case PublishResult::InvalidHandle:
+    case PublishResult::NoCandidate:
+      // A successful fetch that could not be published is an internal fault, not
+      // a network result: never report Success, and back off hard (Permanent).
+      return core::PollOutcome::Permanent;
+  }
+  return core::PollOutcome::Permanent;  // unreachable; keeps the compiler happy
+}
+
+bool fetchOutcomeNetworkAbortSensitive(FetchOutcome outcome) {
+  switch (outcome) {
+    case FetchOutcome::Timeout:
+    case FetchOutcome::DnsFailure:
+    case FetchOutcome::TlsFailure:
+    case FetchOutcome::TransportFailure:
+    case FetchOutcome::ParseError:
+      return true;
+    case FetchOutcome::Ok:
+    case FetchOutcome::Http429:
+    case FetchOutcome::Http5xx:
+    case FetchOutcome::HttpOther:
+    case FetchOutcome::ResponseTooLarge:
+    case FetchOutcome::NoMemory:
+    case FetchOutcome::Obsolete:
+      return false;
+  }
+  return false;  // unreachable; keeps the compiler happy
+}
+
+core::PollOutcome effectiveOutcomeAfterFlap(FetchOutcome fetch_outcome,
+                                            core::PollOutcome base_outcome,
+                                            bool published_success,
+                                            bool disconnect_flap) {
+  if (!disconnect_flap || published_success) {
+    // No flap, or a fully validated/published success: the base class stands.
+    return base_outcome;
+  }
+  if (fetchOutcomeNetworkAbortSensitive(fetch_outcome)) {
+    // A spurious mid-fetch drop plausibly aborted the read: treat as a pause so
+    // it never advances the transient/permanent backoff streak.
+    return core::PollOutcome::Obsolete;
+  }
+  return base_outcome;
 }
 
 }  // namespace services::adsb

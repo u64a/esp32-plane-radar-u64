@@ -8,7 +8,10 @@
 
 #include "config.h"
 #include "core/geo_projection.h"
+#include "core/radar_data_state.h"
+#include "core/radar_status.h"
 #include "core/screen_geometry.h"
+#include "core/status_badge_layout.h"
 #include "hardware/display.h"
 #include "hardware/display_font.h"
 #include "services/adsb_client.h"
@@ -32,6 +35,7 @@ uint16_t kColorTagType = 0x5DFF;
 uint16_t kColorTagAltitude = 0xFFE0;
 uint16_t kColorRunway = 0x4D5F;
 uint16_t kColorRunwayLabel = 0x7DFF;
+uint16_t kColorWarning = 0xFFE0;
 
 }  // namespace radar
 
@@ -52,6 +56,17 @@ bool s_tag_use_vlw = false;
 
 int s_scale_label_max_w = 0;
 int s_scale_label_h = 0;
+
+// Compact status badge: a separately cached style (may be a shrunk copy of the
+// scale style) plus the pre-measured upper-west fill rectangle. Both are
+// computed once in initLabelMetrics so no per-frame measurement or font search
+// occurs. The rectangle is sized for the worst-case status text and proven to
+// stay inside the radar disc while clearing the center marker.
+bool s_status_use_vlw = false;
+float s_status_vlw_size = 0.50f;
+const lgfx::GFXfont* s_status_gfx = &plane_radar_fonts::FreeSansBold9pt7b;
+float s_status_gfx_size = 1.0f;
+core::StatusBadgeRect s_status_rect{};
 
 lgfx::LovyanGFX* s_draw = &tft;
 LGFX_Sprite s_frame(&tft);
@@ -95,6 +110,9 @@ float findVlwSizeForHeight(int target_px) {
 }
 
 void applyScaleStyle();
+void applyCardinalStyle();
+void applyStatusStyle();
+void initStatusBadgeLayout();
 
 const lgfx::GFXfont* pickGfxFontClosest(
     int target_px, const lgfx::GFXfont* const* candidates, size_t count) {
@@ -157,6 +175,10 @@ void initLabelMetrics() {
     }
   }
 
+  // Compact status badge: measure the worst-case status text and cache an
+  // upper-west in-disc slot (with a shrunk style if the scale font is too wide).
+  initStatusBadgeLayout();
+
   s_label_metrics_ready = true;
 }
 
@@ -203,6 +225,15 @@ void initPalette() {
       tft.color565(radar::kRunwayR, radar::kRunwayG, radar::kRunwayB);
   radar::kColorRunwayLabel = tft.color565(radar::kRunwayLabelR, radar::kRunwayLabelG,
                                           radar::kRunwayLabelB);
+  // Warning yellow follows the same BGR swap the verified aircraft red uses so
+  // the STALE badge renders yellow (not cyan) in the sprite pipeline.
+  if (config::kDisplayRgbOrder) {
+    radar::kColorWarning =
+        tft.color565(radar::kWarningB, radar::kWarningG, radar::kWarningR);
+  } else {
+    radar::kColorWarning =
+        tft.color565(radar::kWarningR, radar::kWarningG, radar::kWarningB);
+  }
 }
 
 float innerRingMaxKm() {
@@ -429,11 +460,14 @@ void sortBeyondDotsFarFirst(BeyondDotDrawItem* items, size_t count) {
   }
 }
 
-void drawAircraft() {
+void drawAircraftFromSnapshot(const services::adsb::SnapshotView& snapshot) {
   initLabelMetrics();
 
-  const size_t n = services::adsb::aircraftCount();
-  const services::adsb::Aircraft* planes = services::adsb::aircraftList();
+  const services::adsb::Aircraft* planes = snapshot.aircraft;
+  if (planes == nullptr) {
+    return;
+  }
+  const size_t n = std::min<size_t>(snapshot.count, services::adsb::kMaxAircraft);
   const core::LocalProjection projection(services::location::lat(),
                                          services::location::lon());
   const float pixels_per_km =
@@ -517,6 +551,79 @@ void applyScaleStyle() {
   }
 }
 
+void applyStatusStyle() {
+  if (s_status_use_vlw) {
+    displayFontSetSmoothSize(*s_draw, s_status_vlw_size);
+  } else {
+    displayFontSetBitmap(*s_draw, s_status_gfx);
+    s_draw->setTextSize(s_status_gfx_size);
+  }
+}
+
+// Apply a candidate status style to `tft` purely to measure its metrics. Font
+// metrics depend only on font+size, so the sprite pipeline sees identical
+// widths/heights (sprite/direct parity).
+void applyStatusStyleForMeasure(bool use_vlw, float vlw_size,
+                                const lgfx::GFXfont* gfx, float gfx_size) {
+  if (use_vlw) {
+    displayFontSetSmoothSize(tft, vlw_size);
+  } else {
+    displayFontSetBitmap(tft, gfx);
+    tft.setTextSize(gfx_size);
+  }
+}
+
+// Worst-case width across every status string the planner can emit: LOADING
+// with the maximum dot count, STALE at the clamped maximum age, plus the fixed
+// OFFLINE / NO WIFI. Measured under the currently applied style on `tft`.
+int measureStatusMaxWidth() {
+  static const char* const kSamples[] = {"LOADING...", "STALE 999s", "OFFLINE",
+                                         "NO WIFI"};
+  int max_w = 0;
+  for (const char* sample : kSamples) {
+    const int w = tft.textWidth(sample);
+    if (w > max_w) {
+      max_w = w;
+    }
+  }
+  return max_w;
+}
+
+void initStatusBadgeLayout() {
+  const core::StatusBadgeSlot slot{radar::kCenterX,
+                                   radar::kCenterY,
+                                   radar::kGridOuterRadius,
+                                   radar::kStatusDiscInsetPx,
+                                   radar::kCenterDotRadius,
+                                   radar::kStatusCenterClearPx,
+                                   radar::kStatusLabelPadX,
+                                   radar::kStatusLabelPadY};
+
+  // Shrink factors applied to the active scale style. 1.0 keeps the status
+  // text at the scale size; smaller factors are tried only when the full text
+  // cannot fit the upper-west slot. This runs once at init (bounded loop) — no
+  // per-frame measurement or font search.
+  static constexpr float kShrink[] = {1.0f,  0.95f, 0.90f, 0.85f, 0.80f,
+                                      0.75f, 0.70f, 0.65f, 0.60f};
+  for (float shrink : kShrink) {
+    const float vlw_size = s_scale_vlw_size * shrink;
+    applyStatusStyleForMeasure(s_scale_use_vlw, vlw_size, s_scale_gfx, shrink);
+    const int text_w = measureStatusMaxWidth();
+    const int text_h = tft.fontHeight();
+
+    s_status_use_vlw = s_scale_use_vlw;
+    s_status_vlw_size = vlw_size;
+    s_status_gfx = s_scale_gfx;
+    s_status_gfx_size = shrink;
+    s_status_rect = core::placeStatusBadge(text_w, text_h, slot);
+    if (s_status_rect.fits) {
+      return;
+    }
+  }
+  // Unreached for the real 240x240 disc; the smallest candidate remains cached
+  // so the full text is still drawn (never abbreviated) if it is ever hit.
+}
+
 void drawCardinalLabel(const char* text, int x, int y, textdatum_t datum) {
   applyCardinalStyle();
   s_draw->setTextDatum(datum);
@@ -594,6 +701,53 @@ void drawScaleLabel(int cx, int cy, int outer_radius) {
                                scaleLabelAnchorX(cx, outer_radius), cy);
 }
 
+uint16_t statusBadgeColor(core::RadarStatusBadge badge) {
+  switch (badge) {
+    case core::RadarStatusBadge::Stale:
+      return radar::kColorWarning;
+    case core::RadarStatusBadge::Offline:
+      return radar::kColorAircraft;  // established error red
+    case core::RadarStatusBadge::Loading:
+    case core::RadarStatusBadge::NoWifi:
+    case core::RadarStatusBadge::None:
+    default:
+      return radar::kColorLabel;
+  }
+}
+
+// Compact status badge in the pre-measured upper-west in-disc slot. The fill
+// rectangle is cached (worst-case sized) so the padded box is stable across
+// states, stays inside the radar disc, and clears the center marker — the badge
+// never crosses the horizontal centerline into the center dot. Uses the cached
+// status style (a shrunk copy of the scale style when the full text is too wide
+// for the slot) so the locked text is always drawn in full.
+void drawStatusLabelWithBackground(const char* text, uint16_t color) {
+  applyStatusStyle();
+  const core::StatusBadgeRect& rect = s_status_rect;
+
+  s_draw->fillRect(rect.left, rect.top, rect.width, rect.height,
+                   radar::kColorBackground);
+  s_draw->setTextColor(color, radar::kColorBackground);
+  s_draw->setTextDatum(textdatum_t::middle_left);
+  s_draw->drawString(text, rect.left + radar::kStatusLabelPadX,
+                     rect.top + rect.height / 2);
+}
+
+void drawStatusBadge(const core::RadarStatusPlan& plan) {
+  if (plan.badge == core::RadarStatusBadge::None || plan.text[0] == '\0') {
+    return;
+  }
+  drawStatusLabelWithBackground(plan.text, statusBadgeColor(plan.badge));
+}
+
+core::RadarStatusPlan planFromModel(const RadarDisplayModel& model) {
+  return core::radarStatusPlan(model.data.mode, model.data.age_seconds,
+                               model.data.show_aircraft,
+                               model.data.settings_revision,
+                               model.snapshot.settings_revision,
+                               model.wifi_connected, model.activity_phase);
+}
+
 template <typename Gfx>
 void drawStaticGrid(Gfx& gfx) {
   initLabelMetrics();
@@ -631,45 +785,83 @@ bool ensureFrameSprite() {
 // Double-buffered frame: composite the grid AND aircraft into the off-screen
 // sprite, then blit it to the panel in a single pushSprite. Because the panel
 // is updated in one pass, labels never show an erase/redraw gap — no flicker.
-void renderFrame() {
+// Exactly one 240x240 sprite and one pushSprite; the direct-draw fallback runs
+// identical state logic against the panel.
+void renderFrame(const RadarDisplayModel& model) {
+  const core::RadarStatusPlan plan = planFromModel(model);
   drawStaticGrid(s_frame);  // opens its own DrawScope(s_frame)
   {
     const DrawScope scope(s_frame);
-    drawAircraft();
+    if (plan.draw_aircraft) {
+      drawAircraftFromSnapshot(model.snapshot);
+    }
+    drawStatusBadge(plan);
   }
   s_frame.pushSprite(0, 0);
   tft.setTextDatum(textdatum_t::top_left);
+}
+
+void drawFrameDirect(const RadarDisplayModel& model) {
+  const core::RadarStatusPlan plan = planFromModel(model);
+  const DrawScope scope(tft);
+  drawStaticGrid(tft);  // opens its own nested DrawScope(tft)
+  if (plan.draw_aircraft) {
+    drawAircraftFromSnapshot(model.snapshot);
+  }
+  drawStatusBadge(plan);
+  tft.setTextDatum(textdatum_t::top_left);
+}
+
+// Behavior-compatible synthesis for the not-yet-migrated main loop: draw the
+// currently published snapshot as a Live/connected frame (grid + aircraft, no
+// status chrome), reusing the model path instead of a second draw routine.
+RadarDisplayModel liveModelFromPublished() {
+  RadarDisplayModel model{};
+  model.snapshot.aircraft = services::adsb::aircraftList();
+  model.snapshot.count =
+      static_cast<uint16_t>(services::adsb::aircraftCount());
+  model.snapshot.settings_revision = 0;
+  model.data.mode = core::RadarDataMode::Live;
+  model.data.age_seconds = 0;
+  model.data.show_aircraft = true;
+  model.data.settings_revision = 0;  // matches snapshot → aircraft drawn
+  model.wifi_connected = true;       // Live + connected → no status chrome
+  model.activity_phase = 0;
+  return model;
 }
 
 }  // namespace
 
 bool radarDisplayPrepareFrame() { return ensureFrameSprite(); }
 
-void radarDisplayDraw() {
+void radarDisplayDraw(const RadarDisplayModel& model) {
   initPalette();
   initLabelMetrics();
 
   if (ensureFrameSprite()) {
-    renderFrame();
+    renderFrame(model);
     return;
   }
 
   // Fallback when the sprite can't be allocated: draw straight to the panel.
-  const DrawScope scope(tft);
-  drawStaticGrid(tft);
-  drawAircraft();
-  tft.setTextDatum(textdatum_t::top_left);
+  drawFrameDirect(model);
 }
 
-void radarDisplayRefreshAircraft() {
+void radarDisplayRefreshAircraft(const RadarDisplayModel& model) {
   initPalette();
 
   if (ensureFrameSprite()) {
-    renderFrame();
+    renderFrame(model);
     return;
   }
 
-  radarDisplayDraw();
+  radarDisplayDraw(model);
+}
+
+void radarDisplayDraw() { radarDisplayDraw(liveModelFromPublished()); }
+
+void radarDisplayRefreshAircraft() {
+  radarDisplayRefreshAircraft(liveModelFromPublished());
 }
 
 }  // namespace ui

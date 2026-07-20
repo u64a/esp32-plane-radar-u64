@@ -4,6 +4,9 @@
 
 #include <driver/gpio.h>
 
+#include "core/poll_policy.h"
+#include "core/radar_data_state.h"
+
 namespace config {
 
 // --- Wi-Fi portal ---
@@ -76,6 +79,46 @@ constexpr uint32_t kAdsbConnectTimeoutMs = 8000;
 constexpr uint32_t kAdsbOverallTimeoutMs = 10000;
 /** Response-local max idle gap between received bytes before a stall (Timeout). */
 constexpr uint32_t kAdsbStallTimeoutMs = 5000;
+
+// --- Phase 6 ADS-B poll backoff + radar-data freshness (ms) ---
+// The canonical values live in core::kDefaultAdsbPollPolicy and
+// core::kDefaultRadarFreshnessPolicy (Arduino-free and unit-tested). These
+// firmware-facing names mirror them, and the static_asserts below keep the two
+// in lock-step so a later main-loop integration can build the policies from
+// config without drift.
+constexpr uint32_t kAdsbSuccessIntervalMs = 3000;    // success, incl. empty ac[]
+constexpr uint32_t kAdsbTransientInitialMs = 5000;   // first transient backoff
+constexpr uint32_t kAdsbTransientCapMs = 60000;      // transient backoff ceiling
+constexpr uint32_t kAdsbRateDefaultMs = 60000;       // 429 without Retry-After
+constexpr uint32_t kAdsbRetryAfterMinMs = 5000;      // Retry-After clamp floor
+constexpr uint32_t kAdsbRetryAfterMaxMs = 300000;    // Retry-After clamp ceiling
+constexpr uint32_t kAdsbPermanentBackoffMs = 300000; // permanent/other errors
+constexpr uint32_t kRadarStaleMs = 15000;            // Live -> Stale age
+constexpr uint32_t kRadarOfflineMs = 60000;          // -> Offline / hide age
+
+static_assert(kAdsbSuccessIntervalMs == kAdsbFetchIntervalMs,
+              "success interval must equal the legacy fetch interval");
+static_assert(kAdsbSuccessIntervalMs == core::kDefaultAdsbPollPolicy.success_ms,
+              "config success interval drifted from core poll policy");
+static_assert(
+    kAdsbTransientInitialMs == core::kDefaultAdsbPollPolicy.transient_initial_ms,
+    "config transient initial drifted from core poll policy");
+static_assert(kAdsbTransientCapMs == core::kDefaultAdsbPollPolicy.transient_cap_ms,
+              "config transient cap drifted from core poll policy");
+static_assert(kAdsbRateDefaultMs == core::kDefaultAdsbPollPolicy.rate_default_ms,
+              "config rate default drifted from core poll policy");
+static_assert(
+    kAdsbRetryAfterMinMs == core::kDefaultAdsbPollPolicy.retry_after_min_ms,
+    "config Retry-After minimum drifted from core poll policy");
+static_assert(
+    kAdsbRetryAfterMaxMs == core::kDefaultAdsbPollPolicy.retry_after_max_ms,
+    "config Retry-After maximum drifted from core poll policy");
+static_assert(kAdsbPermanentBackoffMs == core::kDefaultAdsbPollPolicy.permanent_ms,
+              "config permanent backoff drifted from core poll policy");
+static_assert(kRadarStaleMs == core::kDefaultRadarFreshnessPolicy.stale_ms,
+              "config stale threshold drifted from core freshness policy");
+static_assert(kRadarOfflineMs == core::kDefaultRadarFreshnessPolicy.offline_ms,
+              "config offline threshold drifted from core freshness policy");
 
 // --- UI colors (RGB565) — status screens ---
 constexpr uint16_t kColorBlack = 0x0000;

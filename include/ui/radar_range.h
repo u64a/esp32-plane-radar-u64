@@ -25,8 +25,12 @@ using core::range::RangePreset;
 
 /** Load saved range and distance units from flash. Call once after boot. */
 void rangeInit();
-/** Cycle preset and save to flash. */
-void rangeNext();
+/**
+ * Cycle to the next preset and save to flash. Returns true when the preset
+ * actually changed -- an effective query change that bumps the runtime settings
+ * revision. (Distance-unit and runway toggles are visual-only and never do.)
+ */
+bool rangeNext();
 const RangePreset& rangeCurrent();
 uint8_t rangeIndex();
 /** ADSB fetch radius (km): scaled to screen edge so beyond-ring dots have data. */
