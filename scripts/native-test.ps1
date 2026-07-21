@@ -3,6 +3,16 @@ param()
 
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
+
+# Phase 11: run the airport-data offline gate fail-fast before any PlatformIO tests.
+Write-Host "--- verify-airport-data gate ---"
+$airportGate = Join-Path $PSScriptRoot "verify-airport-data.ps1"
+& powershell -ExecutionPolicy Bypass -File $airportGate -ProjectRoot $projectRoot
+if ($LASTEXITCODE -ne 0) {
+  throw "verify-airport-data gate failed with exit code $LASTEXITCODE"
+}
+Write-Host ""
+
 $toolchainVersion = "2.8.0"
 $gccVersion = "16.1.0"
 $assetSha256 =
