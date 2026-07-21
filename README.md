@@ -700,16 +700,15 @@ Measured with the same pinned clean build for all envs:
 | Build measurement | Phase 9 `supermini` | Phase 10 `supermini` | Δ vs Ph 9 | Phase 10 `supermini-quiet` | Δ vs `supermini` | Phase 10 `supermini-diag` | Δ vs `supermini` | Phase 10 `supermini-worker` | Δ vs Ph 9 worker | Phase 10 `supermini-worker-diag` | Δ vs `supermini-worker` |
 |------|------:|------:|------:|------:|------:|------:|------:|------:|------:|------:|------:|
 | Linker-reported static RAM (bytes) | 65,044 | 65,044 | 0 | 64,916 | −128 | 65,052 | +8 | 73,924 | 0 | 73,948 | +24 |
-| Linker-reported firmware flash (bytes) | 1,143,328 | 1,143,352 | +24 | 1,138,238 | −5,114 | 1,143,990 | +638 | 1,146,218 | +24 | 1,147,010 | +792 |
+| `.pio/build/*/firmware.bin` (bytes) | 1,198,256 | 1,198,160 | −96 | 1,192,256 | −5,904 | 1,198,880 | +720 | 1,202,320 | −96 | 1,203,120 | +896 |
+| `.pio/build/*/firmware-merged.bin` (bytes) | 1,263,792 | 1,263,696 | −96 | 1,257,792 | −5,904 | 1,264,416 | +720 | 1,267,856 | −96 | 1,268,656 | +896 |
 
-Notes (source gates; hardware confirmation required):
-- **supermini (default)**: +24 B flash from Phase 10 macro/constexpr additions; 0 RAM — diagnostics do not add any state to non-diag builds. Default Serial logging behavior is unchanged.
-- **supermini-quiet** (`LOG_LEVEL=0`): −128 B RAM and −5,114 B flash from removal of all Serial logging strings and Serial.begin. No output at all.
-- **supermini-diag** (`DIAGNOSTICS=1`): +8 B RAM (the `g_diag_last_fetch_ms` file-scope state and `s_last_render_diag` struct) and +638 B flash from the timing, heap-query, and render-diagnostic code paths.
-- **supermini-worker-diag** (`WORKER=1, DIAGNOSTICS=1`): +24 B RAM from `s_last_render_diag` and the diag `fetch_duration_ms` field in `WorkerResultMsg`; +792 B flash.
-- The diagnostic `g_diag_last_fetch_ms` symbol and `radarDisplayLastDiagnostics` function are **absent** from the default `supermini` and `supermini-worker` ELFs (verified with `nm`) and **present** in the diag variants — confirming zero diagnostic cost in non-diag builds.
-- **Worker symbols (`workerTask`, `s_worker_stack`, `s_result_q`, etc.)** remain **zero** in the default `supermini` ELF.
-- All timing/heap measurements are **hardware-only** (not performed here): render_us includes panel I/O in both paths (sprite mode: one final pushSprite SPI transfer; direct-draw: incremental SPI transfers per drawing call); runway_us measures off-screen RAM only in sprite mode but includes panel SPI in direct-draw; worker_hwm is meaningful only after representative load; heap_min is since boot; largest_block is a post-fetch snapshot not the minimum since boot.
+Notes (final measurements at HEAD 4dc257d; confirmed against clean build artifacts):
+- **supermini (default)**: −96 B firmware.bin from Phase 9 baseline; 0 B static RAM. Diagnostics are fully compiled out.
+- **supermini-quiet** (`LOG_LEVEL=0`): −5,904 B firmware.bin (no Serial output, no `Serial.begin`, no logging format strings).
+- **supermini-diag** (`DIAGNOSTICS=1`): +8 B static RAM (`g_diag_last_fetch_ms` file-scope state and `s_last_render_diag` struct) and +720 B firmware.bin (timing, heap-query, and render-diagnostic code paths).
+- **supermini-worker** (opt-in): −96 B firmware.bin from Phase 9 worker baseline.
+- **supermini-worker-diag** (`WORKER=1, DIAGNOSTICS=1`): +24 B static RAM (`s_last_render_diag` and diag `fetch_duration_ms` field in `WorkerResultMsg`); +896 B firmware.bin.
 
 ### Diagnostics output format (hardware-only interpretation)
 
@@ -798,10 +797,11 @@ Two new native test suites are added:
 
 The `native` env runs **567 cases across 38 suites**; `native-diag` runs **5 cases in 1 suite** (`test_runtime_diagnostics_on`); `scripts/native-test.ps1` executes **572 cases across 39 suite runs total**. The `native-diag` env uses `test_filter = test_runtime_diagnostics_on` + `test_ignore =` (clearing the inherited exclusion) so the default `native` env and `native-diag` never run each other's macro-sensitive tests.
 
-The **ELF proof** (`nm` proves symbols; binary string scanning proves format strings — both from build artifacts, *not* a source check):
-- `g_diag_last_fetch_ms` and `radarDisplayLastDiagnostics` symbols are **absent** from `supermini` and `supermini-worker` ELFs (`nm` confirms) and **present** in the `supermini-diag` and `supermini-worker-diag` ELFs.
-- `workerTask`, `s_worker_stack`, `s_worker_tcb`, `s_request_q`, `s_result_q`, `workerCancel` symbols are **absent** from the default `supermini` ELF (`nm` confirms).
-- `supermini-quiet` firmware binary contains no logging format strings (binary string scan: `Radar location saved`, `diag: fetch_ms`, etc. are absent); `supermini-diag` binary contains both `diag: fetch_ms=…` and `diag: render_us=…` format strings (binary string scan confirms presence).
+The **ELF proof** (`nm` proves symbols; binary-safe scanning proves format strings — both from build artifacts, *not* a source check):
+- **Diagnostic symbols**: `g_diag_last_fetch_ms` and `radarDisplayLastDiagnostics` are **absent** from `supermini` and `supermini-worker` ELFs (`nm` confirms) and **present** in `supermini-diag` and `supermini-worker-diag` ELFs. This proves zero diagnostic cost in non-diag builds.
+- **Worker task symbols**: `workerTask`, `s_worker_stack`, `s_worker_tcb`, `s_request_q`, `s_result_q`, and `workerCancel` are **absent** from the default `supermini` ELF (`nm` confirms), confirming no worker scaffolding is linked. Worker-variant stack sizes are exactly **0x2000 (8,192) bytes** in `supermini-worker` and `supermini-worker-diag` ELFs.
+- **Heap metric APIs**: `ESP.getFreeHeap()`, `ESP.getMinFreeHeap()`, and `ESP.getMaxAllocHeap()` are **absent** from non-diag `supermini` and `supermini-worker` ELFs and **present** in `supermini-diag` and `supermini-worker-diag` ELFs (framework functions `heap_caps_get_free_size` and `heap_caps_get_largest_free_block` exist in all builds and are not isolation indicators); `heap_caps_get_minimum_free_size` presence confirms diag build isolation.
+- **Binary-safe format string scan**: `supermini`, `supermini-worker`, and `supermini-quiet` firmware binaries lack the diag format strings `diag: fetch_ms=…` and `diag: render_us=…`, which are present in `supermini-diag` and `supermini-worker-diag` binaries. All shared runtime logging prefixes (time, warnings, font/frame fallback, distance/runway settings, location save/fail/retry, range, ADS-B outcome, startup sequence, render mode) are **absent** from `supermini-quiet` binary (including the exact startup log `Plane Radar\n` — note: substring `Plane Radar` appears in portal HTML and is not an isolation indicator). Presence in default/worker/diag variants confirms selective logging compilation.
 
 The updated **worker policy gate** (`verify-adsb-worker-policy.ps1`) now covers 17 tamper cases (2 new: `supermini-diag` must not add `ADSB_WORKER`; `supermini-worker-diag` must keep `DIAGNOSTICS=1`). All 10 original invariants are preserved.
 
