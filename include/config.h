@@ -4,33 +4,81 @@
 
 #include <driver/gpio.h>
 
+#include "core/http_request.h"
 #include "core/poll_policy.h"
+#include "core/portal_secrets.h"
+#include "core/portal_session.h"
+#include "core/provision_button.h"
 #include "core/radar_data_state.h"
 
 namespace config {
 
-// --- Wi-Fi portal ---
-constexpr char kPortalApName[] = "PlaneRadar-Setup";
-constexpr char kPortalIp[] = "192.168.4.1";
-/** mDNS host (no ".local" suffix); browser: http://plane-radar.local */
-constexpr char kPortalHostname[] = "plane-radar";
-constexpr char kPortalHostUrl[] = "plane-radar.local";
+// --- Secure Wi-Fi setup portal (temporary SoftAP; see README + core/portal_*) ---
+//
+// There is NO permanent LAN listener, no mDNS/OTA, and no open AP. The portal is
+// a temporary SoftAP that exists ONLY while the core PortalSession is in a setup
+// session, and only after the radio + secrets handshake. The SSID is derived at
+// runtime from the factory MAC by core::formatPortalSsid ("PlaneRadar-XXYYZZ"),
+// so there is no static AP name here.
+constexpr char kPortalIp[] = "192.168.4.1";      // SoftAP address (exact)
+constexpr uint8_t kPortalIpOctets[4] = {192, 168, 4, 1};
+constexpr uint8_t kPortalNetmaskOctets[4] = {255, 255, 255, 0};  // /24
+constexpr uint8_t kPortalApChannel = 1;          // fixed 2.4 GHz channel
+constexpr uint8_t kPortalApMaxConnections = 1;   // at most ONE station
+constexpr bool kPortalApVisible = true;          // WPA2-PSK, broadcast SSID (never open)
+
+/** Session liveness deadline: the portal closes 5 min after the original session
+ *  start; candidate retries do NOT extend it. Mirrors the core policy. */
+constexpr uint32_t kPortalSessionTimeoutMs = 300000;  // 5 minutes
+static_assert(kPortalSessionTimeoutMs ==
+                  core::kDefaultPortalSessionPolicy.session_timeout_ms,
+              "portal session timeout drifted from core policy");
+
+// --- Captive HTTP + DNS ---
+constexpr uint16_t kPortalHttpPort = 80;
+constexpr uint16_t kPortalDnsPort = 53;
+/** Per-connection HTTP timeouts (single request per connection). */
+constexpr uint32_t kPortalHttpIdleTimeoutMs = 3000;     // max gap between bytes
+constexpr uint32_t kPortalHttpOverallTimeoutMs = 8000;  // max total per request
+/** Cumulative bounded deadline for writing one HTTP response (non-blocking
+ *  lwip_send with DNS/button pumped between attempts). */
+constexpr uint32_t kPortalHttpWriteDeadlineMs = 3000;
+
+// Enforced HTTP parser limits (mirror the core production maxima). Validated once
+// at startup via core::httpLimitsValid before serving.
+constexpr core::HttpLimits kPortalHttpLimits = core::kDefaultHttpLimits;
+
+// --- Candidate credential trial ---
+/** A submitted candidate must obtain a fresh generation-bound GOT_IP within this
+ *  budget or the trial fails and the old credentials are restored untouched. */
+constexpr uint32_t kCandidateConnectTimeoutMs = 30000;  // 30 s
 
 /** Per-attempt STA connect wait (ms); retried kWifiConnectAttempts times. */
 constexpr unsigned long kWifiConnectAttemptMs = 15000;
 constexpr uint8_t kWifiConnectAttempts = 3;
-constexpr unsigned long kWifiPortalTimeoutSec = 0;  // 0 = no timeout while configuring
 constexpr unsigned long kWifiConnectingFrameMs = 50;
-/** Wait after disconnect before reconnecting (avoids portal on brief drops). */
+/** Wait after going offline before a background reconnect (avoids churn on brief
+ *  drops); then retry at most this often. Runtime OfflineIdle retries only. */
 constexpr unsigned long kWifiDownGraceMs = 4000;
-/** Minimum interval between background reconnect tries. */
 constexpr unsigned long kWifiReconnectIntervalMs = 15000;
 
-// --- BOOT button (ESP32-C3 Super Mini, active LOW) ---
+// --- BOOT / provisioning button (ESP32-C3 Super Mini, GPIO 9, active LOW) ---
+//
+// The approved two-stage gesture policy (core::ProvisionButton). A tap cycles the
+// range; a medium hold opens setup; a long hold ARMS erase but the SAME hold can
+// never erase (release + a second confirming hold is required). There is NO
+// 3-second immediate reset and NO power-on GPIO9 hold dependency.
 constexpr gpio_num_t kBootPin = GPIO_NUM_9;
-constexpr unsigned long kBootResetHoldMs = 3000UL;
-/** Ignore BOOT taps shorter than this (debounce). */
-constexpr unsigned long kBootTapMinMs = 40UL;
+constexpr core::ProvisionButtonPolicy kButtonPolicy =
+    core::kDefaultProvisionButtonPolicy;
+static_assert(kButtonPolicy.tap_min_ms == 40 && kButtonPolicy.tap_max_ms == 1000 &&
+                  kButtonPolicy.configure_min_ms == 2000 &&
+                  kButtonPolicy.arm_ms == 8000 &&
+                  kButtonPolicy.confirm_window_ms == 10000 &&
+                  kButtonPolicy.confirm_hold_ms == 3000,
+              "button gesture policy drifted from approved core defaults");
+/** Ignore BOOT taps shorter than this (debounce); mirrors the gesture tap floor. */
+constexpr unsigned long kBootTapMinMs = core::kDefaultProvisionButtonPolicy.tap_min_ms;
 
 // --- Display: GC9A01 1.28" round 240×240 (SPI) ---
 constexpr gpio_num_t kDisplayPinRst = GPIO_NUM_0;
@@ -195,6 +243,18 @@ constexpr char kTimeFloorNvsNamespace[] = "timefloor";
 constexpr char kTimeFloorNvsKey[] = "floorrec";                          // versioned blob
 constexpr uint32_t kTimeFloorPersistIntervalMs = 24UL * 60 * 60 * 1000;  // in-session flash-wear guard
 constexpr int64_t kTimeFloorMinAdvanceSec = 24LL * 60 * 60;              // >= 24 h authenticated advance per write
+
+// --- Provisioning transaction marker (NVS; power-loss durability) ------------
+//
+// A tiny, dedicated NVS marker records whether a credential FLASH commit or a
+// factory erase was in progress, so a power loss mid-transaction is detected
+// fail-closed at the next boot instead of silently resuming a normal connect.
+// Dedicated namespace/key so it never collides with the "radar" / "planeradar" /
+// "timefloor" / wifi Preferences users. It stores ONLY a versioned, checksummed
+// enum (core::TxnMarkerRecord) -- NEVER a password or any credential byte; the
+// old/new NVS atomicity of the credential itself remains the actual guarantee.
+constexpr char kProvisionMarkerNvsNamespace[] = "provtxn";
+constexpr char kProvisionMarkerNvsKey[] = "txnrec";  // versioned, checksummed enum
 
 // --- UI colors (RGB565) — status screens ---
 constexpr uint16_t kColorBlack = 0x0000;

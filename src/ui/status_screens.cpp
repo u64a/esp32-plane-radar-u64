@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "config.h"
+#include "core/provision_button.h"
 #include "hardware/display.h"
 #include "hardware/display_font.h"
 
@@ -34,6 +35,13 @@ struct SpinnerDot {
 char s_connecting_ssid[33];
 char s_ssid_line[33];
 constexpr int kConnectingTextMaxWidthPx = 220;
+
+// Static text buffers for the credentials screen, at file scope so they can be
+// securely wiped when the session leaves the credentials screen (the WPA2
+// password rendered here must not linger in status RAM).
+char s_cred_ssid_line[40];
+char s_cred_pass_line[40];
+char s_cred_count_line[24];
 float s_spinner_angle_deg = -90.0f;
 SpinnerDot s_spinner_dots[kSpinnerDotCount];
 bool s_connecting_text_drawn = false;
@@ -208,36 +216,206 @@ void statusScreenConnectingTick() {
   drawSpinnerDots();
 }
 
-void statusScreenPortal() {
+void statusScreenPortalPreparing() {
   const TextLine lines[] = {
       {"Wi-Fi setup", 1.15f, &kPortalGfxTitle},
-      {"1. Join network:", 1.05f, &kPortalGfxBody},
-      {config::kPortalApName, 1.12f, &kPortalGfxEmphasis},
-      {"2. Open in browser:", 1.05f, &kPortalGfxBody},
-      {config::kPortalHostUrl, 1.12f, &kPortalGfxEmphasis},
-      {"or 192.168.4.1", 1.0f, &kPortalGfxBody},
+      {"Preparing secure", 1.05f, &kPortalGfxBody},
+      {"network...", 1.05f, &kPortalGfxBody},
   };
   drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
                 sizeof(lines) / sizeof(lines[0]));
 }
 
-void statusScreenConnectFailed() {
+void statusScreenPortalCredentials(const char* ssid, const char* password,
+                                   uint32_t seconds_left) {
+  snprintf(s_cred_ssid_line, sizeof(s_cred_ssid_line), "%s",
+           (ssid != nullptr && ssid[0] != '\0') ? ssid : "PlaneRadar");
+  snprintf(s_cred_pass_line, sizeof(s_cred_pass_line), "%s",
+           (password != nullptr) ? password : "");
+  const uint32_t mins = seconds_left / 60U;
+  const uint32_t secs = seconds_left % 60U;
+  snprintf(s_cred_count_line, sizeof(s_cred_count_line), "Closes in %lu:%02lu",
+           static_cast<unsigned long>(mins), static_cast<unsigned long>(secs));
   const TextLine lines[] = {
-      {"Could not connect", 1.15f, &kGfxTitle},
+      {"Network:", 1.0f, &kPortalGfxBody},
+      {s_cred_ssid_line, 1.08f, &kPortalGfxEmphasis},
+      {"Password:", 1.0f, &kPortalGfxBody},
+      {s_cred_pass_line, 1.08f, &kPortalGfxEmphasis},
+      {"Open 192.168.4.1", 1.0f, &kPortalGfxBody},
+      {s_cred_count_line, 1.0f, &kPortalGfxBody},
+  };
+  drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
+                sizeof(lines) / sizeof(lines[0]));
+}
+
+void statusScreenClearCredentials() {
+  // Volatile-safe wipe so the compiler cannot elide it as a dead store.
+  volatile char* p = s_cred_pass_line;
+  for (size_t i = 0; i < sizeof(s_cred_pass_line); ++i) {
+    p[i] = 0;
+  }
+  memset(s_cred_ssid_line, 0, sizeof(s_cred_ssid_line));
+  memset(s_cred_count_line, 0, sizeof(s_cred_count_line));
+}
+
+void statusScreenCandidateTesting() {
+  const TextLine lines[] = {
+      {"Testing Wi-Fi", 1.15f, &kPortalGfxTitle},
+      {"Connecting to", 1.05f, &kPortalGfxBody},
+      {"your network...", 1.05f, &kPortalGfxBody},
+  };
+  drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
+                sizeof(lines) / sizeof(lines[0]));
+}
+
+void statusScreenCandidateFailed() {
+  const TextLine lines[] = {
+      {"Wi-Fi failed", 1.15f, &kGfxTitle},
+      {"Reopening setup", 1.0f, &kGfxBody},
+      {"with same name", 1.0f, &kGfxBody},
+      {"and password.", 1.0f, &kGfxBody},
+  };
+  drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
+                sizeof(lines) / sizeof(lines[0]));
+}
+
+void statusScreenCommitting() {
+  const TextLine lines[] = {
+      {"Saving Wi-Fi", 1.15f, &kPortalGfxTitle},
+      {"Please wait...", 1.05f, &kPortalGfxBody},
+  };
+  drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
+                sizeof(lines) / sizeof(lines[0]));
+}
+
+void statusScreenSavedWifiFailed() {
+  const TextLine lines[] = {
+      {"Could not connect", 1.12f, &kGfxTitle},
       {"Check Wi-Fi password", 1.0f, &kGfxBody},
-      {"and signal strength.", 1.0f, &kGfxBody},
-      {"Hold BOOT 3 sec", 1.0f, &kGfxBody},
-      {"to reset Wi-Fi", 1.0f, &kGfxBody},
+      {"Hold BOOT 2-8 sec,", 1.0f, &kGfxBody},
+      {"release to set up", 1.0f, &kGfxBody},
+      {"new Wi-Fi", 1.0f, &kGfxBody},
   };
   drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
                 sizeof(lines) / sizeof(lines[0]));
 }
 
-void statusScreenWifiReset() {
+void statusScreenCredentialFault() {
+  // Truthful generic wording: the write AND its rollback both failed to verify,
+  // so the stored credential's state is unknown -- never claim it "could not be
+  // saved" (it may have been saved, or a good one may be gone; we cannot tell).
   const TextLine lines[] = {
-      {"Wi-Fi reset", 1.15f, &kPortalGfxTitle},
-      {"Restarting...", 1.05f, &kPortalGfxBody},
+      {"Wi-Fi fault", 1.12f, &kGfxTitle},
+      {"Wi-Fi credential", 1.0f, &kGfxBody},
+      {"state unknown", 1.0f, &kGfxBody},
+      {"Hold BOOT 8s,", 1.0f, &kGfxBody},
+      {"release, then", 1.0f, &kGfxBody},
+      {"hold 3s to erase", 1.0f, &kGfxBody},
   };
   drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
                 sizeof(lines) / sizeof(lines[0]));
+}
+
+void statusScreenEraseIncomplete() {
+  const TextLine lines[] = {
+      {"Not fully erased", 1.12f, &kGfxTitle},
+      {"Some settings may", 1.0f, &kGfxBody},
+      {"remain. Hold BOOT", 1.0f, &kGfxBody},
+      {"8s, release, then", 1.0f, &kGfxBody},
+      {"hold 3s to retry", 1.0f, &kGfxBody},
+  };
+  drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
+                sizeof(lines) / sizeof(lines[0]));
+}
+
+void statusScreenSettingsSaveFailed() {
+  const TextLine lines[] = {
+      {"Wi-Fi saved", 1.12f, &kGfxTitle},
+      {"Settings save", 1.0f, &kGfxBody},
+      {"failed - location,", 1.0f, &kGfxBody},
+      {"units, or runways", 1.0f, &kGfxBody},
+      {"may be unchanged", 1.0f, &kGfxBody},
+  };
+  drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
+                sizeof(lines) / sizeof(lines[0]));
+}
+
+void statusScreenButtonPrompt(core::ProvisionButtonPrompt prompt) {
+  switch (prompt) {
+    case core::ProvisionButtonPrompt::ReleaseToConfigure: {
+      // Holding into the arm window only ARMS erase; it never erases on its
+      // own -- a second, separate hold is always required (see EraseArmedRelease).
+      const TextLine lines[] = {
+          {"Release now to", 1.12f, &kPortalGfxTitle},
+          {"configure Wi-Fi", 1.05f, &kPortalGfxBody},
+          {"Keep holding to", 1.0f, &kPortalGfxBody},
+          {"arm erase (8s)", 1.0f, &kPortalGfxBody},
+      };
+      drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
+                    sizeof(lines) / sizeof(lines[0]));
+      break;
+    }
+    case core::ProvisionButtonPrompt::EraseArmedRelease: {
+      const TextLine lines[] = {
+          {"Erase armed", 1.12f, &kGfxTitle},
+          {"Release, then", 1.0f, &kGfxBody},
+          {"hold 3s again", 1.0f, &kGfxBody},
+          {"within 10s", 1.0f, &kGfxBody},
+      };
+      drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
+                    sizeof(lines) / sizeof(lines[0]));
+      break;
+    }
+    case core::ProvisionButtonPrompt::ConfirmHoldToErase: {
+      const TextLine lines[] = {
+          {"Confirm erase", 1.12f, &kGfxTitle},
+          {"Press & hold 3s", 1.0f, &kGfxBody},
+          {"(within 10s)", 1.0f, &kGfxBody},
+      };
+      drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
+                    sizeof(lines) / sizeof(lines[0]));
+      break;
+    }
+    case core::ProvisionButtonPrompt::KeepHoldingToErase: {
+      const TextLine lines[] = {
+          {"Keep holding", 1.12f, &kGfxTitle},
+          {"3 sec to erase", 1.05f, &kGfxBody},
+          {"all settings...", 1.0f, &kGfxBody},
+      };
+      drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
+                    sizeof(lines) / sizeof(lines[0]));
+      break;
+    }
+    case core::ProvisionButtonPrompt::Cancelled:
+    case core::ProvisionButtonPrompt::None:
+    default:
+      break;
+  }
+}
+
+void statusScreenFactoryErase(const core::FactoryEraseOutcome& outcome) {
+  if (core::factoryEraseAllCleared(outcome)) {
+    const TextLine lines[] = {
+        {"Erased", 1.15f, &kPortalGfxTitle},
+        {"Wi-Fi, location,", 1.05f, &kPortalGfxBody},
+        {"units cleared.", 1.05f, &kPortalGfxBody},
+        {"Restarting...", 1.0f, &kPortalGfxBody},
+    };
+    drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
+                  sizeof(lines) / sizeof(lines[0]));
+  } else {
+    // Truthful incomplete wipe: name it plainly and restart so the user can
+    // retry. NEVER claim a clean erase when any subsystem did not verify. Avoid
+    // implying a single hold retries -- the full two-stage gesture (hold 8s,
+    // release, hold 3s again) is spelled out on statusScreenEraseIncomplete if
+    // the fault persists after restart.
+    const TextLine lines[] = {
+        {"Not fully erased", 1.12f, &kGfxTitle},
+        {"Some settings may", 1.0f, &kGfxBody},
+        {"remain. Restarting", 1.0f, &kGfxBody},
+        {"to retry erase.", 1.0f, &kGfxBody},
+    };
+    drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
+                  sizeof(lines) / sizeof(lines[0]));
+  }
 }

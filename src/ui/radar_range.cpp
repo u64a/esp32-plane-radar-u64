@@ -3,7 +3,6 @@
 #include "ui/radar_theme.h"
 
 #include <Preferences.h>
-#include <cstring>
 
 #include "services/settings_events.h"
 
@@ -29,32 +28,18 @@ void saveRangeIndex() {
   s_prefs.end();
 }
 
-void saveUseMiles() {
+// Persist + verify a bool preference by read-back (a default distinct from the
+// value being written) so a silently-failed NVS write is reported, not trusted.
+// The PROPOSED value is written; the caller updates its runtime copy only on a
+// verified success.
+bool saveBoolVerified(const char* key, bool value) {
   if (!s_prefs.begin(kPrefsNamespace, false)) {
-    return;
-  }
-  s_prefs.putBool(kPrefsMilesKey, s_use_miles);
-  s_prefs.end();
-}
-
-void saveShowRunways() {
-  if (!s_prefs.begin(kPrefsNamespace, false)) {
-    return;
-  }
-  s_prefs.putBool(kPrefsRunwaysKey, s_show_runways);
-  s_prefs.end();
-}
-
-bool portalCheckboxChecked(const char* value) {
-  if (value == nullptr || value[0] == '\0') {
     return false;
   }
-  // WiFiManager checkbox submits its value= attribute ("T", or "F" if we prefilled F).
-  if ((value[0] == 'T' || value[0] == 't' || value[0] == 'F' || value[0] == 'f') &&
-      value[1] == '\0') {
-    return true;
-  }
-  return strcmp(value, "on") == 0;
+  const bool wrote = s_prefs.putBool(key, value) > 0;
+  const bool verified = wrote && s_prefs.getBool(key, !value) == value;
+  s_prefs.end();
+  return verified;
 }
 
 }  // namespace
@@ -99,29 +84,41 @@ bool useMiles() { return s_use_miles; }
 
 bool showRunways() { return s_show_runways; }
 
-void saveMilesFromPortal(const char* checkbox_value) {
-  const bool next = portalCheckboxChecked(checkbox_value);
-  if (next == s_use_miles) {
-    return;  // no effective change: persist nothing, latch no redraw
+bool setUseMiles(bool use_miles) {
+  if (use_miles == s_use_miles) {
+    return true;  // no effective change: persist nothing, already saved
   }
-  s_use_miles = next;
-  saveUseMiles();
-  // Distance units are visual-only: mark a redraw-only change (never a query
-  // revision bump, freshness reset, or backoff change).
+  // Persist + read back the PROPOSED value FIRST; update the runtime value and
+  // mark the visual-only change ONLY on a verified write, so a failed write leaves
+  // the prior runtime value (a later identical retry is not falsely "already
+  // saved"). Distance units are visual-only: never a query revision bump.
+  if (!saveBoolVerified(kPrefsMilesKey, use_miles)) {
+    Serial.printf("Distance units: %s (SAVE FAILED)\n",
+                  use_miles ? "miles" : "km");
+    return false;
+  }
+  s_use_miles = use_miles;
   services::settings::markVisualChanged();
-  Serial.printf("Distance units: %s\n", s_use_miles ? "miles" : "km");
+  Serial.printf("Distance units: %s (saved)\n", s_use_miles ? "miles" : "km");
+  return true;
 }
 
-void saveRunwaysFromPortal(const char* checkbox_value) {
-  const bool next = portalCheckboxChecked(checkbox_value);
-  if (next == s_show_runways) {
-    return;  // no effective change: persist nothing, latch no redraw
+bool setShowRunways(bool show_runways) {
+  if (show_runways == s_show_runways) {
+    return true;  // no effective change: persist nothing, already saved
   }
-  s_show_runways = next;
-  saveShowRunways();
-  // Runway overlay is visual-only: redraw only, no query revision change.
+  // Persist + read back the PROPOSED value FIRST; update the runtime value and
+  // mark the visual-only change ONLY on a verified write. Runway overlay is
+  // visual-only: redraw only, no query revision change.
+  if (!saveBoolVerified(kPrefsRunwaysKey, show_runways)) {
+    Serial.printf("Runway overlay: %s (SAVE FAILED)\n",
+                  show_runways ? "on" : "off");
+    return false;
+  }
+  s_show_runways = show_runways;
   services::settings::markVisualChanged();
-  Serial.printf("Runway overlay: %s\n", s_show_runways ? "on" : "off");
+  Serial.printf("Runway overlay: %s (saved)\n", s_show_runways ? "on" : "off");
+  return true;
 }
 
 void formatRing3Label(char* buf, size_t len, float ring3_km, bool use_miles) {
@@ -132,14 +129,23 @@ void formatCurrentRing3Label(char* buf, size_t len) {
   formatRing3Label(buf, len, rangeCurrent().ring3_km, s_use_miles);
 }
 
-void unitsReset() {
+bool resetAll() {
+  s_range_index = core::range::kDefaultRangeIndex;
   s_use_miles = false;
   s_show_runways = true;
-  if (s_prefs.begin(kPrefsNamespace, false)) {
-    s_prefs.remove(kPrefsMilesKey);
-    s_prefs.remove(kPrefsRunwaysKey);
-    s_prefs.end();
+  if (!s_prefs.begin(kPrefsNamespace, false)) {
+    return false;
   }
+  s_prefs.remove(kPrefsRangeKey);
+  s_prefs.remove(kPrefsMilesKey);
+  s_prefs.remove(kPrefsRunwaysKey);
+  // remove() returns false for an already-absent key, so confirm the final state
+  // by read-back rather than trusting the remove() return values.
+  const bool ok = !s_prefs.isKey(kPrefsRangeKey) &&
+                  !s_prefs.isKey(kPrefsMilesKey) &&
+                  !s_prefs.isKey(kPrefsRunwaysKey);
+  s_prefs.end();
+  return ok;
 }
 
 }  // namespace ui::radar

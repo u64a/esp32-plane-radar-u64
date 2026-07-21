@@ -2,40 +2,46 @@
 
 <img width="800" height="450" alt="plane-radar" src="https://github.com/user-attachments/assets/716d0992-dab8-47ba-8f1a-2aec7f607419" />
 
-**3D printed case (STL + assembly):** [MakerWorld](https://makerworld.com/en/models/2872376-esp32-plane-radar-live-ads-b-on-a-round-display#profileId-3207083) · **Firmware:** [Releases](https://github.com/MatixYo/ESP32-Plane-Radar/releases)
+**3D printed case (STL + assembly):** [MakerWorld](https://makerworld.com/en/models/2872376-esp32-plane-radar-live-ads-b-on-a-round-display#profileId-3207083) · **Firmware (original/upstream project releases, reference for the original project; this private local hardening copy does not publish there):** [Releases](https://github.com/MatixYo/ESP32-Plane-Radar/releases)
 
-Firmware for an **ESP32-C3 Super Mini** and a **1.28″ round GC9A01** display (240×240). Shows a circular **ADS-B radar** around your configured location, with **WiFiManager** for first-time setup.
+Firmware for an **ESP32-C3 Super Mini** and a **1.28″ round GC9A01** display (240×240). Shows a circular **ADS-B radar** around your configured location, with a **temporary, secured Wi‑Fi setup portal** for first-time setup.
 
 ## What it does
 
-1. **Wi‑Fi setup** (if needed) — captive portal on AP **`PlaneRadar-Setup`**
+1. **Wi‑Fi setup** (if needed) — a **temporary WPA2‑protected** captive portal on a MAC‑derived AP (**`PlaneRadar-XXYYZZ`**) whose one‑time password is shown **only on the device screen**
 2. **Radar** — live aircraft from [adsb.fi](https://opendata.adsb.fi/) on a sonar-style grid, over **verified HTTPS** and only once **trusted UTC time** is established (see [Security: verified TLS & trusted time](#security-verified-tls--trusted-time-phase-7))
 
-After Wi‑Fi is saved, the device reconnects automatically; the radar runs in the main loop and refreshes on a **3 s completion‑relative** ADS‑B poll, backing off on errors and ageing to a stale/offline state when data stops arriving.
+After Wi‑Fi is saved, the device reconnects automatically; the radar runs in the main loop and refreshes on a **3 s completion‑relative** ADS‑B poll, backing off on errors and ageing to a stale/offline state when data stops arriving. There is **no permanent LAN listener, no mDNS, and no OTA** — the setup portal exists only while a setup session is active.
 
 ## Controls (BOOT, GPIO 9, active LOW)
 
+A single button drives three intents through the approved two‑stage gesture (never a fixed 3‑second reset, and no power‑on hold):
+
 | Action | Effect |
 |--------|--------|
-| **Short tap** | Cycle range preset (5 → 10 → 15 → 25 km); saved to flash |
-| **Hold 3 s** | Clear Wi‑Fi, location, and units; reboot into setup portal |
+| **Short tap** (40 ms – 1 s) | Cycle range preset (5 → 10 → 15 → 25 km); saved to flash |
+| **Hold 2–8 s, release** | Open the secure Wi‑Fi setup portal |
+| **Hold to 8 s (armed), release, then a separate 3 s hold within 10 s** | Factory erase (Wi‑Fi, location, range, units, runways, and the persisted time‑floor). The **same** hold can never erase — the 8 s hold only **arms** erase; it must be released, and then a fresh press held **3 s** within a **10 s** confirm window completes it, so a stuck button can’t wipe the device |
 
-During setup you can also hold BOOT at power-on to force a credential reset (same as the long press).
+The screen shows progressive prompts during a hold (“Release now to configure Wi‑Fi”, then “Keep holding to arm erase (8s)”, then, once armed and released, “Keep holding 3 sec to erase”). No prompt implies the same hold both configures and erases. There is **no** GPIO 9 power‑on dependency.
 
 ## Wi‑Fi setup portal
 
+The portal is a **temporary, WPA2‑secured SoftAP** at a fixed `192.168.4.1`. It opens automatically on first boot (no stored credentials) and on demand via the configure gesture. It runs for **5 minutes**, then closes; it is **never** a permanent LAN service.
+
 **First-time setup** (no saved Wi‑Fi):
 
-1. Connect to **`PlaneRadar-Setup`**
-2. Open **`http://plane-radar.local`** (preferred) or **`http://192.168.4.1`** — both are shown on the yellow setup screen; captive portal may open automatically
-3. Set home Wi‑Fi, then save
+1. The device screen shows the **network name** (`PlaneRadar-XXYYZZ`) and a **one‑time password** — join that Wi‑Fi with the shown password
+2. Open **`http://192.168.4.1`** (your phone’s captive‑portal prompt should pop it up automatically)
+3. Enter home Wi‑Fi (and optionally location/units/runways), then **Save & test**
 
-**Reconfigure anytime** (after the device is on your network):
+**Reconfigure** (device already on your network): hold BOOT **2–8 s** and release to reopen the same secured portal, then change Wi‑Fi/location/units/runways and save.
 
-1. Open **`http://plane-radar.local`** or **`http://<device-ip>`** (e.g. from your router or serial log at boot)
-2. Change Wi‑Fi, location, units, or runway overlay; save
+The submitted credential is **trialed in RAM first**: only after it actually connects — and the driver's active config is re‑verified to still equal the trialed candidate — is it written to flash, so a wrong password never destroys the working network and a stray link event on a stale config is never accepted. On failure the portal reopens with the **same** name/password for the rest of the 5‑minute window. If saved Wi‑Fi later fails to connect the device goes offline and shows the button instructions — it **never** auto‑opens the portal. The one‑time password appears **only** on the panel and is never logged or stored.
 
-The same portal runs on the setup AP and on the device’s LAN IP while connected to Wi‑Fi. mDNS hostname is `plane-radar` → **plane-radar.local** (`kPortalHostname` in `config.h`). Some clients resolve `.local` slowly; use the IP if needed.
+The credential transaction is **power‑loss durable**: a tiny dedicated NVS marker (`none` / `commit_in_progress` / `erase_pending`, a versioned + checksummed enum — **never** any password) is persisted and verified before any credential flash is touched and cleared only after the commit or an old‑config rollback is verified. If power is lost mid‑commit, or a boot credential read cannot be verified, the device enters a **fail‑closed credential fault** — it refuses to reconnect or reopen the portal (no false success) until a factory erase recovers it — rather than silently reconnecting on an unknown credential. The Wi‑Fi and hardware RF capture remain the final hardware‑only proof of a good beacon/link; the boot marker just guarantees an interrupted transaction is never mistaken for a normal boot.
+
+**Password field:** leaving it blank reuses the **stored** password **only** when the submitted SSID exactly matches the currently stored network; for any other/new SSID a blank password means an **open** network.
 
 **Custom fields** (stored in NVS):
 
@@ -45,7 +51,7 @@ The same portal runs on the setup AP and on the device’s LAN IP while connecte
 | **Display distances in miles** | Ring scale label in **mi** instead of **km** (e.g. `6mi` vs `10km`) |
 | **Show airport runways** | Major-airport runway overlay on the radar (off to hide) |
 
-After a reset, the device reboots and shows the setup screen immediately (no “Connecting” loop on stale credentials).
+Location, units, and runway choices submitted in the portal are staged and applied **only after** the new Wi‑Fi credential is committed, and each is read back to confirm it persisted; if a display setting fails to save the panel shows a truthful "Wi‑Fi saved; settings save failed" warning rather than silently claiming success (a verified Wi‑Fi credential is never rolled back for a display‑setting write failure). A factory erase is guarded by the `erase_pending` marker (so a power loss mid‑erase resumes the erase at the next boot, before any network) and clears Wi‑Fi, location, radar preferences (range, units, runways), and the persisted time‑floor — each step is read back and verified — then restarts only when **every** subsystem verifiably cleared **and** the marker clears. If any step could not be verified it shows a truthful "not fully erased" warning and stays network‑off/fail‑closed; a second confirming erase gesture (or a power‑cycle) retries rather than restarting into a normal boot with settings possibly remaining.
 
 ## Radar display
 
@@ -302,9 +308,10 @@ Edit **`include/config.h`** for hardware and behavior:
 
 | Area | Keys / notes |
 |------|----------------|
-| Portal | `kPortalApName`, `kPortalIp`, `kPortalHostname` / `kPortalHostUrl` (mDNS; needs `-DWM_MDNS` in `platformio.ini`) |
-| Wi‑Fi timing | connect attempts, reconnect grace, portal timeout (`0` = no timeout) |
-| BOOT | `kBootPin`, `kBootResetHoldMs`, `kBootTapMinMs` |
+| Secure portal | `kPortalIp` (`192.168.4.1`), `kPortalApChannel` / `kPortalApMaxConnections` (1) / `kPortalApVisible`, `kPortalSessionTimeoutMs` (5 min), captive HTTP/DNS `kPortalHttpPort` / `kPortalDnsPort` / `kPortalHttpIdleTimeoutMs` / `kPortalHttpOverallTimeoutMs` / `kPortalHttpWriteDeadlineMs` / `kPortalHttpLimits`, `kCandidateConnectTimeoutMs` (30 s). SSID + secrets are generated at runtime by `core/portal_secrets` — no static AP name, no mDNS |
+| Transaction marker | `kProvisionMarkerNvsNamespace` / `kProvisionMarkerNvsKey` — dedicated NVS namespace for the versioned + checksummed power‑loss marker (`core/txn_marker`; `none` / `commit_in_progress` / `erase_pending`, never a password) |
+| Wi‑Fi timing | connect attempts (`kWifiConnectAttempts` × `kWifiConnectAttemptMs`), reconnect grace `kWifiDownGraceMs`, retry interval `kWifiReconnectIntervalMs` |
+| BOOT / gesture | `kBootPin`, `kButtonPolicy` (approved `core::ProvisionButtonPolicy`: tap/configure/arm/confirm timings, `static_assert`-pinned) |
 | Display SPI | pins, `kDisplayInvert`, `kDisplayRgbOrder`, `kDisplaySpiWriteHz` |
 | Default location | `kDefaultRadarLat`, `kDefaultRadarLon` (until portal overrides) |
 | ADS-B | `kAdsbFetchIntervalMs`, `kAdsbShowGroundAircraft`; cumulative transport budgets `kAdsbConnectTimeoutMs` / `kAdsbOverallTimeoutMs` / `kAdsbStallTimeoutMs`; poll backoff `kAdsbSuccessIntervalMs` / `kAdsbTransientInitialMs` / `kAdsbTransientCapMs` / `kAdsbRateDefaultMs` / `kAdsbRetryAfterMinMs` / `kAdsbRetryAfterMaxMs` / `kAdsbPermanentBackoffMs`; freshness `kRadarStaleMs` / `kRadarOfflineMs` |
@@ -330,7 +337,11 @@ include/
     runway_overlay.h
     status_screens.h
   services/
-    wifi_setup.h
+    wifi_setup.h            — secure provisioning + runtime link controller (facade)
+    config_portal.h         — temporary captive WiFiServer + DNSServer portal transport
+    device_identity.h       — factory MAC + esp_fill_random entropy bridge
+    wifi_credentials.h      — fixed wifi_config_t snapshot/build/compare + storage
+    provision_marker.h      — durable NVS transaction marker (core/txn_marker record)
     radar_location.h
     adsb_client.h
 data/
@@ -399,22 +410,31 @@ SHA-256, Authenticode signature, and GCC version before caching it. The test scr
 uses that compiler only for its child PlatformIO process; it does not change the
 user or system `PATH`. No Arduino or ESP32 packages are linked into native tests.
 
-The suite currently comprises **277 test cases across 21 native suites** (all
-passing), including `test_time_trust` (26 cases: trusted-time state machine,
-derived monotonic clock, stale-sample revoke, versioned persisted-floor record,
-and the CA-authenticated certificate-`notBefore` floor ratchet) and
-`test_cert_time` (17 cases: fail-closed certificate-date parsing, RFC 5280
-validity, CA-signed `notBefore` extraction, and bounded full-chain
+The suite is certified at **513 test cases across 33 native suites**, run and
+passing **twice in succession** (no flaky/order-dependent cases). This includes
+the Phase 7 trust logic — `test_time_trust` (26 cases: trusted-time state
+machine, derived monotonic clock, stale-sample revoke, versioned
+persisted-floor record, and the CA-authenticated certificate-`notBefore` floor
+ratchet) and `test_cert_time` (17 cases: fail-closed certificate-date parsing,
+RFC 5280 validity, CA-signed `notBefore` extraction, and bounded full-chain
 peer-certificate validation — expired/future/malformed intermediates, empty and
-over-long chains) for the Phase 7 trust logic.
+over-long chains) — plus the Phase 8 provisioning-hardening suites added since:
+`test_http_request` / `test_http_router` (HTTP parsing and the closed captive
+route set), `test_portal_session` / `test_portal_auth` / `test_portal_secrets`
+(CSRF and form-field bounds), `test_url_form` (form decoding), `test_wifi_field`
+(Wi‑Fi field validation), `test_provision_button` (the tap/configure/arm/confirm
+button FSM), `test_txn_marker` (the power-loss-durable commit transaction),
+`test_factory_erase`, and `test_location_record`.
 
-The friend-seam gate and the **offline CA trust gate** are pure PowerShell
-(Windows PowerShell 5.1 and pwsh 7), need no ESP32 toolchain, and never touch the
-network:
+The friend-seam gate, the **offline CA trust gate**, and the **provisioning
+policy gate** are pure PowerShell (Windows PowerShell 5.1 and pwsh 7), need no
+ESP32 toolchain, and never touch the network:
 
 ```powershell
 .\scripts\check-native-test-access-gate.ps1   # SnapshotStoreTestAccess cannot leak into firmware
 .\scripts\verify-ca-bundle.ps1                # 4 pinned roots, no setInsecure, CA enforced, derived-time clock, CA-authenticated cert-notBefore floor
+.\scripts\verify-provisioning-policy.ps1      # 8 static release invariants against src/+include/+platformio.ini (no WiFiManager/OTA/mDNS, closed route set, no permanent listener, no secret logging, RAM/flash transaction policy, no insecure AP teardown, one framebuffer, bounded portal)
+.\scripts\verify-provisioning-policy.ps1 -SelfTest   # proves the gate itself rejects 9 representative negative tamper cases (re-added WiFiManager, forbidden/extra routes, secret logging, second framebuffer, insecure AP teardown, unguarded storage/teardown, commit-ordering ambiguity), on an isolated temp copy
 ```
 
 ### Memory budget
@@ -504,6 +524,41 @@ fixed 16-entry container stack); the only deeper transient stack is ArduinoJson'
 per-object recursion, which is bounded by the JSON depth limit of 16. Wi-Fi/TLS heap
 peaks, fragmentation, and largest-free-block behavior remain hardware-only measurements.
 
+**Phase 8 provisioning hardening** (the closed captive route set behind
+`http_router`/`http_request`, the CSRF-protected form portal, the power-loss-durable
+commit transaction, and the tap/configure/arm/confirm button FSM) is a **net flash
+shrink and a small, fixed RAM increase**, measured with the same pinned clean
+`supermini` build:
+
+| Build measurement | Phase 7 | Phase 8 | Δ vs Phase 7 |
+|-------------------|------:|------:|------:|
+| Linker-reported static RAM | 61,788 | 65,044 | +3,256 |
+| Linker-reported firmware flash | 1,261,268 | 1,142,914 | −118,354 |
+| `firmware.bin` image | 1,328,480 | 1,197,760 | −130,720 |
+| `firmware-merged.bin` image | 1,394,016 | 1,263,296 | −130,720 |
+
+Flash shrank because the Arduino `WiFiManager`, `WebServer`, OTA, and mDNS
+dependency surface they pulled in was removed in favor of the closed, bounded
+captive portal above — a net reduction even after adding the new router/form/CSRF
+and transaction-marker code. The +3,256 B static RAM is the bounded, fixed-size
+portal and button-controller state (the captive HTTP parser/response workspace,
+the button FSM's own state, and the committed/candidate/old Wi‑Fi config
+snapshots below) — there is still **no** per-request or per-fetch heap allocation.
+The single 240×240 RGB565 frame sprite remains unchanged at **115,200 B** of heap
+(still exactly one, heap-allocated once).
+
+Certified on-stack frames (`-fstack-usage`): `wifiBootConnect` 144 B, `wifiLoop`
+16 B, `feed` 320 B, `driveController` 208 B, `executeCommit` 208 B,
+`executeFactoryErase` 32 B, portal `start`/`pump`/`stop` 64 B / 256 B / 16 B, and
+the status screens' worst case 96 B. The largest application frame remains
+`drawAircraftFromSnapshot` at 2,048 B (unchanged from Phase 5/6/7). Hardware
+stack high-water marks and heap fragmentation remain device-only measurements.
+
+Key static portal buffers: the HTTP response workspace is 2,048 B, the request
+body buffer is 1,600 B, and the parser workspace is 1,072 B; the candidate,
+old, and expected `wifi_config_t` snapshots used by the commit transaction are
+140 B each.
+
 ### Web-flashable release image
 
 Single `.bin` for [esptool-js](https://espressif.github.io/esptool-js/) and similar tools (ESP32-C3, 4 MB, flash at **0x0**):
@@ -531,5 +586,6 @@ Put the board in download mode (hold **BOOT**, tap **RESET**), then flash with C
 ## Dependencies
 
 - [LovyanGFX](https://github.com/lovyan03/LovyanGFX)
-- [WiFiManager](https://github.com/tzapu/WiFiManager)
 - [ArduinoJson](https://github.com/bblanchon/ArduinoJson)
+
+The secure setup portal uses only the Arduino‑ESP32 built‑in Wi‑Fi stack — an Arduino **`WiFiServer`** plus **`DNSServer`** — inside a temporary SoftAP session. The `WiFiServer` is constructed with the exact‑IP constructor `WiFiServer(IPAddress(192,168,4,1), 80, 1)`, so it binds **only** the SoftAP address `192.168.4.1` with a one‑client backlog (never `INADDR_ANY`); the portal treats it as listening only after `begin()` and `operator bool()` are both true, accepts through `accept()` (never `available()`), and tears down with `end()`. To keep request secrets out of `WiFiClient`'s internal 1436‑byte RxBuffer, the accepted client's bytes are pumped with non‑blocking `lwip_recv`/`lwip_send` on `WiFiClient::fd()` and each raw read chunk is wiped after it is parsed. The SoftAP itself is brought up via a controlled paired low‑level sequence (`esp_wifi_stop` → `esp_wifi_set_mode(AP)` → `esp_wifi_set_config(AP, WPA2‑PSK/CCMP + one‑time secret)` → `esp_wifi_start`) so the **first** joinable beacon already carries the secret — never an open/default beacon. There is **no** WiFiManager, `WebServer`, mDNS, or OTA dependency.

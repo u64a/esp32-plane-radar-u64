@@ -40,18 +40,18 @@ uint8_t loadingPhase(uint32_t now_ms) {
   return static_cast<uint8_t>((now_ms / 500U) % 3U);
 }
 
-bool wifiConnected() { return WiFi.status() == WL_CONNECTED; }
+bool wifiConnected() { return wifiLinkUp(); }
 
 // --- runtime state -----------------------------------------------------------
 
 core::RadarDataState g_data = {};
 core::AdsbPollState g_poll = {};
-core::ReconnectState g_reconnect = {};
 
 core::FrameRenderKey g_last_key = {};
 bool g_has_last_key = false;
 bool g_force_redraw = false;
-bool g_wifi_connected = false;
+bool g_link_up = false;
+bool g_owns_display = false;
 
 // --- rendering ---------------------------------------------------------------
 
@@ -104,7 +104,7 @@ void applyPendingSettings(uint32_t now_ms) {
   }
 }
 
-// --- BOOT button -------------------------------------------------------------
+// --- range tap ---------------------------------------------------------------
 
 void onRangeTap() {
   ui::radar::rangeNext();  // marks an effective query change only on a real change
@@ -112,13 +112,6 @@ void onRangeTap() {
   ui::radar::formatCurrentRing3Label(range_label, sizeof(range_label));
   Serial.printf("Range: %s (outer ~%.0f km)\n", range_label,
                 ui::radar::rangeCurrent().outer_km);
-}
-
-void handleBootButton() {
-  bootButtonPollLongPress();
-  if (bootButtonConsumeTap()) {
-    onRangeTap();
-  }
 }
 
 // --- ADS-B fetch flow --------------------------------------------------------
@@ -187,8 +180,10 @@ void serviceAdsb() {
 
   // Before publication, run the controllable-latency side effects and re-consume
   // settings so a range tap or portal save during the blocking fetch is visible.
-  handleBootButton();
   wifiLoop();
+  if (wifiConsumeRangeTap()) {
+    onRangeTap();
+  }
   applyPendingSettings(millis());
 
   const uint32_t completed_ms = millis();
@@ -261,47 +256,6 @@ void serviceAdsb() {
   g_force_redraw = true;  // fetch completion / publication is a render trigger
 }
 
-// --- Wi-Fi branches ----------------------------------------------------------
-
-void serviceConnected() {
-  if (!g_wifi_connected) {
-    // Edge: reconnected outside the blocking reconnect path (e.g. the stack's
-    // own auto-reconnect). Restore the model and force exactly one immediate
-    // fetch without resetting the transient streak.
-    g_wifi_connected = true;
-    core::adsbSettingsChanged(&g_poll);
-    g_force_redraw = true;
-  }
-  core::reconnectConnected(&g_reconnect);
-  serviceAdsb();
-}
-
-void serviceDisconnected(uint32_t now_ms) {
-  if (g_wifi_connected) {
-    // Edge: Wi-Fi just dropped. Fetches pause simply by staying in this branch,
-    // but the radar model is kept: targets remain with NO WIFI and age to
-    // Stale/Offline normally. Do not hide the radar or reset freshness/backoff.
-    g_wifi_connected = false;
-    g_force_redraw = true;
-    Serial.println("WiFi lost — will reconnect");
-  }
-  core::reconnectDisconnected(&g_reconnect, now_ms);
-  if (core::reconnectAttemptDue(g_reconnect, now_ms, config::kWifiDownGraceMs,
-                                config::kWifiReconnectIntervalMs)) {
-    // wifiReconnect() blocks and paints the connecting screen over the panel.
-    const bool connected = wifiReconnect();
-    core::reconnectAttemptCompleted(&g_reconnect, millis(), connected);
-    // Always restore the radar model afterward so the connecting screen cannot
-    // stick, whether the attempt succeeded or failed.
-    g_force_redraw = true;
-    if (connected) {
-      g_wifi_connected = true;
-      core::adsbSettingsChanged(&g_poll);  // one immediate fetch, streak intact
-    }
-    // A failed attempt leaves the ADS-B backoff untouched by design.
-  }
-}
-
 }  // namespace
 
 void setup() {
@@ -310,14 +264,11 @@ void setup() {
   Serial.println();
   Serial.println("Plane Radar");
 
-  bootButtonInit();
+  wifiControllerInit();
   displayInit();
   const bool frame_buffered = ui::radarDisplayPrepareFrame();
   Serial.printf("radar: rendering mode: %s\n",
                 frame_buffered ? "frame sprite" : "direct draw");
-  if (wifiShowsSetupScreenOnBoot()) {
-    statusScreenPortal();
-  }
   services::location::init();
   ui::radar::rangeInit();
   services::adsb::setPollFn(wifiLoop);
@@ -325,12 +276,14 @@ void setup() {
   // the SNTP callback). Starts UNTRUSTED; ADS-B is gated until a fresh sample.
   services::timekeeper::init();
 
-  // Register the filtered Wi-Fi disconnect event callback BEFORE any network
-  // setup so a mid-fetch disconnect that auto-reconnects is still counted.
+  // Register the filtered Wi-Fi event callbacks (STA GOT_IP + DISCONNECTED) BEFORE
+  // any network setup so a mid-fetch disconnect that auto-reconnects is counted
+  // and every connect generation observes a fresh link-up.
   wifiRegisterEventHandlers();
 
-  // The portal connection flow may block and may mutate the settings revision.
-  wifiSetupConnect();
+  // Boot connect (blocks only for the connecting UI); opens secure setup
+  // automatically on first boot. May mutate the settings revision.
+  wifiBootConnect();
 
   // Always activate the radar frame, even if Wi-Fi is down.
   const uint32_t now_ms = millis();
@@ -341,28 +294,76 @@ void setup() {
   services::settings::consumeQueryChange();
   services::settings::consumeVisualChange();
   core::adsbRadarDisplayed(&g_poll);  // radar visible; forces the first fetch
-  g_wifi_connected = wifiConnected();
+  g_link_up = wifiLinkUp();
+  g_owns_display = wifiOwnsDisplay();
   g_force_redraw = true;
-  renderIfNeeded(now_ms);  // render a real RadarDisplayModel (Loading)
+  if (!g_owns_display) {
+    renderIfNeeded(now_ms);  // render a real RadarDisplayModel (Loading)
+  }
 }
 
 void loop() {
-  const uint32_t now_ms = millis();
-
-  handleBootButton();
-  applyPendingSettings(millis());
+  // The controller owns the whole Wi-Fi lifecycle: boot connect, the secure setup
+  // portal, the credential transaction, background reconnects, and the button.
   wifiLoop();
-  applyPendingSettings(millis());
 
-  // Advance the non-blocking trusted-time state machine before servicing ADS-B
-  // so serviceAdsb() sees the freshest trust state (and fetches immediately on
-  // the first loop after trust is established).
-  services::timekeeper::update(wifiConnected(), millis());
+  const uint32_t now_ms = millis();
+  const bool owns = wifiOwnsDisplay();
 
-  if (wifiConnected()) {
-    serviceConnected();
-  } else {
-    serviceDisconnected(now_ms);
+  // A range tap latch survives blocking work; apply it regardless of ownership so
+  // the query revision is current when the radar reclaims the panel.
+  if (wifiConsumeRangeTap()) {
+    onRangeTap();
+  }
+  applyPendingSettings(now_ms);
+
+  if (owns) {
+    // Provisioning / boot-connect / gesture prompts own the panel: skip ADS-B and
+    // the radar redraw so status screens are not overdrawn. Keep the link edge in
+    // sync so releasing ownership does not fabricate a reconnect edge.
+    g_link_up = wifiLinkUp();
+    g_owns_display = true;
+    delay(10);
+    return;
+  }
+
+  if (g_owns_display) {
+    g_force_redraw = true;  // reclaim the panel from a status screen
+    g_owns_display = false;
+  }
+
+  // Trusted-time state machine (SNTP only while a real STA link is up).
+  services::timekeeper::update(wifiLinkUp(), now_ms);
+
+  // Controller-forced immediate fetch (restored / newly committed STA success).
+  if (wifiConsumeImmediateFetch()) {
+    core::adsbSettingsChanged(&g_poll);
+  }
+
+  // Link edge: on a plain reconnect force exactly one immediate fetch (streak
+  // intact) and redraw; a drop keeps the radar with NO WIFI and ages normally.
+  const bool up = wifiLinkUp();
+  if (up != g_link_up) {
+    g_force_redraw = true;
+    if (up) {
+      core::adsbSettingsChanged(&g_poll);
+    }
+    g_link_up = up;
+  }
+
+  if (up) {
+    serviceAdsb();  // fetch when due; internally pumps wifiLoop (may take the panel)
+  }
+
+  // serviceAdsb()'s internal wifiLoop() (the ADS-B poll hook) can acquire the
+  // panel mid-fetch (e.g. a configure gesture opening setup). Recheck ownership
+  // and skip the final radar render if it changed, so a status screen is never
+  // overdrawn; the next loop forces a redraw when ownership is released.
+  if (wifiOwnsDisplay()) {
+    g_link_up = wifiLinkUp();
+    g_owns_display = true;
+    delay(10);
+    return;
   }
 
   renderIfNeeded(millis());

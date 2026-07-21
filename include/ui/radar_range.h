@@ -38,12 +38,22 @@ float fetchRadiusKm();
 
 bool useMiles();
 bool showRunways();
-/** WiFi portal checkbox: "T" = miles, otherwise km. */
-void saveMilesFromPortal(const char* checkbox_value);
-void saveRunwaysFromPortal(const char* checkbox_value);
+/** Set distance units (miles vs km). Persists + marks a visual-only change only
+ *  on an effective change; never bumps the query revision. Returns true when the
+ *  value is unchanged or the write persisted AND verified by read-back; false when
+ *  a changed value could not be durably persisted. */
+bool setUseMiles(bool use_miles);
+/** Set the runway overlay on/off. Persists + marks a visual-only change only on
+ *  an effective change; never bumps the query revision. Returns true when the
+ *  value is unchanged or the write persisted AND verified by read-back; false when
+ *  a changed value could not be durably persisted. */
+bool setShowRunways(bool show_runways);
 void formatRing3Label(char* buf, size_t len, float ring3_km, bool use_miles);
 void formatCurrentRing3Label(char* buf, size_t len);
-/** Reset distance units to km (e.g. with WiFi credential wipe). */
-void unitsReset();
+/** Factory reset ALL persisted radar preferences (range preset, distance units,
+ *  runway overlay) to defaults. Returns true only when the NVS keys are verifiably
+ *  absent afterward (read back), so a factory erase never claims success on a
+ *  failed clear. */
+bool resetAll();
 
 }  // namespace ui::radar

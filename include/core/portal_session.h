@@ -15,11 +15,14 @@
 //
 //   * The setup listener exists ONLY in SetupSession (portalListenerActive), and
 //     it is reached ONLY through an explicit radio + secrets handshake: entering
-//     setup first pauses ADS-B and disconnects STA and initializes the AP radio,
-//     then waits for PortalRadioReady (STA has no IP AND the AP radio is up),
-//     then requests secret generation and waits for SecretsReady before starting
-//     the listener. An entropy failure (SecretsFailed) fails closed and never
-//     exposes a listener. Secrets are NOT marked active until SecretsReady.
+//     setup first pauses ADS-B and disconnects STA and requests radio preparation,
+//     then waits for PortalRadioReady (STA is quiesced with NO IP and RF entropy
+//     is ready; the AP is NOT exposed yet -- start_ap_radio is a radio/entropy
+//     preparation, not AP exposure), then requests secret generation and waits for
+//     SecretsReady before starting the listener. Only start_listener actually
+//     exposes the SoftAP, and only after SecretsReady. An entropy failure
+//     (SecretsFailed) fails closed and never exposes a listener. Secrets are NOT
+//     marked active until SecretsReady.
 //   * A candidate connect (begin_candidate_trial) is emitted ONLY after the
 //     adapter acknowledges PortalQuiesced -- i.e. the client, HTTP listener,
 //     captive DNS, and SoftAP are all provably down. Submission and the trial are
@@ -74,6 +77,16 @@
 //     normal-STA id. A delayed link event from an earlier attempt is rejected. An
 //     unsolicited StaConnected in OfflineIdle is NOT accepted: the adapter must
 //     first request a new generation (StaRetry) before any link event applies.
+//     Hardware STA callbacks cannot carry a true originating generation id, so the
+//     sta_connection_id is an ADAPTER-attempt generation, not a driver fact: the
+//     adapter enforces the physical barriers the id relies on -- it re-baselines
+//     its GOT_IP/disconnect event counters only after disconnect/no-IP quiescence
+//     and immediately before each connect, requires a FRESH link-up event and (for
+//     a candidate) that the driver's CURRENT config still equals the candidate
+//     before echoing StaConnected/CandidateConnected, and confirms no-IP before
+//     reporting a loss/failure. The core id rejects a mismatched echo; delayed-
+//     event timing remains a hardware gate the adapter closes with those predicates
+//     (plus a bounded forced radio reset if a teardown cannot reach no-IP in time).
 //   * Delayed/stale async completions are rejected by IDENTITY. Every async side
 //     effect stamps the actions with the identity the adapter must echo, and each
 //     completion carries and must match that identity: the session_id (session-
@@ -123,7 +136,8 @@ enum class PortalInput : uint8_t {
   StaRetry,            // adapter-initiated background reconnect from OfflineIdle:
                        // mints a fresh sta_connection_id and (re)starts STA connect
   ConfigureButton,     // physical configure gesture: open setup
-  PortalRadioReady,    // ack: STA has no IP AND the AP radio is initialized
+  PortalRadioReady,    // ack: STA quiesced (no IP) AND RF entropy ready; the AP is
+                       // NOT exposed yet (radio/entropy prep, not "AP radio up")
   SecretsReady,        // ack: per-session secrets generated
   SecretsFailed,       // entropy failure: secret generation failed (fail closed)
   PortalQuiesced,      // ack: client + HTTP + captive DNS + SoftAP are down
@@ -143,9 +157,10 @@ enum class PortalInput : uint8_t {
 // means "do nothing".
 //
 // Radio/secrets sequencing is expressed through SEPARATE transitions rather than
-// action ordering: start_ap_radio (mode switch to AP; no SSID/DNS/HTTP yet) is
-// requested before secrets; start_listener (SoftAP SSID + captive DNS + HTTP)
-// only after SecretsReady; begin_candidate_trial only after PortalQuiesced.
+// action ordering: start_ap_radio (prepare the radio: quiesce STA + ready RF
+// entropy; the AP is NOT exposed and no SSID/DNS/HTTP exists yet) is requested
+// before secrets; start_listener (SoftAP SSID + captive DNS + HTTP) only after
+// SecretsReady; begin_candidate_trial only after PortalQuiesced.
 //
 // When an action set initiates an async operation that expects a completion, the
 // ack_* fields carry the identity the adapter MUST echo on that completion (see
@@ -155,7 +170,8 @@ struct PortalActions {
   bool stop_listener;                // stop client + HTTP + captive DNS + SoftAP
   bool start_sta_connect;            // begin STA connect with stored/old creds
   bool disconnect_sta;               // disconnect STA / drop its IP (pre-AP)
-  bool start_ap_radio;               // switch radio to AP mode / init AP netif
+  bool start_ap_radio;               // prepare radio (STA quiesced + RF entropy
+                                     // ready); AP NOT exposed (not "AP mode up")
   bool pause_adsb;                   // pause ADS-B (retain snapshot AND backoff)
   bool resume_adsb;                  // resume the ADS-B path
   bool force_immediate_adsb_fetch;   // force exactly one immediate fetch now
