@@ -1,0 +1,3 @@
+# Force LF for generated airport data so byte-exact --check works cross-platform.
+include/data/large_airports.h       text eol=lf
+src/data/large_airports_data.cpp    text eol=lf
