@@ -485,7 +485,7 @@ SHA-256, Authenticode signature, and GCC version before caching it. The test scr
 uses that compiler only for its child PlatformIO process; it does not change the
 user or system `PATH`. No Arduino or ESP32 packages are linked into native tests.
 
-The `native` env alone is certified at **567 cases across 38 suites**; `native-diag` runs **5 cases in 1 suite** (`test_runtime_diagnostics_on`); `scripts/native-test.ps1` runs both for **572 cases across 39 suite runs total**, passing **twice in succession** (no flaky/order-dependent cases). This includes
+The `native` env alone is certified at **580 cases across 39 suites**; `native-diag` runs **5 cases in 1 suite** (`test_runtime_diagnostics_on`); `scripts/native-test.ps1` runs both for **585 cases across 40 suite runs total**, passing **twice in succession** (no flaky/order-dependent cases). This includes
 the Phase 7 trust logic — `test_time_trust` (26 cases: trusted-time state
 machine, derived monotonic clock, stale-sample revoke, versioned
 persisted-floor record, and the CA-authenticated certificate-`notBefore` floor
@@ -796,7 +796,7 @@ Two new native test suites are added:
 - **`test_runtime_diagnostics`** (runs under `[env:native]`, `DIAGNOSTICS=0`): verifies default values, constexpr reflection, `WorkerResult` trivial copyability without the conditional field (with a C++17 `std::void_t` detection idiom proving field absence), and `elapsedMicros` rollover safety.
 - **`test_runtime_diagnostics_on`** (runs under `[env:native-diag]`, `DIAGNOSTICS=1` only): verifies `kDiagnosticsEnabled=true`, that `WorkerResult::fetch_duration_ms` is `uint32_t`, and that `WorkerResult` remains trivially copyable with the added field.
 
-The `native` env runs **567 cases across 38 suites**; `native-diag` runs **5 cases in 1 suite** (`test_runtime_diagnostics_on`); `scripts/native-test.ps1` executes **572 cases across 39 suite runs total**. The `native-diag` env uses `test_filter = test_runtime_diagnostics_on` + `test_ignore =` (clearing the inherited exclusion) so the default `native` env and `native-diag` never run each other's macro-sensitive tests.
+The `native` env runs **580 cases across 39 suites**; `native-diag` runs **5 cases in 1 suite** (`test_runtime_diagnostics_on`); `scripts/native-test.ps1` executes **585 cases across 40 suite runs total**. The `native-diag` env uses `test_filter = test_runtime_diagnostics_on` + `test_ignore =` (clearing the inherited exclusion) so the default `native` env and `native-diag` never run each other's macro-sensitive tests.
 
 The **ELF proof** (`nm` proves symbols; binary-safe scanning proves format strings — both from build artifacts, *not* a source check):
 - **Diagnostic symbols**: `g_diag_last_fetch_ms` and `radarDisplayLastDiagnostics` are **absent** from `supermini` and `supermini-worker` ELFs (`nm` confirms) and **present** in `supermini-diag` and `supermini-worker-diag` ELFs. This proves zero diagnostic cost in non-diag builds.
@@ -951,12 +951,12 @@ Renders in memory and compares exact LF bytes to checked-in files. Exits 0 if id
 
 ```powershell
 .\scripts\verify-airport-data.ps1              # Phase 11: OurAirports provenance gate (20 invariants)
-.\scripts\verify-airport-data.ps1 -SelfTest    # proves the gate rejects 18 tamper cases
+.\scripts\verify-airport-data.ps1 -SelfTest    # proves the gate rejects 24 tamper cases
 .\scripts\verify-egress-policy.ps1             # Phase 11: runtime egress source policy gate (12 invariants)
-.\scripts\verify-egress-policy.ps1 -SelfTest   # proves the gate rejects 27 tamper cases
+.\scripts\verify-egress-policy.ps1 -SelfTest   # proves the gate rejects 34 tamper cases
 ```
 
-The `scripts/native-test.ps1` script runs `verify-airport-data.ps1` fail-fast at its start before any PlatformIO tests.
+The `scripts/native-test.ps1` script runs both Phase 11 live gates (`verify-airport-data.ps1` and `verify-egress-policy.ps1`) fail-fast in its current PowerShell process before any PlatformIO tests; it does not run gate self-tests.
 
 No remote is added, no releases are published, and no GitHub Actions workflows are introduced by this project.
 
@@ -976,7 +976,7 @@ New Phase 11 gate commands:
 
 ```powershell
 .\scripts\verify-airport-data.ps1              # 20 source invariants
-.\scripts\verify-airport-data.ps1 -SelfTest    # 18 tamper cases
+.\scripts\verify-airport-data.ps1 -SelfTest    # 24 tamper cases
 .\scripts\verify-egress-policy.ps1             # 12 source invariants
-.\scripts\verify-egress-policy.ps1 -SelfTest   # 27 tamper cases
+.\scripts\verify-egress-policy.ps1 -SelfTest   # 34 tamper cases
 ```

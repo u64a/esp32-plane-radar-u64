@@ -61,6 +61,64 @@ function Read-Source {
   return Get-Content -Raw $Path
 }
 
+# Python lexical skeleton helper for the generator's ordinary syntax. It preserves
+# newlines and blanks comments and triple-quoted strings. With -BlankStrings it
+# also blanks ordinary string contents, so executable checks cannot be faked by
+# docstrings or string literals.
+function Get-PythonSkeleton {
+  param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [switch]$BlankStrings)
+  $out = New-Object System.Text.StringBuilder
+  $i = 0
+  while ($i -lt $Text.Length) {
+    $ch = $Text[$i]
+    if ($ch -eq '#') {
+      while ($i -lt $Text.Length -and $Text[$i] -ne "`n") { [void]$out.Append(' '); $i++ }
+      continue
+    }
+    if ($ch -eq '"' -or $ch -eq "'") {
+      $quote = [string]$ch
+      $triple = ($i + 2 -lt $Text.Length -and $Text.Substring($i, 3) -eq ($quote * 3))
+      if ($triple) {
+        for ($j = 0; $j -lt 3; $j++) { [void]$out.Append(' ') }; $i += 3
+        while ($i -lt $Text.Length) {
+          if ($i + 2 -lt $Text.Length -and $Text.Substring($i, 3) -eq ($quote * 3)) {
+            for ($j = 0; $j -lt 3; $j++) { [void]$out.Append(' ') }; $i += 3; break
+          }
+          if ($Text[$i] -eq "`n") { [void]$out.Append("`n") } else { [void]$out.Append(' ') }
+          $i++
+        }
+        continue
+      }
+      [void]$out.Append($ch); $i++
+      while ($i -lt $Text.Length) {
+        $current = $Text[$i]
+        if ($current -eq '\\' -and $i + 1 -lt $Text.Length) {
+          if ($BlankStrings) { [void]$out.Append(' '); [void]$out.Append(' ') }
+          else { [void]$out.Append($current); [void]$out.Append($Text[$i + 1]) }
+          $i += 2; continue
+        }
+        if ($current -eq $ch) { [void]$out.Append($current); $i++; break }
+        if ($BlankStrings) {
+          if ($current -eq "`n") { [void]$out.Append("`n") } else { [void]$out.Append(' ') }
+        } else { [void]$out.Append($current) }
+        $i++
+      }
+      continue
+    }
+    [void]$out.Append($ch); $i++
+  }
+  return $out.ToString()
+}
+
+function Get-PythonTopLevelFunctionBody {
+  param([Parameter(Mandatory)][string]$Skeleton, [Parameter(Mandatory)][string]$Name)
+  $start = [regex]::Match($Skeleton, '(?m)^def\s+' + [regex]::Escape($Name) + '\b[^\r\n]*:\s*$')
+  if (-not $start.Success) { return $null }
+  $next = ([regex]'(?m)^def\s+').Match($Skeleton, $start.Index + $start.Length)
+  $end = if ($next.Success) { $next.Index } else { $Skeleton.Length }
+  return $Skeleton.Substring($start.Index, $end - $start.Index)
+}
+
 function Parse-AirportEntries {
   param([Parameter(Mandatory)][string]$CppText)
   $rx = [regex]'^\s*\{"([A-Z]{4})",\s*(-?\d+),\s*(-?\d+)\},'
@@ -115,17 +173,17 @@ function Invoke-LiveGate {
   $AIRPORTS_SHA256 = "092223c8d6a1cf60c13d450e61a91438cc80c5fd50f92f52f49a38826e04a354"
   $RUNWAYS_SHA256  = "312f9ded8a5a29f8634bd615b0a7aadd4ed01e773ae63e5aab7c510629440fec"
 
-  # Strip Python comment lines before checking URL constants (comments may
-  # legitimately mention "/main/" as documentation of what is forbidden).
-  $pyCodeLines = ($pyText -split "`n") | Where-Object { $_ -notmatch '^\s*#' }
-  $pyCodeText  = $pyCodeLines -join "`n"
+  # Literal-preserved skeleton supports exact constants; executable checks use
+  # a strings-blanked skeleton so docstrings/literals cannot satisfy them.
+  $pyCodeText = Get-PythonSkeleton $pyText
+  $pyExecText = Get-PythonSkeleton $pyText -BlankStrings
 
   # 1. Exact pinned constants and pinned URL composition. A changed live URL must
   #    fail even if the old pinned commit string still appears elsewhere.
   if ($pyCodeText -notmatch ('(?m)^\s*_COMMIT\s*=\s*"' + [regex]::Escape($COMMIT) + '"\s*$')) {
     Fail "Generator _COMMIT must be exactly _COMMIT = `"$COMMIT`""
   }
-  $baseUrlRx = [regex]('(?s)_BASE_URL\s*=\s*\(\s*"https://raw\.githubusercontent\.com/davidmegginson/ourairports-data/"\s*\+\s*_COMMIT\s*\)')
+  $baseUrlRx = [regex]('(?ms)^\s*_BASE_URL\s*=\s*\(\s*"https://raw\.githubusercontent\.com/davidmegginson/ourairports-data/"\s*\+\s*_COMMIT\s*\)\s*$')
   if (-not $baseUrlRx.IsMatch($pyCodeText)) {
     Fail "Generator _BASE_URL must be composed from the pinned raw.githubusercontent base + _COMMIT"
   }
@@ -186,92 +244,47 @@ function Invoke-LiveGate {
     Fail "Generator RUNWAYS_LENGTH must be exactly 3_951_490"
   }
 
-  # 4. Hash-before-parse: each verifier compares the byte length to
-  #    expected_length AND the computed SHA-256 to expected_sha256 before
-  #    returning raw bytes; decode/CSV parsing happens only in _parse_csv after.
-  if ($pyCodeText -notmatch "_read_local_verified" -or $pyCodeText -notmatch "_fetch_verified") {
-    Fail "Generator missing _fetch_verified/_read_local_verified functions"
-  }
+  # 4. Bounded verifier bodies must execute exact raw-byte checks before return.
   foreach ($functionName in @("_fetch_verified", "_read_local_verified")) {
-    $verifyFuncRx = [regex]("(?s)def " + [regex]::Escape($functionName) + "\b.*?return data")
-    $verifyMatch = $verifyFuncRx.Match($pyText)
-    if (-not $verifyMatch.Success) { Fail "Could not locate $functionName body" }
-    $verifyBody = $verifyMatch.Value
-    $verifyCode = (($verifyBody -split "`n") | ForEach-Object {
-      $_ -replace '\s+#.*$', ''
-    }) -join "`n"
-    $returnIndex = $verifyCode.LastIndexOf("return data")
-    # Length comparison against expected_length, before returning raw bytes.
-    $lenMatch = [regex]::Match($verifyCode, '!=\s*expected_length')
-    if (-not $lenMatch.Success -or $lenMatch.Index -gt $returnIndex) {
-      Fail "$functionName must compare the byte length to expected_length before returning raw bytes"
+    $verifyBody = Get-PythonTopLevelFunctionBody $pyExecText $functionName
+    if ($null -eq $verifyBody) { Fail "Could not locate $functionName body" }
+    $returnMatch = [regex]::Match($verifyBody, '(?m)^\s*return\s+data\s*$')
+    if (-not $returnMatch.Success) { Fail "$functionName must return data in its own body" }
+    foreach ($required in @(
+      @{ Pat = '(?m)^\s*actual_len\s*=\s*len\s*\(\s*data\s*\)\s*$'; Msg = 'actual_len = len(data)' },
+      @{ Pat = '(?m)^\s*if\s+actual_len\s*!=\s*expected_length\s*:\s*$'; Msg = 'if actual_len != expected_length:' },
+      @{ Pat = '(?m)^\s*actual_sha\s*=\s*hashlib\.sha256\s*\(\s*data\s*\)\.hexdigest\s*\(\s*\)\s*$'; Msg = 'actual_sha = hashlib.sha256(data).hexdigest()' },
+      @{ Pat = '(?m)^\s*if\s+actual_sha\s*!=\s*expected_sha256\s*:\s*$'; Msg = 'if actual_sha != expected_sha256:' }
+    )) {
+      $match = [regex]::Match($verifyBody, $required.Pat)
+      if (-not $match.Success -or $match.Index -gt $returnMatch.Index) { Fail "$functionName must execute '$($required.Msg)' before return data" }
     }
-    # Computed SHA-256 present AND compared to expected_sha256, before returning.
-    $hashIndex = $verifyCode.IndexOf("hashlib.sha256")
-    if ($hashIndex -lt 0 -or $hashIndex -gt $returnIndex) {
-      Fail "$functionName must compute hashlib.sha256 before returning raw bytes"
-    }
-    $shaCmpMatch = [regex]::Match($verifyCode, '!=\s*expected_sha256')
-    if (-not $shaCmpMatch.Success -or $shaCmpMatch.Index -gt $returnIndex) {
-      Fail "$functionName must compare the computed SHA-256 to expected_sha256 before returning raw bytes"
-    }
-    # Decode/CSV parsing must not occur in a verifier; it returns raw bytes.
-    if ($verifyCode -match [regex]::Escape("decode(") -or $verifyCode -match "csv.DictReader") {
-      Fail "$functionName must not decode/parse CSV; it must return raw bytes for separate parsing"
-    }
+    if ($verifyBody -match '\bdecode\s*\(' -or $verifyBody -match 'csv\.DictReader') { Fail "$functionName must not decode/parse CSV" }
   }
-  # _parse_csv must exist and do the decode
-  if ($pyText -notmatch "_parse_csv" -or $pyText -notmatch [regex]::Escape(".decode(")) {
-    Fail "Generator missing _parse_csv function with decode"
+  $fetchLiteralBody = Get-PythonTopLevelFunctionBody $pyCodeText "_fetch_verified"
+  if ($null -eq $fetchLiteralBody -or $fetchLiteralBody -notmatch '(?ms)^\s*req\s*=\s*urllib\.request\.Request\s*\(\s*url\s*,\s*headers\s*=\s*\{\s*"Accept-Encoding"\s*:\s*"identity"\s*\}\s*\)\s*$') {
+    Fail "_fetch_verified must construct Request(url, headers={\"Accept-Encoding\": \"identity\"})"
   }
+  if ($pyExecText -notmatch '(?m)^def\s+_parse_csv\b' -or $pyExecText -notmatch '\.decode\s*\(') { Fail "Generator missing _parse_csv function with decode" }
 
-  # 5. Identity encoding
-  if ($pyCodeText -notmatch [regex]::Escape("Accept-Encoding") -or
-      $pyCodeText -notmatch [regex]::Escape("identity")) {
-    Fail "Generator does not set Accept-Encoding: identity"
+  # 5. Exact deterministic writes; literal contents are intentionally inspected.
+  foreach ($write in @('OUT_H\.write_bytes\(header\.encode\("utf-8"\)\)', 'OUT_CPP\.write_bytes\(cpp\.encode\("utf-8"\)\)')) {
+    if ($pyCodeText -notmatch $write) { Fail "Generator must use deterministic UTF-8 write_bytes output" }
   }
+  if ($pyExecText -match '\bwrite_text\s*\(') { Fail "Generator must not use write_text" }
 
-  # 6. write_bytes LF
-  if ($pyCodeText -notmatch [regex]::Escape("write_bytes")) {
-    Fail "Generator must write files with write_bytes"
-  }
-  if ($pyCodeText -notmatch '\.encode\("utf-8"\)' -and
-      $pyCodeText -notmatch "\.encode\('utf-8'\)") {
-    Fail "Generator must encode with .encode('utf-8') or .encode(`"utf-8`")"
-  }
-  if ($pyCodeText -match [regex]::Escape("write_text")) {
-    Fail "Generator must not use write_text"
-  }
+  # 6. Paired local arguments must be executable main-body enforcement.
+  $mainBody = Get-PythonTopLevelFunctionBody $pyExecText "main"
+  if ($null -eq $mainBody -or $mainBody -notmatch '(?ms)^\s*if\s+bool\s*\(\s*local_airports\s*\)\s*!=\s*bool\s*\(\s*local_runways\s*\)\s*:\s*\r?\n\s*parser\.error\s*\(') { Fail "main must enforce paired local CSV arguments with parser.error" }
 
-  # 7. Paired local arguments: both or neither must be enforced
-  if (($pyCodeText -notmatch [regex]::Escape("both or neither")) -and
-      ($pyCodeText -notmatch [regex]::Escape("specified together"))) {
-    Fail "Generator must enforce that --airports-csv and --runways-csv are paired"
-  }
-
-  # 8. Check mode
-  if ($pyCodeText -notmatch [regex]::Escape("--check")) {
-    Fail "Generator is missing --check mode"
-  }
-  if ($pyCodeText -notmatch [regex]::Escape("check_mode")) {
-    Fail "Generator is missing check_mode function"
-  }
-  $checkModeRx = [regex]"(?s)def check_mode\b.*?return \d"
-  $checkMatch = $checkModeRx.Match($pyText)
-  if (-not $checkMatch.Success) {
-    Fail "Could not locate the 'def check_mode ... return <int>' body; body checks cannot be silently skipped"
-  }
-  $checkBody = $checkMatch.Value
-  if ($checkBody -match "write_bytes" -or $checkBody -match "write_text") {
-    Fail "check_mode must not write files"
-  }
-  if ($checkBody -notmatch '(?m)^\s*on_disk\s*=\s*path\.read_bytes\(\)\s*$') {
-    Fail "check_mode must compare path.read_bytes() directly to rendered bytes"
-  }
-  if ($checkBody -match 'path\.read_bytes\(\)\s*\.' -or
-      $checkBody -match [regex]::Escape(".replace(b")) {
-    Fail "check_mode must not normalize CRLF or otherwise transform on-disk bytes"
-  }
+  # 7. check_mode is independently bounded and side-effect free.
+  if ($pyCodeText -notmatch [regex]::Escape("--check")) { Fail "Generator is missing --check mode" }
+  $checkBody = Get-PythonTopLevelFunctionBody $pyExecText "check_mode"
+  if ($null -eq $checkBody) { Fail "Could not locate check_mode body" }
+  if ($checkBody -match '\bwrite_bytes\s*\(' -or $checkBody -match '\bwrite_text\s*\(') { Fail "check_mode must not write files" }
+  if ($checkBody -notmatch '(?m)^\s*on_disk\s*=\s*path\.read_bytes\s*\(\s*\)\s*$') { Fail "check_mode must compare path.read_bytes() directly to rendered bytes" }
+  if ($checkBody -match 'path\.read_bytes\s*\(\s*\)\s*\.' -or $checkBody -match '\.replace\s*\(') { Fail "check_mode must not transform on-disk bytes" }
+  if ($checkBody -notmatch '(?m)^\s*return\s+0\s+if\s+ok\s+else\s+1\s*$') { Fail "check_mode must return 0 if ok else 1 in its own body" }
 
   # 9. Stable provenance in .h
   foreach ($frag in @(
@@ -406,25 +419,9 @@ function Invoke-LiveGate {
     Fail "Generator embeds dynamic timestamp/Python-version in render output"
   }
 
-  # 20. No trust-on-first-use or auto-update-hash mode in executable code
-  # Strip docstrings (simple heuristic: lines between """ markers) and comments.
-  $inDocstring = $false
-  $pyExecLines = foreach ($line in ($pyText -split "`n")) {
-    $stripped = $line.Trim()
-    if ($stripped -match '"""') {
-      if ($inDocstring) { $inDocstring = $false } else { $inDocstring = $true }
-      continue
-    }
-    if ($inDocstring) { continue }
-    if ($stripped -match "^#") { continue }
-    $line
-  }
-  $pyExecText = $pyExecLines -join "`n"
-  foreach ($pat in @("--update-hash", "--fetch-hash", "auto_update_hash",
-                     "update_hash_mode", "trust_on_first_use")) {
-    if ($pyExecText -imatch [regex]::Escape($pat)) {
-      Fail "Generator contains disallowed hash-bypass/auto-update pattern in code: $pat"
-    }
+  # 20. No trust-on-first-use or auto-update-hash mode in executable code.
+  foreach ($pat in @("--update-hash", "--fetch-hash", "auto_update_hash", "update_hash_mode", "trust_on_first_use")) {
+    if ($pyCodeText -imatch [regex]::Escape($pat)) { Fail "Generator contains disallowed hash-bypass/auto-update pattern in code: $pat" }
   }
 
   Write-Host "OK: all 20 airport-data invariants verified."
@@ -567,8 +564,27 @@ function Invoke-SelfTest {
     $badPy18 = $pyOrig -replace [regex]::Escape("def check_mode("), "def check_mode_renamed("
     Expect-Fail "check_mode body not locatable" $badPy18 $hOrig $cppOrig $attrOrig
 
+    # T19: verifier-looking docstring text cannot replace executable checks.
+    $badPy19 = $pyOrig -replace [regex]::Escape("    actual_len = len(data)"), ('    """actual_len = len(data)' + "`n" + '    if actual_len != expected_length:' + "`n" + '    actual_sha = hashlib.sha256(data).hexdigest()' + "`n" + '    if actual_sha != expected_sha256:' + "`n" + '    """')
+    Expect-Fail "verifier docstring bypass" $badPy19 $hOrig $cppOrig $attrOrig
+    # T20: check_mode cannot borrow a later numeric return from main.
+    $badPy20 = $pyOrig -replace [regex]::Escape("    return 0 if ok else 1"), "    pass"
+    Expect-Fail "check_mode missing own return" $badPy20 $hOrig $cppOrig $attrOrig
+    # T21: _BASE_URL must end at the parenthesized pinned expression.
+    $badPy21 = $pyOrig -replace '(?m)(\s+\+ _COMMIT\r?\n\))', '$1 + "/evil"'
+    Expect-Fail "extended base URL expression" $badPy21 $hOrig $cppOrig $attrOrig
+    # T22: identity encoding must be the actual Request header.
+    $badPy22 = $pyOrig -replace [regex]::Escape('headers={"Accept-Encoding": "identity"}'), 'headers={}'
+    Expect-Fail "missing Request identity header" $badPy22 $hOrig $cppOrig $attrOrig
+    # T23: help text cannot replace paired local-argument enforcement.
+    $badPy23 = $pyOrig -replace [regex]::Escape("if bool(local_airports) != bool(local_runways):"), "if False:"
+    Expect-Fail "missing paired local-argument enforcement" $badPy23 $hOrig $cppOrig $attrOrig
+    # T24: generic write_bytes/encode text cannot replace exact LF writes.
+    $badPy24 = $pyOrig -replace [regex]::Escape('OUT_H.write_bytes(header.encode("utf-8"))'), 'OUT_H.write_bytes(header.encode("ascii"))'
+    Expect-Fail "non-deterministic header write encoding" $badPy24 $hOrig $cppOrig $attrOrig
+
     Write-Host ""
-    Write-Host "OK: all 18 self-test tamper cases correctly rejected."
+    Write-Host "OK: all 24 self-test tamper cases correctly rejected."
   } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
   }

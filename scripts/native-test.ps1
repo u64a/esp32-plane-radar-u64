@@ -13,6 +13,10 @@ $airportGate = Join-Path $PSScriptRoot "verify-airport-data.ps1"
 # stale value would be unsafe. Rely on the thrown exception instead.
 & $airportGate -ProjectRoot $projectRoot
 Write-Host ""
+Write-Host "--- verify-egress-policy gate ---"
+$egressGate = Join-Path $PSScriptRoot "verify-egress-policy.ps1"
+& $egressGate -ProjectRoot $projectRoot
+Write-Host ""
 
 $toolchainVersion = "2.8.0"
 $gccVersion = "16.1.0"

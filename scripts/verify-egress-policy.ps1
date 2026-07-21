@@ -229,31 +229,21 @@ function Invoke-LiveGate {
   $timekeeperRaw  = Get-Content -Raw $timekeeperPath
   $timekeeperText = Get-CodeSkeleton $timekeeperRaw               # comments stripped, strings/chars kept
   $timekeeperSkel = Get-CodeSkeleton $timekeeperRaw -BlankStrings # strings+chars+comments blanked
-  # Require executable code equivalent to the full SNTP server chain:
-  #   s1 = config::kSntpServerPrimary
-  #   s2 = kSntpServerFallback1[0] != '\0' ? kSntpServerFallback1 : nullptr
-  #   s3 = kSntpServerFallback2[0] != '\0' ? kSntpServerFallback2 : nullptr
-  # The char literal '\0' interiors are inspected, so the strings/chars-preserved
-  # skeleton is used here; the configTime executable call is verified separately
-  # on the strings-blanked skeleton so a string literal cannot fabricate it.
+  # Require the exact executable full SNTP server chain. Char-literal contents
+  # are blanked in $timekeeperSkel, so the fallback tests accept the preserved
+  # quote shape while text in comments/strings cannot satisfy the checks.
   $sntpChainRequired = @(
-    @{ Pat = '=\s*config::kSntpServerPrimary\s*;'; Msg = "timekeeper.cpp must assign s1 = config::kSntpServerPrimary" },
-    @{ Pat = "config::kSntpServerFallback1\s*\[\s*0\s*\]\s*!=\s*'\\0'\s*\?\s*config::kSntpServerFallback1\s*:\s*nullptr"; Msg = "timekeeper.cpp must derive s2 from kSntpServerFallback1 (empty => nullptr)" },
-    @{ Pat = "config::kSntpServerFallback2\s*\[\s*0\s*\]\s*!=\s*'\\0'\s*\?\s*config::kSntpServerFallback2\s*:\s*nullptr"; Msg = "timekeeper.cpp must derive s3 from kSntpServerFallback2 (empty => nullptr)" }
+    @{ Pat = '(?m)^\s*const\s+char\s*\*\s*s1\s*=\s*config::kSntpServerPrimary\s*;\s*$'; Msg = "timekeeper.cpp must assign s1 = config::kSntpServerPrimary" },
+    @{ Pat = "(?ms)^\s*const\s+char\s*\*\s*s2\s*=\s*config::kSntpServerFallback1\s*\[\s*0\s*\]\s*!=\s*'\s*'\s*\?\s*config::kSntpServerFallback1\s*:\s*nullptr\s*;\s*$"; Msg = "timekeeper.cpp must derive s2 from kSntpServerFallback1 (empty => nullptr)" },
+    @{ Pat = "(?ms)^\s*const\s+char\s*\*\s*s3\s*=\s*config::kSntpServerFallback2\s*\[\s*0\s*\]\s*!=\s*'\s*'\s*\?\s*config::kSntpServerFallback2\s*:\s*nullptr\s*;\s*$"; Msg = "timekeeper.cpp must derive s3 from kSntpServerFallback2 (empty => nullptr)" },
+    @{ Pat = '(?m)^\s*configTime\s*\(\s*0\s*,\s*0\s*,\s*s1\s*,\s*s2\s*,\s*s3\s*\)\s*;'; Msg = "timekeeper.cpp must call configTime(0, 0, s1, s2, s3)" }
   )
   foreach ($req in $sntpChainRequired) {
-    if ($timekeeperText -notmatch $req.Pat) { Fail $req.Msg }
+    if ($timekeeperSkel -notmatch $req.Pat) { Fail $req.Msg }
   }
-  # The configTime call must pass (0, 0, s1, s2, s3) as executable code.
-  if ($timekeeperSkel -notmatch 'configTime\s*\(\s*0\s*,\s*0\s*,\s*\w+\s*,\s*\w+\s*,\s*\w+\s*\)') {
-    Fail "timekeeper.cpp must call configTime(0, 0, s1, s2, s3)"
-  }
-  # Ban alternate SNTP server configuration paths. The existing time-sync
-  # notification callback (sntp_set_time_sync_notification_cb) remains allowed.
+  # Alternate SNTP configuration APIs are forbidden anywhere in production.
   foreach ($banned in @('\bconfigTzTime\s*\(', '\bsntp_setservername\s*\(', '\besp_sntp_setservername\s*\(')) {
-    if ($timekeeperSkel -match $banned) {
-      Fail "timekeeper.cpp contains banned alternate SNTP configuration API: $banned"
-    }
+    if ($combinedSkel -match $banned) { Fail "Production source contains banned alternate SNTP configuration API: $banned" }
   }
 
   # -------------------------------------------------------------------------
@@ -354,8 +344,9 @@ function Invoke-LiveGate {
 
   foreach ($f in $prodFiles) {
     $fname = [System.IO.Path]::GetFileName($f)
-    # Skip PEM/CA bundle files (certificate data contains many hostnames)
-    if ($fname -match "ca_bundle" -or $fname -match "adsb_ca") { continue }
+    # Only the checked-in PEM bundle is exempt; similarly named source files
+    # remain endpoint-scanned and cannot hide an external destination.
+    if ($fname -ceq "adsb_ca_bundle.cpp") { continue }
     $fText = Get-Content -Raw $f
     $fSkel = Get-CodeSkeleton $fText  # comments stripped, strings kept
     $hostMatches = $suspiciousHostRx.Matches($fSkel)
@@ -388,40 +379,25 @@ function Invoke-LiveGate {
     }
   }
 
-  # platformio.ini is part of the declared production scope: an endpoint-defining
-  # build flag/macro (e.g. -DSOME_HOST="evil.example" or a URL/IP baked into a
-  # -D define) would silently introduce a runtime destination the C/C++ scan
-  # never sees. Scan build-flag define (-D...) lines for host/URL/IP endpoints.
+  # platformio.ini is part of the declared production scope. Normalize every
+  # -D macro value before endpoint classification: PlatformIO accepts bare,
+  # quoted, nested-quoted, and backslash-escaped forms.
   foreach ($rawLine in ($platformioText -split "`r?`n")) {
-    $line = $rawLine
-    if ($line -notmatch '-D') { continue }  # focus on build-flag define lines
-    # -Dname="host.tld" / -Dname='host.tld' macro endpoint literals
-    foreach ($dm in ([regex]'-D\s*\w+\s*=\s*(["''])([^"'']*)\1').Matches($line)) {
-      $val = $dm.Groups[2].Value
+    if ($rawLine -notmatch '-D') { continue }
+    foreach ($dm in ([regex]'-D\s*[A-Za-z_]\w*\s*=\s*([^\s]+)').Matches($rawLine)) {
+      $val = $dm.Groups[1].Value.Trim()
+      $val = $val -replace '\\(["''])', '$1'
+      while ($val.Length -ge 2 -and (($val[0] -eq '"' -and $val[$val.Length - 1] -eq '"') -or ($val[0] -eq "'" -and $val[$val.Length - 1] -eq "'"))) {
+        $val = $val.Substring(1, $val.Length - 2).Trim()
+        $val = $val -replace '\\(["''])', '$1'
+      }
       if ($val -match '^(?:https?|wss?)://([^/\s]+)') {
-        $h = $Matches[1]
-        if (($approvedHosts -notcontains $h) -and $h -ne "192.168.4.1") {
-          Fail "platformio.ini build flag defines external URL endpoint: '$val'"
-        }
-      }
-      elseif ($val -match '^[a-zA-Z][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,}$' -and
-              ($approvedHosts -notcontains $val)) {
+        $host = $Matches[1]
+        if (($approvedHosts -notcontains $host) -and $host -ne "192.168.4.1") { Fail "platformio.ini build flag defines external URL endpoint: '$val'" }
+      } elseif ($val -match '^[a-zA-Z][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,}$' -and ($approvedHosts -notcontains $val)) {
         Fail "platformio.ini build flag defines external hostname endpoint: '$val'"
-      }
-      elseif ($val -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$' -and $val -ne "192.168.4.1") {
+      } elseif ($val -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$' -and $val -ne "192.168.4.1") {
         Fail "platformio.ini build flag defines external IP endpoint: '$val'"
-      }
-    }
-    # bare URL / dotted-IP endpoint literals on a build-flag line
-    foreach ($um in ([regex]'(?:https?|wss?)://([^/\s"'']+)').Matches($line)) {
-      $h = $um.Groups[1].Value
-      if (($approvedHosts -notcontains $h) -and $h -ne "192.168.4.1") {
-        Fail "platformio.ini contains external URL endpoint literal: '$($um.Value)'"
-      }
-    }
-    foreach ($ipm in ([regex]'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b').Matches($line)) {
-      if ($ipm.Groups[1].Value -ne "192.168.4.1") {
-        Fail "platformio.ini contains external IP endpoint literal: '$($ipm.Groups[1].Value)'"
       }
     }
   }
@@ -571,6 +547,8 @@ function Invoke-SelfTest {
     # Remove any stray tamper files dropped by extension-coverage tests.
     Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $tmp "src\services\extra_egress.ino")
     Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $tmp "src\services\extra_egress.cc")
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $tmp "src\servicesdsb_ca_backdoor.ino")
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $tmp "src\serviceslt_sntp.cpp")
   }
 
   function Expect-Fail([string]$Label) {
@@ -748,8 +726,35 @@ function Invoke-SelfTest {
     Expect-Fail "flipped does-not-send negation"
     Reset-Tmp
 
+    # T28: only the exact PEM filename is exempt from endpoint scanning.
+    [System.IO.File]::WriteAllText((Join-Path $tmp "src\services\adsb_ca_backdoor.ino"), 'const char* kEvil = "evil.example.com";' + "`n")
+    Expect-Fail "similarly named CA source is scanned"
+    Reset-Tmp
+    # T29: alternate SNTP APIs are banned outside timekeeper.cpp too.
+    [System.IO.File]::WriteAllText((Join-Path $tmp "src\services\alt_sntp.cpp"), 'void alt() { configTzTime("UTC0", "evil.example.com"); }' + "`n")
+    Expect-Fail "alternate SNTP API in another production file"
+    Reset-Tmp
+    # T30: configTime must bind the three distinct chain variables.
+    Write-TmpTimekeeper ($timekeeperOrig -replace [regex]::Escape("configTime(0, 0, s1, s2, s3)"), "configTime(0, 0, s1, s1, s1)")
+    Expect-Fail "configTime does not use s1 s2 s3 chain"
+    Reset-Tmp
+    # T31: ternary-looking text in a string cannot substitute for s2's code.
+    Write-TmpTimekeeper ($timekeeperOrig -replace [regex]::Escape("config::kSntpServerFallback1[0] != '\0' ? config::kSntpServerFallback1 : nullptr"), 'nullptr; const char* fake = "config::kSntpServerFallback1[0] != ''\0'' ? config::kSntpServerFallback1 : nullptr"')
+    Expect-Fail "SNTP ternary string bypass"
+    Reset-Tmp
+    # T32-T34: endpoint macros are normalized before classification.
+    Write-TmpPlatformio ($platformioOrig -replace [regex]::Escape("-DARDUINO_USB_MODE=1"), "-DADSB_HOST='`"evil.example.com`"'")
+    Expect-Fail "nested-quoted platformio hostname"
+    Reset-Tmp
+    Write-TmpPlatformio ($platformioOrig -replace [regex]::Escape("-DARDUINO_USB_MODE=1"), '-DADSB_HOST=\"evil.example.com\"')
+    Expect-Fail "escaped-quoted platformio hostname"
+    Reset-Tmp
+    Write-TmpPlatformio ($platformioOrig -replace [regex]::Escape("-DARDUINO_USB_MODE=1"), '-DADSB_HOST=evil.example.com')
+    Expect-Fail "bare platformio hostname"
+    Reset-Tmp
+
     Write-Host ""
-    Write-Host "OK: all 27 self-test tamper cases correctly rejected."
+    Write-Host "OK: all 34 self-test tamper cases correctly rejected."
   } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
   }
