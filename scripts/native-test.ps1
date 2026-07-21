@@ -4,6 +4,22 @@ param()
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 
+# scripts/native-test.ps1 is ALWAYS read-only with respect to the checked-in
+# render goldens (test/golden): it is a certification gate and NEVER an update
+# path. If the parent environment opts into golden rewriting
+# (PLANE_RADAR_UPDATE_GOLDENS=1), a passing native-gfx gate could silently
+# overwrite checked-in expectations, so fail closed HERE, before any build or
+# test runs (a narrow, prelude-free negative check). Intentional golden updates
+# are DIRECT ONLY: run `pio test -e native-gfx` with PLANE_RADAR_UPDATE_GOLDENS=1
+# yourself; this script will never do it for you.
+if ($env:PLANE_RADAR_UPDATE_GOLDENS -eq "1") {
+  $msg = "scripts/native-test.ps1 is read-only and refuses to run with " +
+    "PLANE_RADAR_UPDATE_GOLDENS=1: this certified gate never rewrites render " +
+    "goldens. To intentionally update goldens, run a direct " +
+    "'pio test -e native-gfx' invocation with PLANE_RADAR_UPDATE_GOLDENS=1."
+  throw $msg
+}
+
 # Phase 11: run the airport-data offline gate fail-fast before any PlatformIO tests.
 Write-Host "--- verify-airport-data gate ---"
 $airportGate = Join-Path $PSScriptRoot "verify-airport-data.ps1"
@@ -100,8 +116,12 @@ if ($diagProcess.ExitCode -ne 0) {
 # into a native binary, renders every named scene into an in-RAM 240x240 RGB565
 # LovyanGFX sprite canvas, and byte-compares the captured framebuffer against the
 # checked-in golden BMPs (test/golden). Fully offline/headless: no SDL2, no
-# window, no hardware. Read-only: goldens are rewritten only under an explicit
-# PLANE_RADAR_UPDATE_GOLDENS=1 opt-in, never during this gate. Fail fast.
+# window, no hardware. ALWAYS read-only: this gate never writes goldens. The
+# script fails closed at the top on PLANE_RADAR_UPDATE_GOLDENS=1, and as defence
+# in depth the key is stripped from the child below, so the native-gfx binary can
+# never observe an inherited update opt-in. Intentional golden updates are
+# direct-only (`pio test -e native-gfx` with PLANE_RADAR_UPDATE_GOLDENS=1). Fail
+# fast.
 $gfxInfo = New-Object System.Diagnostics.ProcessStartInfo
 $gfxInfo.FileName = $pio
 $gfxInfo.WorkingDirectory = $projectRoot
@@ -110,6 +130,12 @@ $gfxInfo.UseShellExecute = $false
 $gfxInfo.EnvironmentVariables["PATH"] =
   "$toolchainBin$([System.IO.Path]::PathSeparator)$($gfxInfo.EnvironmentVariables["PATH"])"
 $gfxInfo.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
+# Defence in depth: even though this script already failed closed above when
+# PLANE_RADAR_UPDATE_GOLDENS=1, defensively clear the key from the child process
+# environment so the native-gfx gate can NEVER inherit an update opt-in.
+if ($gfxInfo.EnvironmentVariables.ContainsKey("PLANE_RADAR_UPDATE_GOLDENS")) {
+  [void]$gfxInfo.EnvironmentVariables.Remove("PLANE_RADAR_UPDATE_GOLDENS")
+}
 
 $gfxProcess = [System.Diagnostics.Process]::Start($gfxInfo)
 $gfxProcess.WaitForExit()

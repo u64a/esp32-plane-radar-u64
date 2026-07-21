@@ -492,7 +492,7 @@ SHA-256, Authenticode signature, and GCC version before caching it. The test scr
 uses that compiler only for its child PlatformIO process; it does not change the
 user or system `PATH`. No Arduino or ESP32 packages are linked into native tests.
 
-The `native` env alone is certified at **580 cases across 39 suites**; `native-diag` runs **5 cases in 1 suite** (`test_runtime_diagnostics_on`); the Phase 12 `native-gfx` headless render gate runs **20 cases in 1 suite** (`test_native_gfx`, one per golden scene); `scripts/native-test.ps1` runs all three for **605 cases across 41 suite runs total**, passing **twice in succession** (no flaky/order-dependent cases). This includes
+The `native` env alone is certified at **580 cases across 39 suites**; `native-diag` runs **5 cases in 1 suite** (`test_runtime_diagnostics_on`); the Phase 12 `native-gfx` headless render gate runs **21 cases in 1 suite** (`test_native_gfx`, one per golden scene); `scripts/native-test.ps1` runs all three for **606 cases across 41 suite runs total**, passing **twice in succession** (no flaky/order-dependent cases). This includes
 the Phase 7 trust logic — `test_time_trust` (26 cases: trusted-time state
 machine, derived monotonic clock, stale-sample revoke, versioned
 persisted-floor record, and the CA-authenticated certificate-`notBefore` floor
@@ -565,12 +565,14 @@ metrics and anti-aliasing match the firmware's VLW path. All headless shims live
 under `test/native_gfx_support/` and `test/test_native_gfx/` and are selected
 **only** by `[env:native-gfx]`; the firmware display driver is never changed.
 
-**Scenes (20, one Unity test + one golden BMP each).** Radar: `radar_loading`,
+**Scenes (21, one Unity test + one golden BMP each).** Radar: `radar_loading`,
 `radar_live_empty`, `radar_live_traffic` (multiple aircraft with
 headings/tags/speed vectors, inside-disc and beyond-ring rim behaviour),
 `radar_stale` (age badge), `radar_offline` (targets hidden), `radar_nowifi`
 (Wi-Fi-disconnected badge), `radar_runways` (runway overlay near the embedded
-large airport EHAM). Status/provisioning: `status_connecting` (saved-network),
+large airport EHAM), `radar_runways_off` (same location/range/model/inputs as
+`radar_runways` but with the runway overlay disabled, making the
+enabled/disabled "Show airport runways" contract observable). Status/provisioning: `status_connecting` (saved-network),
 `status_portal_preparing`, `status_portal_credentials` (dummy SSID/password/
 countdown), `status_candidate_testing`, `status_candidate_failed`,
 `status_credential_fault`, `status_button_configure`,
@@ -585,8 +587,21 @@ to deterministic literals so ordering never leaks state.
 byte comparison**. Normal runs are **read-only**: a mismatch writes the actual
 image under the ignored `.pio/native-gfx-out/` path and fails without touching
 the golden. Goldens are (re)written **only** when `PLANE_RADAR_UPDATE_GOLDENS=1`
-is set (an unmistakable opt-in), and every written file is printed. The suite is
+is set (an unmistakable opt-in), and every written file is printed. Intentional
+updates are **direct-only**: `scripts/native-test.ps1` is **always read-only** —
+it fails closed at the top if the environment has `PLANE_RADAR_UPDATE_GOLDENS=1`
+and defensively strips the key from the `native-gfx` child, so the certified
+gate can never rewrite goldens. To regenerate goldens, run `pio test -e
+native-gfx` directly with `PLANE_RADAR_UPDATE_GOLDENS=1`. The suite is
 deterministic and byte-identical across repeated runs on the pinned host.
+
+**Fail-closed render preflight.** Before **any** scene comparison or golden
+write, the test `main()` verifies the headless canvas is allocated with a live
+pixel buffer at exactly **240×240** and that the **exact VLW smooth font** is
+loaded (`displayFontIsSmooth()`); `displayInit()` only logs allocation/font
+failures, so this preflight prevents update mode from ever blessing
+fallback/invalid output. On failure it prints the precise error(s) and exits
+nonzero without touching any golden. It is not a separate Unity case.
 
 **What it proves / does not prove.** It proves pixel **geometry, text, layout,
 and byte-for-byte deterministic drawing** of the real UI entry points. It is

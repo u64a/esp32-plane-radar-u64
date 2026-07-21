@@ -8,6 +8,7 @@
 
 #include <unity.h>
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -16,9 +17,11 @@
 #include "core/provision_button.h"
 #include "core/radar_data_state.h"
 #include "hardware/display.h"
+#include "hardware/display_font.h"
 #include "headless_adapters.h"
 #include "services/adsb_types.h"
 #include "ui/radar_display.h"
+#include "ui/radar_theme.h"
 #include "ui/status_screens.h"
 
 namespace {
@@ -150,6 +153,19 @@ void scene_radar_runways() {
   ui::radarDisplayDraw(m);
 }
 
+// Runways-disabled control: identical Amsterdam location, range preset, model,
+// and inputs as scene_radar_runways, but with the runway overlay turned OFF. The
+// enabled/disabled pair makes the "Show airport runways" contract observable.
+void scene_radar_runways_off() {
+  nativegfx::resetAdapters();
+  nativegfx::setLocation(kCenterLat, kCenterLon);
+  nativegfx::setRangeIndex(3);      // 25 km preset: EHAM inside range
+  nativegfx::setShowRunways(false);
+  const ui::RadarDisplayModel m =
+      radarModel(core::RadarDataMode::Live, 3, true, nullptr, 0, true, 0);
+  ui::radarDisplayDraw(m);
+}
+
 // ---- Status / provisioning scenes --------------------------------------
 
 void scene_status_connecting() {
@@ -222,6 +238,7 @@ GOLDEN_TEST(radar_stale, scene_radar_stale)
 GOLDEN_TEST(radar_offline, scene_radar_offline)
 GOLDEN_TEST(radar_nowifi, scene_radar_nowifi)
 GOLDEN_TEST(radar_runways, scene_radar_runways)
+GOLDEN_TEST(radar_runways_off, scene_radar_runways_off)
 GOLDEN_TEST(status_connecting, scene_status_connecting)
 GOLDEN_TEST(status_portal_preparing, scene_status_portal_preparing)
 GOLDEN_TEST(status_portal_credentials, scene_status_portal_credentials)
@@ -239,8 +256,54 @@ GOLDEN_TEST(status_settings_save_failed, scene_status_settings_save_failed)
 void setUp(void) {}
 void tearDown(void) {}
 
+namespace {
+
+// Fail-closed render preflight. Runs BEFORE any Unity scene execution or golden
+// write (including PLANE_RADAR_UPDATE_GOLDENS mode) so invalid/fallback output
+// can never be compared against or blessed into the checked-in goldens. The
+// headless canvas MUST be allocated with a live pixel buffer at exactly
+// kSize x kSize (240x240) and the EXACT VLW smooth font MUST be loaded
+// (displayFontIsSmooth()); otherwise displayInit() would only have logged the
+// failure and rendering would proceed against a null/misized buffer or the
+// bitmap-fallback font. On any failure, prints precise error(s) and exits
+// nonzero without touching any golden.
+void renderPreflightOrDie() {
+  bool ok = true;
+  if (tft.getBuffer() == nullptr) {
+    std::fprintf(stderr,
+                 "native-gfx preflight: headless canvas buffer is not "
+                 "allocated (getBuffer() == nullptr)\n");
+    ok = false;
+  }
+  if (tft.width() != ui::radar::kSize || tft.height() != ui::radar::kSize) {
+    std::fprintf(stderr,
+                 "native-gfx preflight: canvas is %ldx%ld, expected %dx%d\n",
+                 static_cast<long>(tft.width()),
+                 static_cast<long>(tft.height()), ui::radar::kSize,
+                 ui::radar::kSize);
+    ok = false;
+  }
+  if (!displayFontIsSmooth()) {
+    std::fprintf(stderr,
+                 "native-gfx preflight: exact VLW smooth font is not loaded "
+                 "(displayFontIsSmooth() == false); refusing bitmap-fallback "
+                 "text\n");
+    ok = false;
+  }
+  if (!ok) {
+    std::fprintf(stderr,
+                 "native-gfx preflight FAILED: refusing to render scenes or "
+                 "write goldens.\n");
+    std::fflush(stderr);
+    std::_Exit(1);
+  }
+}
+
+}  // namespace
+
 int main(int, char**) {
   displayInit();
+  renderPreflightOrDie();
   UNITY_BEGIN();
   RUN_TEST(test_radar_loading);
   RUN_TEST(test_radar_live_empty);
@@ -249,6 +312,7 @@ int main(int, char**) {
   RUN_TEST(test_radar_offline);
   RUN_TEST(test_radar_nowifi);
   RUN_TEST(test_radar_runways);
+  RUN_TEST(test_radar_runways_off);
   RUN_TEST(test_status_connecting);
   RUN_TEST(test_status_portal_preparing);
   RUN_TEST(test_status_portal_credentials);
