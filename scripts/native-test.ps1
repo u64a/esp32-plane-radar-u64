@@ -7,7 +7,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 # Phase 11: run the airport-data offline gate fail-fast before any PlatformIO tests.
 Write-Host "--- verify-airport-data gate ---"
 $airportGate = Join-Path $PSScriptRoot "verify-airport-data.ps1"
-& powershell -ExecutionPolicy Bypass -File $airportGate -ProjectRoot $projectRoot
+& $airportGate -ProjectRoot $projectRoot
 if ($LASTEXITCODE -ne 0) {
   throw "verify-airport-data gate failed with exit code $LASTEXITCODE"
 }

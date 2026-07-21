@@ -839,14 +839,16 @@ The secure setup portal uses only the Arduino‑ESP32 built‑in Wi‑Fi stack �
 
 ## Runtime egress, privacy, and portal network behavior (Phase 11)
 
-### Runtime network egress (exact — two parties only)
+### Runtime network egress
 
-| Purpose | Protocol / port | External party |
+| Purpose | Protocol / port | Fixed application/service destination |
 |---------|-----------------|----------------|
 | ADS-B live data | **HTTPS — TCP/443** | `opendata.adsb.fi` (Cloudflare-fronted) |
 | Time synchronization | **SNTP — UDP/123** | `time.cloudflare.com` |
 
-These are the **only** two external parties the firmware contacts at runtime. `time.cloudflare.com` is the sole default SNTP server because `adsb.fi` is already behind Cloudflare, so it adds no additional operator. Up to two optional compile-time SNTP fallback servers may be configured (`kSntpServerFallback1/2` in `config.h`), but these are **empty by default** and **policy-gated** — the egress policy gate (`scripts/verify-egress-policy.ps1`) fails if they are non-empty. **DHCP-provided NTP is explicitly disabled** (`esp_sntp_servermode_dhcp(false)`). There are **no** other default outbound parties beyond DNS for the two hosts above.
+`opendata.adsb.fi` and `time.cloudflare.com` are the only fixed application/service destinations selected by the firmware. `time.cloudflare.com` is the sole default SNTP server. Up to two optional compile-time SNTP fallback servers may be configured (`kSntpServerFallback1/2` in `config.h`), but these are **empty by default** and **policy-gated** — the egress policy gate (`scripts/verify-egress-policy.ps1`) fails if they are non-empty. **DHCP-provided NTP is explicitly disabled** (`esp_sntp_servermode_dhcp(false)`).
+
+Ordinary **DNS/DHCP infrastructure** traffic is also needed to join the configured network and resolve those hostnames. The firmware does not select a fixed third-party DNS operator: DNS and DHCP servers are supplied by the local network, and their operators can vary by network.
 
 **Build-time OurAirports and GitHub traffic** (downloading `airports.csv`/`runways.csv` from the pinned immutable commit URL during regeneration) is a **build/development-time activity only** and is not firmware runtime egress. Regeneration runs on a developer machine, not on the ESP32 device.
 
@@ -856,8 +858,8 @@ The firmware sends the following data to external parties at runtime:
 
 | Data sent | Recipient | Detail |
 |-----------|-----------|--------|
-| ADS-B query parameters | `opendata.adsb.fi` | Lat/lon formatted to 6 decimal places (`%.6f`), radius converted to nautical miles formatted to 0.1 NM (`%.1f`) in the URL path |
-| Normal TCP/IP source IP | `opendata.adsb.fi`, `time.cloudflare.com` | Standard link-layer metadata visible to the network path and DNS resolver |
+| ADS-B query parameters | `opendata.adsb.fi` | Lat/lon formatted/rounded to six decimal places (`%.6f`), radius converted to nautical miles formatted to 0.1 NM (`%.1f`) in the URL path |
+| Normal TCP/IP source IP | `opendata.adsb.fi`, `time.cloudflare.com` | Network-layer source-address metadata: local/private on the LAN and public after NAT where applicable |
 | SNTP client packets | `time.cloudflare.com` | Standard NTP exchange; no device-specific payload |
 
 **The firmware does not send:**
@@ -868,13 +870,13 @@ The firmware sends the following data to external parties at runtime:
 
 **Local network note:** Normal Wi-Fi and DHCP link-layer operation exposes the device MAC address to the **local network** (access point and devices on the same LAN segment). This is standard 802.11 behavior and is not specific to this firmware.
 
-The ADS-B provider and DNS/SNTP resolver can observe the device's **public IP address** and the query parameters (lat/lon + radius). The lat/lon values are formatted to 6 decimal places: this is the same precision as configured by the user and sent in the URL, with no additional reduction or rounding applied beyond what the ADS-B API requires.
+The ADS-B provider and DNS/SNTP resolver can observe the device's source address (including a **public IP address** after NAT where applicable) and the query parameters (lat/lon + radius). The lat/lon values are formatted/rounded to six decimal places and the radius to 0.1 NM; this formatting is **not** a privacy-preserving precision reduction and is not necessarily the same precision as the configured values.
 
 ### Portal network behavior
 
 The setup portal creates a **temporary, session-scoped SoftAP** at `192.168.4.1`:
 
-- **WPA2-PSK** with a MAC-derived, one-time-displayed password; never open
+- **WPA2-PSK** with a newly random password for each provisioning session, displayed on-device; never open. The SSID, not the password, is MAC-derived.
 - **Session-scoped**: exists only while a setup session is active (max 5 minutes)
 - **No permanent listener**: the portal is torn down after the session ends
 - **Wildcard DNS** at `192.168.4.1` (port 53) redirects all DNS queries to the captive portal for the duration of the session only
@@ -943,9 +945,9 @@ Renders in memory and compares exact LF bytes to checked-in files. Exits 0 if id
 
 ```powershell
 .\scripts\verify-airport-data.ps1              # Phase 11: OurAirports provenance gate (20 invariants)
-.\scripts\verify-airport-data.ps1 -SelfTest    # proves the gate rejects 12 tamper cases
-.\scripts\verify-egress-policy.ps1             # Phase 11: runtime egress source policy gate (10 invariants)
-.\scripts\verify-egress-policy.ps1 -SelfTest   # proves the gate rejects 10 tamper cases
+.\scripts\verify-airport-data.ps1 -SelfTest    # proves the gate rejects 14 tamper cases
+.\scripts\verify-egress-policy.ps1             # Phase 11: runtime egress source policy gate (12 invariants)
+.\scripts\verify-egress-policy.ps1 -SelfTest   # proves the gate rejects 16 tamper cases
 ```
 
 The `scripts/native-test.ps1` script runs `verify-airport-data.ps1` fail-fast at its start before any PlatformIO tests.
@@ -954,21 +956,21 @@ No remote is added, no releases are published, and no GitHub Actions workflows a
 
 ### Phase 11 native tests and gate summary
 
-The Phase 11 native test suite `test_large_airport_data` adds **12 cases** in 1 suite to the native test run:
+The Phase 11 native test suite `test_large_airport_data` adds **13 cases** in 1 suite to the native test run:
 
 - `test_airport_count_matches_constant` / `test_runway_count_matches_constant`: runtime count equals compile-time constant (1166/1706)
 - `test_airport_idents_are_4_chars` / `test_airport_idents_unique` / `test_airport_idents_sorted`: ident validity
 - `test_airport_lat_range` / `test_airport_lon_range`: coordinate bounds
-- `test_runway_lengths_positive` / `test_runway_index_bounds` / `test_runway_ordering`: runway structural integrity
+- `test_runway_endpoint_coordinate_ranges` / `test_runway_lengths_positive` / `test_runway_index_bounds` / `test_runway_ordering`: runway structural integrity
 - `test_compile_time_extent_airport` / `test_compile_time_extent_runway`: `std::extent` matches constants
 
-The `native` env now runs **579 cases across 39 suites**; `native-diag` runs **5 cases in 1 suite**; `scripts/native-test.ps1` runs both for **584 cases across 40 suite runs total**.
+With the pinned local toolchain, `scripts/native-test.ps1` passes **580 cases across 39 suites** in `native` and **5 cases in 1 suite** in `native-diag`, for **585 cases across 40 suite runs total**.
 
 New Phase 11 gate commands:
 
 ```powershell
 .\scripts\verify-airport-data.ps1              # 20 source invariants
-.\scripts\verify-airport-data.ps1 -SelfTest    # 12 tamper cases
-.\scripts\verify-egress-policy.ps1             # 10 source invariants
-.\scripts\verify-egress-policy.ps1 -SelfTest   # 10 tamper cases
+.\scripts\verify-airport-data.ps1 -SelfTest    # 14 tamper cases
+.\scripts\verify-egress-policy.ps1             # 12 source invariants
+.\scripts\verify-egress-policy.ps1 -SelfTest   # 16 tamper cases
 ```

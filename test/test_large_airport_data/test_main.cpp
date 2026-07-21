@@ -94,7 +94,23 @@ void test_airport_lon_range() {
 }
 
 // ---------------------------------------------------------------------------
-// T08: all runway lengths are positive
+// T08: all runway endpoint coordinates are geographically valid
+// ---------------------------------------------------------------------------
+void test_runway_endpoint_coordinate_ranges() {
+    for (size_t i = 0; i < kRunwayCount; ++i) {
+        TEST_ASSERT_GREATER_OR_EQUAL_INT32(-900000000, kRunways[i].le_lat_e7);
+        TEST_ASSERT_LESS_OR_EQUAL_INT32(   900000000, kRunways[i].le_lat_e7);
+        TEST_ASSERT_GREATER_OR_EQUAL_INT32(-1800000000, kRunways[i].le_lon_e7);
+        TEST_ASSERT_LESS_OR_EQUAL_INT32(   1800000000, kRunways[i].le_lon_e7);
+        TEST_ASSERT_GREATER_OR_EQUAL_INT32(-900000000, kRunways[i].he_lat_e7);
+        TEST_ASSERT_LESS_OR_EQUAL_INT32(   900000000, kRunways[i].he_lat_e7);
+        TEST_ASSERT_GREATER_OR_EQUAL_INT32(-1800000000, kRunways[i].he_lon_e7);
+        TEST_ASSERT_LESS_OR_EQUAL_INT32(   1800000000, kRunways[i].he_lon_e7);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T09: all runway lengths are positive
 // ---------------------------------------------------------------------------
 void test_runway_lengths_positive() {
     for (size_t i = 0; i < kRunwayCount; ++i) {
@@ -104,7 +120,7 @@ void test_runway_lengths_positive() {
 }
 
 // ---------------------------------------------------------------------------
-// T09: all runway airport_idx values are within [0, kAirportCount)
+// T10: all runway airport_idx values are within [0, kAirportCount)
 // ---------------------------------------------------------------------------
 void test_runway_index_bounds() {
     for (size_t i = 0; i < kRunwayCount; ++i) {
@@ -115,7 +131,7 @@ void test_runway_index_bounds() {
 }
 
 // ---------------------------------------------------------------------------
-// T10: runways are sorted by airport_idx ASC, then length_m DESC
+// T11: runways are sorted by airport_idx ASC, then length_m DESC
 // ---------------------------------------------------------------------------
 void test_runway_ordering() {
     for (size_t i = 1; i < kRunwayCount; ++i) {
@@ -132,7 +148,7 @@ void test_runway_ordering() {
 }
 
 // ---------------------------------------------------------------------------
-// T11: compile-time extent check is consistent with kAirportCount constant
+// T12: compile-time extent check is consistent with kAirportCount constant
 // ---------------------------------------------------------------------------
 void test_compile_time_extent_airport() {
     // Redundant with the static_assert, but reports at runtime too.
@@ -141,7 +157,7 @@ void test_compile_time_extent_airport() {
 }
 
 // ---------------------------------------------------------------------------
-// T12: compile-time extent check is consistent with kRunwayCount constant
+// T13: compile-time extent check is consistent with kRunwayCount constant
 // ---------------------------------------------------------------------------
 void test_compile_time_extent_runway() {
     TEST_ASSERT_EQUAL_UINT(kRunwayCount,
@@ -159,6 +175,7 @@ int main(int, char**) {
     RUN_TEST(test_airport_idents_sorted);
     RUN_TEST(test_airport_lat_range);
     RUN_TEST(test_airport_lon_range);
+    RUN_TEST(test_runway_endpoint_coordinate_ranges);
     RUN_TEST(test_runway_lengths_positive);
     RUN_TEST(test_runway_index_bounds);
     RUN_TEST(test_runway_ordering);

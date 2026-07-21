@@ -330,7 +330,7 @@ def check_mode(airports_raw: bytes, runways_raw: bytes) -> int:
             print(f"MISSING: {path}", file=sys.stderr)
             ok = False
             continue
-        on_disk = path.read_bytes().replace(b"\r\n", b"\n")
+        on_disk = path.read_bytes()
         if on_disk != rendered:
             print(
                 f"MISMATCH: {path}\n"

@@ -15,9 +15,10 @@ param(
 #   1.  Pinned commit URL; no /main/ in URL constants.
 #   2.  SHA-256 format and expected values (lowercase hex 64 chars).
 #   3.  Byte lengths: airports=12651071, runways=3951490.
-#   4.  Hash-before-parse: sha256 verified before decode in fetch/read functions.
+#   4.  Hash-before-parse: sha256 verified before decode in both fetch/read functions.
 #   5.  Identity encoding: Accept-Encoding: identity set in fetch.
-#   6.  write_bytes LF: files written via write_bytes(encode('utf-8')).
+#   6.  Exact-LF check/write: check mode compares read_bytes directly to rendered
+#       UTF-8 LF bytes; files are written via write_bytes(encode('utf-8')).
 #   7.  Paired local arguments: both or neither local CSV flags.
 #   8.  Check mode: --check renders without modifying files.
 #   9.  Stable provenance in .h: commit/SHA-256/lengths/blobs/license/filter ver.
@@ -26,7 +27,8 @@ param(
 #  12.  Header constants: kAirportCount=1166, kRunwayCount=1706.
 #  13.  Sized externs: kAirports[kAirportCount], kRunways[kRunwayCount].
 #  14.  Airport idents unique, sorted, 4 chars.
-#  15.  Coordinates valid: lat [-90e7,90e7], lon [-180e7,180e7].
+#  15.  Airport and runway endpoint coordinates valid: lat [-90e7,90e7],
+#       lon [-180e7,180e7].
 #  16.  Runway count=1706; all lengths positive.
 #  17.  Runway airport_idx in [0, kAirportCount-1].
 #  18.  Runway ordering: by airport_idx ASC, length DESC within airport.
@@ -80,6 +82,10 @@ function Parse-RunwayEntries {
     if ($m.Success) {
       $entries.Add([pscustomobject]@{
         AirportIdx = [int]$m.Groups[1].Value
+        LeLat      = [int64]$m.Groups[2].Value
+        LeLon      = [int64]$m.Groups[3].Value
+        HeLat      = [int64]$m.Groups[4].Value
+        HeLon      = [int64]$m.Groups[5].Value
         LengthM    = [int]$m.Groups[6].Value
       })
     }
@@ -153,16 +159,23 @@ function Invoke-LiveGate {
   if ($pyCodeText -notmatch "_read_local_verified" -or $pyCodeText -notmatch "_fetch_verified") {
     Fail "Generator missing _fetch_verified/_read_local_verified functions"
   }
-  $verifyFuncRx = [regex]"(?s)def _fetch_verified.*?return data"
-  $verifyMatch = $verifyFuncRx.Match($pyText)
-  if (-not $verifyMatch.Success) { Fail "Could not locate _fetch_verified body" }
-  $verifyBody = $verifyMatch.Value
-  if ($verifyBody -notmatch "hashlib.sha256") {
-    Fail "_fetch_verified missing hashlib.sha256 verification"
-  }
-  # decode/CSV parsing must NOT happen inside _fetch_verified (it returns raw bytes)
-  if ($verifyBody -match [regex]::Escape("decode(") -or $verifyBody -match "csv.DictReader") {
-    Fail "_fetch_verified must not decode/parse CSV; it must return raw bytes for separate parsing"
+  foreach ($functionName in @("_fetch_verified", "_read_local_verified")) {
+    $verifyFuncRx = [regex]("(?s)def " + [regex]::Escape($functionName) + ".*?return data")
+    $verifyMatch = $verifyFuncRx.Match($pyText)
+    if (-not $verifyMatch.Success) { Fail "Could not locate $functionName body" }
+    $verifyBody = $verifyMatch.Value
+    $verifyCode = (($verifyBody -split "`n") | ForEach-Object {
+      $_ -replace '\s+#.*$', ''
+    }) -join "`n"
+    $hashIndex = $verifyCode.IndexOf("hashlib.sha256")
+    $returnIndex = $verifyCode.LastIndexOf("return data")
+    if ($hashIndex -lt 0 -or $hashIndex -gt $returnIndex) {
+      Fail "$functionName must verify hashlib.sha256 before returning raw bytes"
+    }
+    # Decode/CSV parsing must not occur in a verifier; it returns raw bytes.
+    if ($verifyCode -match [regex]::Escape("decode(") -or $verifyCode -match "csv.DictReader") {
+      Fail "$functionName must not decode/parse CSV; it must return raw bytes for separate parsing"
+    }
   }
   # _parse_csv must exist and do the decode
   if ($pyText -notmatch "_parse_csv" -or $pyText -notmatch [regex]::Escape(".decode(")) {
@@ -207,6 +220,13 @@ function Invoke-LiveGate {
     if ($checkBody -match "write_bytes" -or $checkBody -match "write_text") {
       Fail "check_mode must not write files"
     }
+    if ($checkBody -notmatch '(?m)^\s*on_disk\s*=\s*path\.read_bytes\(\)\s*$') {
+      Fail "check_mode must compare path.read_bytes() directly to rendered bytes"
+    }
+    if ($checkBody -match 'path\.read_bytes\(\)\s*\.' -or
+        $checkBody -match [regex]::Escape(".replace(b")) {
+      Fail "check_mode must not normalize CRLF or otherwise transform on-disk bytes"
+    }
   }
 
   # 9. Stable provenance in .h
@@ -236,13 +256,12 @@ function Invoke-LiveGate {
   }
 
   # 11. .gitattributes LF rules
-  if ($attrText -notmatch [regex]::Escape("include/data/large_airports.h") -or
-      $attrText -notmatch "eol=lf") {
-    Fail ".gitattributes missing LF rule for include/data/large_airports.h"
-  }
-  if ($attrText -notmatch [regex]::Escape("src/data/large_airports_data.cpp") -or
-      $attrText -notmatch "eol=lf") {
-    Fail ".gitattributes missing LF rule for src/data/large_airports_data.cpp"
+  foreach ($generatedPath in @("include/data/large_airports.h",
+                                "src/data/large_airports_data.cpp")) {
+    $lineRx = [regex]("(?m)^" + [regex]::Escape($generatedPath) + "\s+.*(?:^|\s)eol=lf(?:\s|$)")
+    if (-not $lineRx.IsMatch($attrText)) {
+      Fail ".gitattributes missing same-line exact LF rule for $generatedPath"
+    }
   }
 
   # 12. Header constants
@@ -282,7 +301,7 @@ function Invoke-LiveGate {
     if ($ident.Length -ne 4) { Fail "Airport ident not 4 chars: $ident" }
   }
 
-  # 15. Coordinates valid
+  # 15. Airport and runway endpoint coordinates valid.
   foreach ($ap in $airports) {
     if ($ap.Lat -lt -900000000 -or $ap.Lat -gt 900000000) {
       Fail "Airport $($ap.Ident) lat $($ap.Lat) out of range [-90e7,90e7]"
@@ -305,6 +324,16 @@ function Invoke-LiveGate {
     }
     if ($rw.AirportIdx -lt 0 -or $rw.AirportIdx -ge 1166) {
       Fail "Runway airport_idx=$($rw.AirportIdx) out of range [0,1165]"
+    }
+    foreach ($endpoint in @(
+      @{ Name = "le_lat_e7"; Value = $rw.LeLat; Min = -900000000; Max = 900000000 },
+      @{ Name = "he_lat_e7"; Value = $rw.HeLat; Min = -900000000; Max = 900000000 },
+      @{ Name = "le_lon_e7"; Value = $rw.LeLon; Min = -1800000000; Max = 1800000000 },
+      @{ Name = "he_lon_e7"; Value = $rw.HeLon; Min = -1800000000; Max = 1800000000 }
+    )) {
+      if ($endpoint.Value -lt $endpoint.Min -or $endpoint.Value -gt $endpoint.Max) {
+        Fail "Runway airport_idx=$($rw.AirportIdx) $($endpoint.Name)=$($endpoint.Value) out of range [$($endpoint.Min),$($endpoint.Max)]"
+      }
     }
     if ($rw.AirportIdx -lt $prevRwIdx) {
       Fail "Runways not sorted by airport_idx ASC: $prevRwIdx then $($rw.AirportIdx)"
@@ -434,10 +463,10 @@ function Invoke-SelfTest {
     $badCpp6 = $cppOrig -replace '"AGGH"', '"ZZZZ"'
     Expect-Fail "unsorted airport idents" $pyOrig $hOrig $badCpp6 $attrOrig
 
-    # T7: removed LF rule for header from .gitattributes
-    $lines7 = $attrOrig -split "`n" | Where-Object { $_ -notmatch "large_airports\.h" }
-    $badAttr7 = $lines7 -join "`n"
-    Expect-Fail "removed LF rule for header" $pyOrig $hOrig $cppOrig $badAttr7
+    # T7: an LF rule on another path must not satisfy the header's own rule.
+    $badAttr7 = $attrOrig -replace [regex]::Escape("include/data/large_airports.h       text eol=lf"),
+      "include/data/large_airports.h       text eol=crlf`nunrelated.txt text eol=lf"
+    Expect-Fail "header lacks same-line LF rule" $pyOrig $hOrig $cppOrig $badAttr7
 
     # T8: unsized extern (kAirports[] instead of kAirports[kAirportCount])
     $badH8 = $hOrig -replace "kAirports\[kAirportCount\]", "kAirports[]"
@@ -459,8 +488,21 @@ function Invoke-SelfTest {
     $badPy12 = $pyOrig -replace "write_bytes", "write_text"
     Expect-Fail "write_text instead of write_bytes" $badPy12 $hOrig $cppOrig $attrOrig
 
+    # T13: CRLF normalization would hide generated-file line-ending drift.
+    $badPy13 = $pyOrig -replace [regex]::Escape("on_disk = path.read_bytes()"),
+      'on_disk = path.read_bytes().replace(b"\r\n", b"\n")'
+    Expect-Fail "CRLF normalization in check mode" $badPy13 $hOrig $cppOrig $attrOrig
+
+    # T14: a generated runway endpoint outside geographic bounds is rejected.
+    $firstEndpointLine = ($cppOrig -split "`n" | Where-Object {
+      $_ -match '^\s*\{\d+,\s*-?\d+,\s*-?\d+,\s*-?\d+,\s*-?\d+,\s*\d+\},'
+    } | Select-Object -First 1)
+    $badCpp14 = $cppOrig -replace [regex]::Escape($firstEndpointLine),
+      ($firstEndpointLine -replace '^\s*\{(\d+),\s*-?\d+', '  {$1, 900000001')
+    Expect-Fail "out-of-range runway endpoint" $pyOrig $hOrig $badCpp14 $attrOrig
+
     Write-Host ""
-    Write-Host "OK: all 12 self-test tamper cases correctly rejected."
+    Write-Host "OK: all 14 self-test tamper cases correctly rejected."
   } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
   }
