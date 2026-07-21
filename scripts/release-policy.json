@@ -1,0 +1,129 @@
+{
+  "schema": "plane-radar/release-policy",
+  "schema_version": 1,
+  "description": "Approved local-only release policy for the ESP32-C3 Plane Radar firmware. scripts/build-release.ps1 and scripts/verify-release.ps1 both load this file; it is the single tracked source of truth for the pinned toolchain, the five release environments, their EXACT approved resource/file sizes, the required source gates, and the default-artifact identity. Any intentional change to an approved size or pin MUST edit this tracked file in the same commit.",
+  "local_only": {
+    "require_no_git_remote": true,
+    "release_root_relative": "release",
+    "note": "The repository is intentionally remote-free. Release artifacts stay local and ignored under release/."
+  },
+  "pins": {
+    "platformio_core": "6.1.19",
+    "platform": "espressif32@6.5.0",
+    "framework": "arduino",
+    "framework_arduinoespressif32": "3.20014.231204",
+    "toolchain_riscv32_esp": "8.4.0+2021r2-patch5",
+    "tool_esptoolpy": "1.40501.0",
+    "board": "esp32-c3-devkitm-1",
+    "mcu": "esp32c3",
+    "flash_size": "4MB",
+    "app_offset": "0x10000",
+    "dependencies": {
+      "lovyan03/LovyanGFX": "1.2.25",
+      "bblanchon/ArduinoJson": "7.4.3"
+    }
+  },
+  "airport_data": {
+    "source_repo": "https://github.com/davidmegginson/ourairports-data",
+    "source_commit": "79efa72ec1e344d91b081160634fa042a56a21b8",
+    "filter_schema_version": 1,
+    "airports": 1166,
+    "runways": 1706
+  },
+  "toolchain_tools": {
+    "nm": "toolchain-riscv32-esp/bin/riscv32-esp-elf-nm.exe",
+    "cppfilt": "toolchain-riscv32-esp/bin/riscv32-esp-elf-c++filt.exe"
+  },
+  "default_artifact": {
+    "environment": "supermini",
+    "relative_path": "supermini/firmware-merged.bin",
+    "role": "default-release",
+    "note": "supermini/firmware-merged.bin is the ONLY default release image. It is flashed at offset 0x0."
+  },
+  "required_source_gates": [
+    {
+      "id": "native-test",
+      "script": "scripts/native-test.ps1",
+      "summary": "606 cases across 41 suite runs (native 580/39 + native-diag 5/1 + native-gfx 21/1); also runs verify-airport-data and verify-egress-policy fail-fast.",
+      "args": []
+    },
+    {
+      "id": "check-native-test-access",
+      "script": "scripts/check-native-test-access-gate.ps1",
+      "summary": "SnapshotStoreTestAccess friend seam cannot leak into a firmware build (source + live compile check).",
+      "args": []
+    },
+    {
+      "id": "verify-ca-bundle",
+      "script": "scripts/verify-ca-bundle.ps1",
+      "summary": "Offline CA trust gate: 4 pinned roots, no setInsecure, CA enforced, derived-time clock, CA-authenticated cert-notBefore floor.",
+      "args": []
+    },
+    {
+      "id": "verify-provisioning-policy",
+      "script": "scripts/verify-provisioning-policy.ps1",
+      "summary": "8 static provisioning release invariants (no WiFiManager/OTA/mDNS, closed route set, no permanent listener, no secret logging, one framebuffer, bounded portal).",
+      "args": []
+    },
+    {
+      "id": "verify-adsb-worker-policy",
+      "script": "scripts/verify-adsb-worker-policy.ps1",
+      "summary": "10 worker source invariants + Phase 10 diag env matrix (17 tamper cases).",
+      "args": []
+    },
+    {
+      "id": "verify-diagnostics-policy",
+      "script": "scripts/verify-diagnostics-policy.ps1",
+      "summary": "12 diagnostics/logging source invariants.",
+      "args": []
+    }
+  ],
+  "environments": [
+    {
+      "name": "supermini",
+      "role": "default-release",
+      "evaluation_only": false,
+      "options": { "worker": false, "diagnostics": false, "log_level": 2 },
+      "resources": { "ram": 65044, "flash": 1143278, "firmware_bin": 1198160, "merged_bin": 1263696 }
+    },
+    {
+      "name": "supermini-worker",
+      "role": "evaluation",
+      "evaluation_only": true,
+      "options": { "worker": true, "diagnostics": false, "log_level": 2 },
+      "resources": { "ram": 73924, "flash": 1146152, "firmware_bin": 1202224, "merged_bin": 1267760 }
+    },
+    {
+      "name": "supermini-quiet",
+      "role": "evaluation",
+      "evaluation_only": true,
+      "options": { "worker": false, "diagnostics": false, "log_level": 0 },
+      "resources": { "ram": 64916, "flash": 1138158, "firmware_bin": 1192256, "merged_bin": 1257792 }
+    },
+    {
+      "name": "supermini-diag",
+      "role": "evaluation",
+      "evaluation_only": true,
+      "options": { "worker": false, "diagnostics": true, "log_level": 2 },
+      "resources": { "ram": 65052, "flash": 1143892, "firmware_bin": 1198880, "merged_bin": 1264416 }
+    },
+    {
+      "name": "supermini-worker-diag",
+      "role": "evaluation",
+      "evaluation_only": true,
+      "options": { "worker": true, "diagnostics": true, "log_level": 2 },
+      "resources": { "ram": 73948, "flash": 1146920, "firmware_bin": 1203120, "merged_bin": 1268656 }
+    }
+  ],
+  "resource_tolerance_bytes": 0,
+  "copied_artifacts": [
+    "firmware.bin",
+    "firmware-merged.bin",
+    "firmware.elf",
+    "firmware.map",
+    "build.log",
+    "merge.log",
+    "nm-symbols.txt"
+  ],
+  "proof_invariants_note": "The per-environment binary invariants proven by build-release are defined by scripts/build-release.ps1 (Part B). They bind the EXACT current-head binaries only and do not claim raw equivalence to any prior phase."
+}
