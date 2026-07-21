@@ -126,6 +126,49 @@ Only a genuine success resets the shared transient streak. A **range** or **loca
 
 **Wi-Fi drop** pauses fetches but never hides the radar: the last targets keep showing with a `NO WIFI` badge and age to Stale/Offline normally, and a drop is **not** counted as an ADS-B failure. On reconnect the radar redraws and one immediate fetch is forced (the transient streak is preserved). A drop that occurs **and auto-reconnects entirely inside one blocking fetch** is caught even though `WiFi.status()` reads connected before and after: a filtered `ARDUINO_EVENT_WIFI_STA_DISCONNECTED` callback advances a lock-free 32-bit disconnect counter (registered once before network setup; the callback only bumps the atomic — no logging, drawing, or allocation), and the loop compares that counter before each fetch with its value after all post-fetch pumps. A detected mid-fetch flap forces one immediate refresh afterward (surviving the in-flight completion even if the link is already back), and — unless the fetch fully published a success — a link-interruption-sensitive outcome (timeout / DNS / TLS / transport read-EOF, and a plausibly-truncated parse error) is resolved as a pause so the spurious drop never advances the transient or permanent backoff. If the link is still down, polling stays paused and the immediate latch survives until reconnect. The frame is redrawn only on real changes — initial display, a settings change, a Wi-Fi edge, a fetch/publish, or a freshness transition — plus the `LOADING` dots animating every 500 ms and the `STALE` age ticking each second; Live/Offline frames are not redrawn continuously.
 
+### ADS-B network worker (Phase 9, opt-in — not the default)
+
+The **default `supermini` firmware's runtime behavior and mode remain
+synchronous and worker-off by default**: ADS-B DNS/TCP/TLS/HTTP fetch work
+still runs synchronously in the main loop, exactly as described above. (The
+default binary does carry a small shared-code flash delta from this work,
+documented in [Memory budget](#memory-budget).) A
+separate, explicit opt-in **`supermini-worker`** build (`PLANE_RADAR_ADSB_WORKER=1`)
+is a prototype that moves that same fetch work onto one dedicated low-priority
+FreeRTOS task, so display refresh, button gesture sampling, and portal pumping
+keep running while a fetch is in flight. It issues the **same** ADS-B HTTPS
+request and the **same** SNTP time sync as the default build — no new external
+traffic or telemetry is added.
+
+**Architecture and security:**
+
+- One long-lived task created with `xTaskCreateStatic` — priority **1**, an
+  **8192-byte**, **16-byte-aligned** static stack; no heap task/stack allocation.
+- Two `xQueueCreateStatic` queues, each **depth 1** — a strict one-request/
+  one-result single-producer/single-consumer handoff between the main loop and
+  the worker; no unbounded queuing.
+- The worker reuses the **same two** existing `AircraftSnapshot` buffers the
+  synchronous path already publishes into — there is **no** third snapshot and
+  **no** second framebuffer.
+- The main loop keeps sole ownership of display, button, settings, publish,
+  provisioning, and NVS state; the worker owns only its own `WiFiClientSecure`
+  and writes exclusively into the currently **inactive** candidate snapshot.
+- Cancellation is cooperative: a Configure or Erase intent latches and waits
+  for the worker to report **Paused** and for its in-flight result to drain
+  **before** any radio or NVS mutation proceeds; an Erase intent supersedes a
+  pending Configure.
+- The default build **compiles the worker path out entirely** — this is
+  enforced by a source policy gate; a separately performed release-binary
+  `nm` symbol inspection additionally proves the default binary links **zero**
+  worker/integration symbols (see [Native tests](#native-tests) and
+  [Memory budget](#memory-budget)).
+
+This worker firmware is **for prototype evaluation and hardware validation
+only**. It does **not** become the default release firmware until on-device
+stack high-water marks, TLS heap peak / largest-free-block behavior, and
+long-running concurrency soak tests pass on real hardware — none of which has
+happened yet (see [Hardware-only acceptance gates](#hardware-only-acceptance-gates)).
+
 ## Security: verified TLS & trusted time (Phase 7)
 
 ADS-B is fetched over **HTTPS with full certificate verification**, and the device
@@ -302,6 +345,18 @@ TLS handshake over Wi-Fi, the **TLS verification heap peak / largest-free-block*
 impact, live SNTP behavior, RF, and panel output remain **hardware-only** gates.
 Do not treat a green native/offline run as proof of on-device TLS.
 
+The same applies to the opt-in `supermini-worker` prototype (see
+[ADS-B network worker](#ads-b-network-worker-phase-9-opt-in--not-the-default)):
+its native suites and the `verify-adsb-worker-policy.ps1` source gate prove
+protocol/source compile-gating (not the zero-symbol default binary), and a
+separately performed release-binary `nm` inspection proves the default binary
+links **zero** worker/integration symbols, but the worker's on-device
+task stack high-water mark, TLS heap peak / largest-free-block impact while a
+fetch runs concurrently with display/button/portal work, and long-running
+concurrency behavior are **hardware-only** gates that have **not** been run yet.
+A green native/offline run for the worker is not proof of on-device readiness,
+and it does **not** make `supermini-worker` the default release firmware.
+
 ## Configuration
 
 Edit **`include/config.h`** for hardware and behavior:
@@ -336,6 +391,9 @@ include/
     radar_display.h
     runway_overlay.h
     status_screens.h
+  core/
+    adsb_worker_protocol.h  — worker request/result protocol (Phase 9): generations, Paused/fault states
+    network_work_intent.h   — Configure/Erase cooperative-cancellation intent shared by main and worker
   services/
     wifi_setup.h            — secure provisioning + runtime link controller (facade)
     config_portal.h         — temporary captive WiFiServer + DNSServer portal transport
@@ -344,16 +402,19 @@ include/
     provision_marker.h      — durable NVS transaction marker (core/txn_marker record)
     radar_location.h
     adsb_client.h
+    adsb_worker.h           — opt-in low-priority ADS-B fetch worker (Phase 9; compiled out unless `PLANE_RADAR_ADSB_WORKER=1`)
 data/
   ui_font.vlw              — embedded smooth UI font (Noto Sans Bold)
 scripts/
   build_large_airports.py
+  verify-adsb-worker-policy.ps1  — Phase 9 source policy gate for the opt-in worker (see Native tests)
 src/
   main.cpp
   data/
     large_airports_data.cpp
   hardware/
   ui/
+  core/
   services/
 ```
 
@@ -383,7 +444,7 @@ pio run -t upload
 pio device monitor
 ```
 
-- PlatformIO env: **`supermini`**
+- PlatformIO env: **`supermini`** (default release build)
 - Serial: **115200** baud
 - USB CDC on boot enabled in `platformio.ini` for the Super Mini
 
@@ -392,6 +453,20 @@ For a clean Windows build that deletes the project `.pio` directory first:
 ```powershell
 .\scripts\clean-build.ps1
 ```
+
+**Opt-in ADS-B network worker (`supermini-worker`, prototype — not the default):**
+identical to `supermini` except it defines `PLANE_RADAR_ADSB_WORKER=1`, compiling
+in the low-priority fetch worker described in
+[ADS-B network worker](#ads-b-network-worker-phase-9-opt-in--not-the-default):
+
+```bash
+pio run -e supermini-worker
+pio run -t merge -e supermini-worker
+```
+
+This env is for prototype evaluation and hardware validation only; it is
+**not** the default release firmware until the hardware-only gates in
+[Hardware-only acceptance gates](#hardware-only-acceptance-gates) pass.
 
 ### Native tests
 
@@ -410,7 +485,7 @@ SHA-256, Authenticode signature, and GCC version before caching it. The test scr
 uses that compiler only for its child PlatformIO process; it does not change the
 user or system `PATH`. No Arduino or ESP32 packages are linked into native tests.
 
-The suite is certified at **513 test cases across 33 native suites**, run and
+The suite is certified at **561 test cases across 37 native suites**, run and
 passing **twice in succession** (no flaky/order-dependent cases). This includes
 the Phase 7 trust logic — `test_time_trust` (26 cases: trusted-time state
 machine, derived monotonic clock, stale-sample revoke, versioned
@@ -418,24 +493,42 @@ persisted-floor record, and the CA-authenticated certificate-`notBefore` floor
 ratchet) and `test_cert_time` (17 cases: fail-closed certificate-date parsing,
 RFC 5280 validity, CA-signed `notBefore` extraction, and bounded full-chain
 peer-certificate validation — expired/future/malformed intermediates, empty and
-over-long chains) — plus the Phase 8 provisioning-hardening suites added since:
-`test_http_request` / `test_http_router` (HTTP parsing and the closed captive
-route set), `test_portal_session` / `test_portal_auth` / `test_portal_secrets`
-(CSRF and form-field bounds), `test_url_form` (form decoding), `test_wifi_field`
-(Wi‑Fi field validation), `test_provision_button` (the tap/configure/arm/confirm
+over-long chains) — the Phase 8 provisioning-hardening suites: `test_http_request`
+/ `test_http_router` (HTTP parsing and the closed captive route set),
+`test_portal_session` / `test_portal_auth` / `test_portal_secrets` (CSRF and
+form-field bounds), `test_url_form` (form decoding), `test_wifi_field` (Wi‑Fi
+field validation), `test_provision_button` (the tap/configure/arm/confirm
 button FSM), `test_txn_marker` (the power-loss-durable commit transaction),
-`test_factory_erase`, and `test_location_record`.
+`test_factory_erase`, and `test_location_record` — plus the four **Phase 9**
+opt-in-worker suites added since: `test_adsb_worker_protocol` (worker request/
+result generations, Paused transition, and fault propagation),
+`test_network_work_intent` (Configure/Erase intent supersedence and quiescence
+— Erase always wins over a pending Configure), `test_adsb_fetch_control`
+(cooperative fetch cancellation that cancels at stage/refill boundaries and
+discards any unpublished partial candidate rather than aborting the transport
+mid-byte), and `test_adsb_worker_contract` (the header/pump-action contract
+the worker and main loop share) — plus the existing `test_poll_backoff` suite,
+extended in Phase 9 (poll-abort handling preserves the transient/permanent
+backoff schedule unchanged).
 
-The friend-seam gate, the **offline CA trust gate**, and the **provisioning
-policy gate** are pure PowerShell (Windows PowerShell 5.1 and pwsh 7), need no
-ESP32 toolchain, and never touch the network:
+The friend-seam gate, the **offline CA trust gate**, the **provisioning
+policy gate**, and the **Phase 9 worker policy gate** are pure PowerShell
+(Windows PowerShell 5.1 and pwsh 7), need no ESP32 toolchain, and never touch
+the network:
 
 ```powershell
 .\scripts\check-native-test-access-gate.ps1   # SnapshotStoreTestAccess cannot leak into firmware
 .\scripts\verify-ca-bundle.ps1                # 4 pinned roots, no setInsecure, CA enforced, derived-time clock, CA-authenticated cert-notBefore floor
 .\scripts\verify-provisioning-policy.ps1      # 8 static release invariants against src/+include/+platformio.ini (no WiFiManager/OTA/mDNS, closed route set, no permanent listener, no secret logging, RAM/flash transaction policy, no insecure AP teardown, one framebuffer, bounded portal)
 .\scripts\verify-provisioning-policy.ps1 -SelfTest   # proves the gate itself rejects 9 representative negative tamper cases (re-added WiFiManager, forbidden/extra routes, secret logging, second framebuffer, insecure AP teardown, unguarded storage/teardown, commit-ordering ambiguity), on an isolated temp copy
+.\scripts\verify-adsb-worker-policy.ps1              # 10 static source invariants for the opt-in worker (static task/stack/queue sizing, snapshot reuse, main-loop ownership boundaries, cooperative cancellation ordering, default build stays worker-free)
+.\scripts\verify-adsb-worker-policy.ps1 -SelfTest    # proves the gate rejects 15 representative negative tamper cases, on an isolated temp copy
 ```
+
+The worker policy gate proves these invariants hold in **source**; the
+release-binary `nm` proof that the default `supermini` build links **zero**
+worker/integration symbols is the actual certification step (see
+[Memory budget](#memory-budget)).
 
 ### Memory budget
 
@@ -558,6 +651,43 @@ Key static portal buffers: the HTTP response workspace is 2,048 B, the request
 body buffer is 1,600 B, and the parser workspace is 1,072 B; the candidate,
 old, and expected `wifi_config_t` snapshots used by the commit transaction are
 140 B each.
+
+**Phase 9 optional ADS-B network worker** (`adsb_worker`/`adsb_worker_protocol`,
+`network_work_intent`, and the `verify-adsb-worker-policy.ps1` gate) leaves the
+**default** `supermini` build's runtime mode synchronous and worker-off, with
+only a small, fixed flash cost from the shared Phase 9 coordination code and
+zero RAM — while the **opt-in** `supermini-worker` build additionally adds the
+fixed cost of its static task/stack/queues.
+Measured with the same pinned clean build for both envs:
+
+| Build measurement | Phase 8 baseline | Phase 9 default `supermini` | Δ vs Phase 8 | Phase 9 opt-in `supermini-worker` | Δ vs Phase 9 default |
+|-------------------|------:|------:|------:|------:|------:|
+| Linker-reported static RAM | 65,044 | 65,044 | 0 | 73,924 | +8,880 |
+| Linker-reported firmware flash | 1,142,914 | 1,143,328 | +414 | 1,146,194 | +2,866 |
+| `firmware.bin` image | 1,197,760 | 1,198,256 | +496 | 1,202,320 | +4,064 |
+| `firmware-merged.bin` image | 1,263,296 | 1,263,792 | +496 | 1,267,856 | +4,064 |
+
+The default build's small flash growth (+414/+496 B, 0 RAM) is **not**
+compiled-out worker scaffolding — the release binary's symbol table, inspected
+with `nm`, shows **zero** worker/integration symbols in the default
+`supermini` ELF, so no task/queue/worker-stack code is linked in at all. The
+delta is instead the shared Phase 9 coordination/cancellation/completion
+refactor (controlled-fetch staging, poll-abort handling, and timekeeper
+synchronization) used to preserve synchronous/async equivalence between the
+default and worker builds — code that runs in both builds' synchronous path.
+The opt-in worker build's **+8,880 B static RAM** is one statically created
+task and two statically created depth-1 queues: the fixed **8,192-byte**
+worker task stack plus its static TCB, the two depth-1 static queues and their
+backing storage, and the small fixed protocol/hook state shared between main
+and worker — there is still **no** third `AircraftSnapshot` and **no** second
+framebuffer. Its additional flash growth (**+2,866/+4,064 B** vs the Phase 9
+default) is the worker adapter, task function, and queue/protocol/integration
+code retained only by the opt-in build — not a newly linked
+`WiFiClientSecure` instance, since TLS code already exists in the default
+synchronous fetch path. On-device
+TLS heap peak and stack high-water marks for the worker build remain **unknown**
+and are a hardware-only gate (see [Hardware-only acceptance gates](#hardware-only-acceptance-gates)) —
+they have not yet been measured on real hardware.
 
 ### Web-flashable release image
 
