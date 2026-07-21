@@ -336,6 +336,60 @@ void test_fault_disables_dispatch_but_never_blocks_callers() {
   TEST_ASSERT_TRUE(core::workerCanDispatch(s));
 }
 
+void test_fault_from_dispatched_is_fail_closed() {
+  // The network-worker adapter faults from Dispatched when the request-queue send
+  // fails right after workerDispatch captured the generation. Dispatch must then
+  // be disabled and no caller may block; recovery is only via a fresh init.
+  WorkerProtocolState s;
+  core::workerProtocolInit(&s);
+  const WorkerDispatch d = core::workerDispatch(&s);
+  TEST_ASSERT_TRUE(d.accepted);
+  TEST_ASSERT_EQUAL_INT(PH(WorkerPhase::Dispatched), phase(s));
+
+  core::workerFault(&s);  // request-queue send failure: fail closed from Dispatched
+  TEST_ASSERT_TRUE(core::workerFaulted(s));
+  TEST_ASSERT_FALSE(core::workerCanDispatch(s));
+  TEST_ASSERT_FALSE(core::workerQuiesced(s));
+
+  // Every entry point returns immediately and leaves the fault standing.
+  TEST_ASSERT_FALSE(core::workerDispatch(&s).accepted);
+  TEST_ASSERT_FALSE(core::workerClaim(&s, d.generation));
+  TEST_ASSERT_FALSE(core::workerComplete(&s, d.generation));
+  TEST_ASSERT_EQUAL_INT(CO(WorkerConsume::Rejected),
+                        CO(core::workerConsume(&s, d.generation)));
+  core::workerRequestPause(&s);
+  TEST_ASSERT_TRUE(core::workerFaulted(s));
+  TEST_ASSERT_FALSE(core::workerResume(&s));  // resume never recovers a fault
+
+  core::workerProtocolInit(&s);  // recovery only via a fresh coordinator
+  TEST_ASSERT_TRUE(core::workerCanDispatch(s));
+}
+
+void test_fault_from_result_ready_is_fail_closed() {
+  // The adapter faults from ResultReady when the result-queue send fails after the
+  // worker completed. The completed result is never delivered: dispatch stays
+  // disabled and a consume of that generation is rejected, so main observes Fault
+  // rather than a fabricated completion or a leaked candidate.
+  WorkerProtocolState s;
+  core::workerProtocolInit(&s);
+  const WorkerDispatch d = core::workerDispatch(&s);
+  TEST_ASSERT_TRUE(core::workerClaim(&s, d.generation));
+  TEST_ASSERT_TRUE(core::workerComplete(&s, d.generation));
+  TEST_ASSERT_EQUAL_INT(PH(WorkerPhase::ResultReady), phase(s));
+
+  core::workerFault(&s);  // result-queue send failure: fail closed from ResultReady
+  TEST_ASSERT_TRUE(core::workerFaulted(s));
+  TEST_ASSERT_FALSE(core::workerCanDispatch(s));
+  TEST_ASSERT_FALSE(core::workerQuiesced(s));
+  TEST_ASSERT_EQUAL_INT(CO(WorkerConsume::Rejected),
+                        CO(core::workerConsume(&s, d.generation)));
+  TEST_ASSERT_FALSE(core::workerResume(&s));
+  TEST_ASSERT_FALSE(core::workerDispatch(&s).accepted);
+
+  core::workerProtocolInit(&s);  // recovery only via a fresh coordinator
+  TEST_ASSERT_TRUE(core::workerCanDispatch(s));
+}
+
 void test_quiescence_truth_table_across_all_phases() {
   // Only Paused is quiesced; every other phase is not.
   WorkerProtocolState s;
@@ -411,6 +465,8 @@ int main(int, char**) {
   RUN_TEST(test_resume_only_returns_paused_to_idle);
   RUN_TEST(test_resume_after_idle_pause_returns_to_idle);
   RUN_TEST(test_fault_disables_dispatch_but_never_blocks_callers);
+  RUN_TEST(test_fault_from_dispatched_is_fail_closed);
+  RUN_TEST(test_fault_from_result_ready_is_fail_closed);
   RUN_TEST(test_quiescence_truth_table_across_all_phases);
   RUN_TEST(test_rejected_events_do_not_corrupt_state);
   RUN_TEST(test_null_state_is_safe);
