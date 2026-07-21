@@ -523,7 +523,7 @@ the network:
 .\scripts\verify-adsb-worker-policy.ps1              # 10 static source invariants + Phase 10 diag env matrix (17 tamper cases total)
 .\scripts\verify-adsb-worker-policy.ps1 -SelfTest    # proves the gate rejects 17 representative negative tamper cases, on an isolated temp copy
 .\scripts\verify-diagnostics-policy.ps1              # Phase 10: 12 diagnostics/logging source invariants
-.\scripts\verify-diagnostics-policy.ps1 -SelfTest    # proves the diagnostics gate rejects 12 representative tamper cases
+.\scripts\verify-diagnostics-policy.ps1 -SelfTest    # proves the diagnostics gate rejects 13 representative tamper cases
 ```
 
 The worker policy gate proves these invariants hold in **source**; the
