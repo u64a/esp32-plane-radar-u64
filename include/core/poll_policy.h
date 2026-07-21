@@ -93,6 +93,18 @@ bool adsbFetchDue(const AdsbPollState& state, uint32_t now_ms);
 // latch as before, so ordinary back-to-back completions never stay immediate.
 void adsbFetchStarted(AdsbPollState* state);
 
+// Unwind an in-flight fetch that was COOPERATIVELY cancelled for a pause (the
+// optional network worker aborting on requestPause), instead of recording a
+// completion. It clears fetch_in_flight only, and DELIBERATELY preserves every
+// scheduling field: transient_streak, next_interval_ms, has_fetch_completion,
+// last_fetch_completed_ms, and the forced-immediate request/latch
+// (immediate_fetch_due / immediate_request_seq / inflight_request_seq). A
+// cancelled fetch is NOT a completion: it must not reset the cadence to
+// success_ms (which PollOutcome::Obsolete would do) nor clear a pending immediate,
+// so the shared backoff stays intact and a later resume performs exactly one
+// immediate fetch. Safe when state is null or no fetch is in flight (a no-op).
+void adsbFetchAbortedForPause(AdsbPollState* state);
+
 void adsbFetchCompleted(AdsbPollState* state, uint32_t completed_ms,
                         const AdsbPollPolicy& policy, PollOutcome outcome,
                         bool retry_after_present, uint32_t retry_after_ms);

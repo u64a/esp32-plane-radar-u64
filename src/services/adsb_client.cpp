@@ -63,12 +63,28 @@ FetchOutcome connectFailure(ConnectOutcome outcome) {
   }
 }
 
-// Arduino-side fetch seam handed to SnapshotStore::fetchCandidate. It performs
-// the bounded HTTPS request into the caller-owned inactive snapshot `out` and
-// returns the FetchResult; it never publishes. `ctx` is unused (workspace and
-// poll hook are file-scope statics).
-FetchResult realFetch(const FetchRequest& request, AircraftSnapshot& out,
-                      void* /*ctx*/) {
+// Synchronous idle adapter: routes the FetchControl idle pump back to the
+// file-scope poll hook (wifiLoop) so the synchronous fetch behaves exactly as it
+// did before the control seam existed.
+void syncPollAdapter(void* /*ctx*/) {
+  if (s_poll_fn != nullptr) {
+    s_poll_fn();
+  }
+}
+
+// Shared bounded-HTTPS fetch used by both the synchronous path and the future
+// worker. It fills the caller-owned inactive snapshot `out` and returns the
+// FetchResult; it never publishes. Idle waits and cooperative cancellation are
+// driven through `control`: a synchronous caller passes a control whose `cancel`
+// is null (never cancels), so all cancellation checkpoints below are no-ops and
+// the behavior is byte-for-byte identical to the pre-control fetch. A worker
+// caller passes a control whose predicate aborts the fetch on requestPause.
+// Cancellation is checked before DNS/connect, immediately after connect,
+// before/after the peer-certificate date check, before the HTTP send, in the send
+// retries and the response-decode idle/refill loops, and before returning
+// success. The client is ALWAYS stop()ped from this executing task.
+FetchResult realFetchImpl(const FetchRequest& request, AircraftSnapshot& out,
+                          const FetchControl& control) {
   if (!core::coordinatesValid(request.lat, request.lon) ||
       !std::isfinite(request.radius_km) || request.radius_km <= 0.0f) {
     return makeFailure(FetchOutcome::ParseError);
@@ -86,6 +102,12 @@ FetchResult realFetch(const FetchRequest& request, AircraftSnapshot& out,
       request.lat, request.lon, static_cast<double>(dist_nm), config::kAdsbHost);
   if (req_len <= 0 || req_len >= static_cast<int>(sizeof(http_request))) {
     return makeFailure(FetchOutcome::ParseError);
+  }
+
+  // Cancellation checkpoint: before any DNS/connect. Nothing is open yet, so a
+  // cancelled fetch simply returns without touching the network.
+  if (fetchControlCancelled(control)) {
+    return makeFailure(FetchOutcome::TransportFailure);
   }
 
   WiFiClientSecure client;
@@ -106,6 +128,12 @@ FetchResult realFetch(const FetchRequest& request, AircraftSnapshot& out,
     return makeFailure(connectFailure(connected));
   }
 
+  // Cancellation checkpoint: immediately after connect, before any further work.
+  if (fetchControlCancelled(control)) {
+    client.stop();
+    return makeFailure(FetchOutcome::TransportFailure);
+  }
+
   // Close the callback TOCTOU / pre-handshake staleness: obtain the DERIVED
   // trusted timestamp AGAIN here -- AFTER DNS + TCP + the TLS handshake and
   // immediately before the peer notBefore/notAfter check -- never a value
@@ -117,6 +145,12 @@ FetchResult realFetch(const FetchRequest& request, AircraftSnapshot& out,
   if (trusted_now_unix <= 0) {
     client.stop();
     return makeFailure(FetchOutcome::TimeUnavailable);
+  }
+
+  // Cancellation checkpoint: before the peer-certificate date validation.
+  if (fetchControlCancelled(control)) {
+    client.stop();
+    return makeFailure(FetchOutcome::TransportFailure);
   }
 
   // The handshake verified the CA chain + hostname, but the pinned SDK builds
@@ -138,8 +172,14 @@ FetchResult realFetch(const FetchRequest& request, AircraftSnapshot& out,
   }
   const int64_t authenticated_leaf_not_before_unix = peer.not_before_unix;
 
+  // Cancellation checkpoint: after cert validation, before the HTTP send.
+  if (fetchControlCancelled(control)) {
+    client.stop();
+    return makeFailure(FetchOutcome::TransportFailure);
+  }
+
   EspMillisClock clock;
-  EspPollIdle idle(s_poll_fn);
+  FetchControlIdle idle(control);
   // One cumulative request/response budget covers BOTH the request send and the
   // HTTP response decode. It starts before the send; the send may consume part
   // of it, and only what remains is handed to the decoder -- send and response
@@ -148,6 +188,7 @@ FetchResult realFetch(const FetchRequest& request, AircraftSnapshot& out,
   if (!espSendAll(client, reinterpret_cast<const uint8_t*>(http_request),
                   static_cast<size_t>(req_len), clock, idle,
                   config::kAdsbOverallTimeoutMs)) {
+    // espSendAll also returns false on a cooperative cancel in its retry loop.
     client.stop();
     return makeFailure(FetchOutcome::Timeout);
   }
@@ -182,6 +223,15 @@ FetchResult realFetch(const FetchRequest& request, AircraftSnapshot& out,
   FetchResult result = runFetch(
       source, clock, idle, request.lat, request.lon, parse_options,
       kDefaultHttpLimits, deadlines, workspace, out, request.settings_revision);
+
+  // Cancellation checkpoint: before returning/posting success. A cancel observed
+  // only now (e.g. a fully buffered body that never idled) must not post a
+  // success; the good bytes stay in the unpublished inactive slot.
+  if (fetchControlCancelled(control)) {
+    client.stop();
+    return makeFailure(FetchOutcome::TransportFailure);
+  }
+
   // Stamp the authenticated floor candidate ONLY on a complete Ok (a partial or
   // failed response, even over a verified connection, must ratchet nothing). The
   // value is the CA-signed leaf notBefore captured before the send -- never an
@@ -190,6 +240,28 @@ FetchResult realFetch(const FetchRequest& request, AircraftSnapshot& out,
       result.outcome, authenticated_leaf_not_before_unix);
   client.stop();
   return result;
+}
+
+// Synchronous fetch seam handed to SnapshotStore::fetchCandidate. It builds a
+// control that pumps the file-scope poll hook and NEVER cancels, so it is
+// byte-for-byte identical to the pre-control synchronous fetch. `ctx` is unused.
+FetchResult realFetch(const FetchRequest& request, AircraftSnapshot& out,
+                      void* /*ctx*/) {
+  FetchControl control{};
+  control.idle = &syncPollAdapter;
+  // control.cancel stays null: the synchronous path never cancels.
+  return realFetchImpl(request, out, control);
+}
+
+// Controlled fetch seam handed to SnapshotStore::fetchCandidate by the worker
+// path. `ctx` is the caller's FetchControl (idle pump + cancellation predicate).
+FetchResult realFetchControlled(const FetchRequest& request,
+                                AircraftSnapshot& out, void* ctx) {
+  if (ctx == nullptr) {
+    FetchControl empty{};  // no idle, no cancel
+    return realFetchImpl(request, out, empty);
+  }
+  return realFetchImpl(request, out, *static_cast<const FetchControl*>(ctx));
 }
 
 }  // namespace
@@ -210,9 +282,26 @@ CandidateResult fetchCandidate(double center_lat, double center_lon,
   return s_store.fetchCandidate(request, &realFetch, nullptr);
 }
 
+CandidateResult fetchCandidateControlled(double center_lat, double center_lon,
+                                         float fetch_radius_km,
+                                         uint32_t settings_revision,
+                                         const FetchControl& control) {
+  const FetchRequest request{center_lat, center_lon, fetch_radius_km,
+                             settings_revision};
+  // The fetch runs synchronously within this call, so `control` outlives it; the
+  // const_cast only satisfies the C-style void* ctx seam (realFetchControlled
+  // treats it as const FetchControl* and never mutates it).
+  return s_store.fetchCandidate(request, &realFetchControlled,
+                                const_cast<FetchControl*>(&control));
+}
+
 PublishResult publishCandidate(const CandidateHandle& handle,
                                uint32_t current_settings_revision) {
   return s_store.publishCandidate(handle, current_settings_revision);
+}
+
+void discardCandidate(const CandidateHandle& handle) {
+  s_store.discardCandidate(handle);  // idempotent; preserves the active snapshot
 }
 
 FetchResult fetchLatest(double center_lat, double center_lon,

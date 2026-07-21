@@ -37,6 +37,51 @@ class IdleHandler {
   virtual ~IdleHandler() = default;
   // Poll/yield during idle waits so the registered network callback still runs.
   virtual void onIdle() = 0;
+  // Cooperative cancellation query for a controllable fetch. Non-pure with a
+  // default of false so every existing IdleHandler (the synchronous poll hook and
+  // the native fakes) stays source-compatible and never cancels -- the decoder
+  // and send loops preserve byte-for-byte behavior. A worker-backed handler
+  // overrides it to abort an in-flight fetch on requestPause.
+  virtual bool cancelled() { return false; }
+};
+
+// Arduino-free control block shared by the synchronous fetch and the future
+// optional network worker (compile-time default OFF). It carries an OPTIONAL idle
+// pump and an OPTIONAL cooperative cancellation predicate, each with an opaque
+// context pointer. No std::function and no heap -- just two function pointers and
+// two context pointers -- so it is safe to copy onto a worker task's stack. A
+// null callback disables that capability: the synchronous path leaves `cancel`
+// null so it never cancels, and `idle` null simply skips the yield.
+struct FetchControl {
+  using IdleFn = void (*)(void* ctx);
+  using CancelFn = bool (*)(void* ctx);
+  IdleFn idle = nullptr;
+  CancelFn cancel = nullptr;
+  void* idle_ctx = nullptr;
+  void* cancel_ctx = nullptr;
+};
+
+// True only when a cancellation predicate is installed AND it reports cancelled.
+// A control with a null predicate (the synchronous path) is never cancelled.
+inline bool fetchControlCancelled(const FetchControl& control) {
+  return control.cancel != nullptr && control.cancel(control.cancel_ctx);
+}
+
+// IdleHandler that routes onIdle()/cancelled() through a FetchControl. Header-only
+// and Arduino-free so the ESP fetch and the native tests drive the exact same
+// idle/cancel plumbing that the bounded HTTP decoder and the send loop consume.
+class FetchControlIdle : public IdleHandler {
+ public:
+  explicit FetchControlIdle(const FetchControl& control) : control_(control) {}
+  void onIdle() override {
+    if (control_.idle != nullptr) {
+      control_.idle(control_.idle_ctx);
+    }
+  }
+  bool cancelled() override { return fetchControlCancelled(control_); }
+
+ private:
+  FetchControl control_;
 };
 
 // Truthful transport connection outcome. Callers must not fabricate a

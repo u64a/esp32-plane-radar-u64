@@ -152,6 +152,13 @@ ReadResult HttpDecoder::nextByte(uint8_t* out) {
       return ReadResult::Timeout;
     }
     idle_.onIdle();  // poll/yield at least once per scratch refill
+    if (idle_.cancelled()) {
+      // Cooperative cancel (worker pause): abort the decode like a transport read
+      // error. The fetch outcome is transport-like on purpose -- the worker
+      // envelope carries the authoritative cancelled flag -- and no partial body
+      // is ever framed as a success.
+      return ReadResult::Error;
+    }
     size_t n = 0;
     const ReadStatus st = source_.read(ws_.scratch, ws_.scratch_size, &n);
     if (st == ReadStatus::Data) {

@@ -51,6 +51,15 @@ core::TimeTrustState s_state{};
 uint32_t s_last_consumed_gen = 0;
 bool s_floor_write_warned = false;
 
+// Dedicated spinlock guarding s_state so the future worker-on build can read
+// trusted()/nowUnix() from the worker task while the loop task runs update() and
+// noteVerifiedCertFloor() without a torn 64-bit field read or a mid-step race. It
+// is SEPARATE from s_sample_mux (which only guards the SNTP sample latch). Every
+// critical section stays short: copy or step s_state under the lock, then perform
+// SNTP start, NVS I/O, and logging OUTSIDE it -- the mux is never held during
+// NVS/network/logging.
+portMUX_TYPE s_state_mux = portMUX_INITIALIZER_UNLOCKED;
+
 // --- Thread-safe SNTP sample latch (portMUX critical section) ----------------
 // The SNTP notification callback runs in the lwIP task and may preempt the loop
 // task. It only latches the sample: no logging, allocation, NVS, drawing, or
@@ -131,8 +140,10 @@ void readPersistedRecord(int64_t* out_floor) {
 
 void init() {
   int64_t persisted_floor = config::kReleaseEpochFloorUnix;
-  readPersistedRecord(&persisted_floor);
+  readPersistedRecord(&persisted_floor);  // NVS read OUTSIDE the lock
+  portENTER_CRITICAL(&s_state_mux);
   core::timeTrustInit(&s_state, kPolicy, persisted_floor);  // always UNTRUSTED at boot
+  portEXIT_CRITICAL(&s_state_mux);
   s_last_consumed_gen = 0;
   sntp_set_time_sync_notification_cb(sntpSyncCallback);
 }
@@ -150,17 +161,33 @@ void update(bool wifi_connected, uint32_t now_ms) {
     in.sample_unix = sample_unix;
   }
 
-  const core::TimeTrustActions actions = core::timeTrustStep(&s_state, kPolicy, in);
+  // Step the state machine under the lock, then perform any SNTP (re)arm OUTSIDE
+  // it -- the mux is never held during network/logging.
+  core::TimeTrustActions actions;
+  portENTER_CRITICAL(&s_state_mux);
+  actions = core::timeTrustStep(&s_state, kPolicy, in);
+  portEXIT_CRITICAL(&s_state_mux);
   if (actions.start_sntp) {
     startSntp();
   }
 }
 
-bool trusted() { return core::timeTrustIsTrusted(s_state); }
+bool trusted() {
+  portENTER_CRITICAL(&s_state_mux);
+  const bool is_trusted = core::timeTrustIsTrusted(s_state);
+  portEXIT_CRITICAL(&s_state_mux);
+  return is_trusted;
+}
 
 int64_t nowUnix() {
+  const uint32_t now_ms = millis();
+  // Snapshot s_state under the lock, then compute the derived value outside it.
+  core::TimeTrustState snapshot;
+  portENTER_CRITICAL(&s_state_mux);
+  snapshot = s_state;
+  portEXIT_CRITICAL(&s_state_mux);
   int64_t derived = 0;
-  if (!core::derivedTrustedNowUnix(s_state, kPolicy, millis(), &derived)) {
+  if (!core::derivedTrustedNowUnix(snapshot, kPolicy, now_ms, &derived)) {
     return 0;  // untrusted or stale: fail closed (never the mutable wall clock)
   }
   return derived;
@@ -174,14 +201,18 @@ void noteVerifiedCertFloor(int64_t authenticated_cert_not_before_unix,
   // unauthenticated NTP attacker cannot influence what is written to NVS. A
   // non-Ok fetch passes 0, which the core rejects as below the release floor.
   uint64_t floor_value = 0;
-  if (!core::shouldRatchetPersistedFloor(s_state,
-                                         authenticated_cert_not_before_unix,
-                                         now_ms, kRatchetPolicy, &floor_value)) {
+  bool should_write = false;
+  portENTER_CRITICAL(&s_state_mux);
+  should_write = core::shouldRatchetPersistedFloor(
+      s_state, authenticated_cert_not_before_unix, now_ms, kRatchetPolicy,
+      &floor_value);
+  portEXIT_CRITICAL(&s_state_mux);
+  if (!should_write) {
     return;
   }
 
   // Serialize the versioned record {floor = exact authenticated notBefore} and
-  // write it as a single atomic NVS blob.
+  // write it as a single atomic NVS blob. The mux is NOT held across this I/O.
   const core::PersistedFloorRecord rec{static_cast<int64_t>(floor_value)};
   uint8_t buf[core::kPersistedFloorRecordBytes];
   bool ok = false;
@@ -196,8 +227,10 @@ void noteVerifiedCertFloor(int64_t authenticated_cert_not_before_unix,
 
   // Record the attempt (success or failure) so the in-session flash-wear guard is
   // honored consistently; only a successful write advances the in-RAM floor
-  // (monotonic max, never a rollback).
+  // (monotonic max, never a rollback). Take the lock again ONLY to record it.
+  portENTER_CRITICAL(&s_state_mux);
   core::noteFloorWrite(&s_state, floor_value, now_ms, ok);
+  portEXIT_CRITICAL(&s_state_mux);
   if (!ok && !s_floor_write_warned) {
     s_floor_write_warned = true;  // surface once; do not spam, do not block
     Serial.println("time: persisted-floor NVS write failed (trust unaffected)");

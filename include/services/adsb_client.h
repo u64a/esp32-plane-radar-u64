@@ -3,6 +3,7 @@
 #include <cstddef>
 
 #include "services/adsb_snapshot_store.h"
+#include "services/adsb_transport.h"
 #include "services/adsb_types.h"
 
 namespace services::adsb {
@@ -52,11 +53,39 @@ CandidateResult fetchCandidate(double center_lat, double center_lon,
                                float fetch_radius_km, uint32_t settings_revision);
 
 /**
+ * Controllable variant of fetchCandidate() for the future optional network
+ * worker (compile-time default OFF). It performs the identical bounded HTTPS
+ * fetch into the store's inactive slot, but drives its idle waits and its
+ * cooperative cancellation through the caller-supplied FetchControl instead of
+ * the file-scope synchronous poll hook. When control.cancel reports cancelled the
+ * fetch aborts (checked before DNS/connect, right after connect, before/after the
+ * peer-certificate date check, before the HTTP send and in its retries, in the
+ * response-decode idle/refill loop, and before returning success) and no partial
+ * candidate is left outstanding; the client is always stop()ped from this calling
+ * task. The outcome may be transport/timeout-like on an abort -- the worker
+ * envelope carries the authoritative cancelled flag; no fake success is produced.
+ * The synchronous fetchCandidate() is unchanged: it uses a control that never
+ * cancels, preserving byte-for-byte behavior.
+ */
+CandidateResult fetchCandidateControlled(double center_lat, double center_lon,
+                                         float fetch_radius_km,
+                                         uint32_t settings_revision,
+                                         const FetchControl& control);
+
+/**
  * Step 2: publish a candidate iff its handle is current and its revision still
  * equals current_settings_revision; otherwise the published snapshot is preserved
  * byte-for-byte. Returns the explicit PublishResult.
  */
 PublishResult publishCandidate(const CandidateHandle& handle,
                                uint32_t current_settings_revision);
+
+/**
+ * Idempotent wrapper over SnapshotStore::discardCandidate(): drop an outstanding
+ * candidate without publishing it (e.g. a worker result the coordinator cancelled
+ * or superseded). A stale, foreign, forged, or already-resolved handle is a
+ * no-op; the published snapshot is always preserved byte-for-byte.
+ */
+void discardCandidate(const CandidateHandle& handle);
 
 }  // namespace services::adsb

@@ -158,6 +158,9 @@ bool espSendAll(WiFiClientSecure& client, const uint8_t* data, size_t length,
         core::elapsedAtLeast(clock.nowMs(), started, deadline_ms)) {
       return false;
     }
+    if (idle.cancelled()) {
+      return false;  // cooperative cancel (worker pause) aborts the send/retries
+    }
     if (!client.connected()) {
       return false;
     }

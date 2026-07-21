@@ -29,21 +29,6 @@ class EspMillisClock : public Clock {
   uint32_t nowMs() const override;
 };
 
-// Invokes the registered network poll callback during controllable idle waits.
-class EspPollIdle : public IdleHandler {
- public:
-  using PollFn = void (*)();
-  explicit EspPollIdle(PollFn fn) : fn_(fn) {}
-  void onIdle() override {
-    if (fn_ != nullptr) {
-      fn_();
-    }
-  }
-
- private:
-  PollFn fn_;
-};
-
 // Resolve DNS (distinguishing DnsFailure), then perform the TCP + TLS connect
 // against the resolved IP using the SNI-capable IP+host overload (no second DNS
 // lookup). The connect budget (DNS + TCP + TLS) is cumulative: it starts before

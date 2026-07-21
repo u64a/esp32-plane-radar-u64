@@ -321,6 +321,84 @@ void test_disconnect_seq_change_detection_including_wrap() {
   TEST_ASSERT_TRUE(disconnectSeqChanged(UINT32_MAX - 1U, 2U));  // several across wrap
 }
 
+void test_abort_for_pause_clears_inflight_preserving_schedule() {
+  // A cooperatively cancelled fetch is unwound WITHOUT recording a completion:
+  // fetch_in_flight clears but the whole backoff schedule is preserved.
+  AdsbPollState s = displayed();
+  complete(&s, 1000, PollOutcome::Transient);  // streak 1, next 5 s, completion@1000
+  TEST_ASSERT_EQUAL_UINT8(1, s.transient_streak);
+  TEST_ASSERT_EQUAL_UINT32(5000, s.next_interval_ms);
+  TEST_ASSERT_TRUE(s.has_fetch_completion);
+
+  core::adsbFetchStarted(&s);
+  TEST_ASSERT_TRUE(s.fetch_in_flight);
+
+  core::adsbFetchAbortedForPause(&s);
+  TEST_ASSERT_FALSE(s.fetch_in_flight);  // only the in-flight marker cleared
+  TEST_ASSERT_EQUAL_UINT8(1, s.transient_streak);          // preserved
+  TEST_ASSERT_EQUAL_UINT32(5000, s.next_interval_ms);      // preserved
+  TEST_ASSERT_TRUE(s.has_fetch_completion);                // preserved
+  TEST_ASSERT_EQUAL_UINT32(1000, s.last_fetch_completed_ms);  // preserved
+
+  // The cadence is intact: still due 5 s after the LAST real completion, not 3 s.
+  TEST_ASSERT_FALSE(core::adsbFetchDue(s, 5999));
+  TEST_ASSERT_TRUE(core::adsbFetchDue(s, 6000));  // 1000 + 5000
+}
+
+void test_abort_for_pause_preserves_pending_immediate() {
+  // If the aborted fetch was the forced-immediate one, the immediate latch
+  // survives so a resume performs exactly one immediate fetch.
+  AdsbPollState s = displayed();  // immediate_fetch_due = true
+  TEST_ASSERT_TRUE(s.immediate_fetch_due);
+  core::adsbFetchStarted(&s);
+  core::adsbFetchAbortedForPause(&s);
+  TEST_ASSERT_FALSE(s.fetch_in_flight);
+  TEST_ASSERT_TRUE(s.immediate_fetch_due);        // latch preserved
+  TEST_ASSERT_TRUE(core::adsbFetchDue(s, 0));      // immediate on resume
+  TEST_ASSERT_TRUE(core::adsbFetchDue(s, 999999));
+
+  // Servicing that one immediate and completing normally returns to cadence:
+  // exactly one immediate fetch, not a permanently-immediate loop.
+  core::adsbFetchStarted(&s);
+  complete(&s, 2000, PollOutcome::Success);
+  TEST_ASSERT_FALSE(core::adsbFetchDue(s, 2000));
+  TEST_ASSERT_TRUE(core::adsbFetchDue(s, 5000));  // 2000 + 3000
+}
+
+void test_abort_for_pause_does_not_reset_cadence_like_obsolete() {
+  // Contrast with routing a cancel through PollOutcome::Obsolete, which would
+  // reset next_interval_ms to success_ms (3 s) and latch a completion.
+  AdsbPollState aborted = displayed();
+  complete(&aborted, 1000, PollOutcome::Transient);  // next 5 s
+  core::adsbFetchStarted(&aborted);
+  core::adsbFetchAbortedForPause(&aborted);
+  TEST_ASSERT_EQUAL_UINT32(5000, aborted.next_interval_ms);  // NOT 3000
+
+  AdsbPollState obsolete = displayed();
+  complete(&obsolete, 1000, PollOutcome::Transient);
+  core::adsbFetchStarted(&obsolete);
+  complete(&obsolete, 2000, PollOutcome::Obsolete);  // the wrong way to model it
+  TEST_ASSERT_EQUAL_UINT32(3000, obsolete.next_interval_ms);  // reset to success
+}
+
+void test_abort_for_pause_null_and_not_in_flight_are_safe() {
+  core::adsbFetchAbortedForPause(nullptr);  // must not crash
+
+  // Not in flight: a no-op that touches nothing.
+  AdsbPollState s = displayed();
+  complete(&s, 1000, PollOutcome::Success);  // next 3 s, completion@1000
+  const AdsbPollState before = s;
+  TEST_ASSERT_FALSE(s.fetch_in_flight);
+  core::adsbFetchAbortedForPause(&s);
+  TEST_ASSERT_EQUAL_UINT8(before.transient_streak, s.transient_streak);
+  TEST_ASSERT_EQUAL_UINT32(before.next_interval_ms, s.next_interval_ms);
+  TEST_ASSERT_EQUAL_UINT32(before.last_fetch_completed_ms,
+                           s.last_fetch_completed_ms);
+  TEST_ASSERT_EQUAL_INT(before.has_fetch_completion, s.has_fetch_completion);
+  TEST_ASSERT_EQUAL_INT(before.immediate_fetch_due, s.immediate_fetch_due);
+  TEST_ASSERT_FALSE(s.fetch_in_flight);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_transient_backoff_table_and_cap);
@@ -343,5 +421,9 @@ int main(int, char**) {
   RUN_TEST(test_effective_outcome_downgrades_only_transient_when_disconnected);
   RUN_TEST(test_wifi_down_transient_does_not_increment_streak);
   RUN_TEST(test_disconnect_seq_change_detection_including_wrap);
+  RUN_TEST(test_abort_for_pause_clears_inflight_preserving_schedule);
+  RUN_TEST(test_abort_for_pause_preserves_pending_immediate);
+  RUN_TEST(test_abort_for_pause_does_not_reset_cadence_like_obsolete);
+  RUN_TEST(test_abort_for_pause_null_and_not_in_flight_are_safe);
   return UNITY_END();
 }

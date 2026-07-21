@@ -130,6 +130,22 @@ void adsbFetchCompleted(AdsbPollState* state, uint32_t completed_ms) {
   state->last_fetch_completed_ms = completed_ms;
 }
 
+void adsbFetchAbortedForPause(AdsbPollState* state) {
+  if (state == nullptr || !state->fetch_in_flight) {
+    return;  // null or nothing in flight: nothing to unwind
+  }
+  // A cooperatively cancelled fetch is unwound as if it never completed: clear
+  // only the in-flight marker. Everything else is preserved on purpose --
+  // transient_streak, next_interval_ms, has_fetch_completion,
+  // last_fetch_completed_ms, and the forced-immediate latch
+  // (immediate_fetch_due / immediate_request_seq / inflight_request_seq). This is
+  // NOT routed through adsbFetchCompleted()/PollOutcome::Obsolete, which would
+  // reset the cadence to success_ms and latch a completion. Keeping the state
+  // intact means the shared backoff survives the pause and a later resume fires
+  // exactly one immediate fetch (only when one was already pending).
+  state->fetch_in_flight = false;
+}
+
 namespace {
 
 // Saturating ceiling for the transient streak: far beyond where the schedule
