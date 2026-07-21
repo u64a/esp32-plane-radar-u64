@@ -9,6 +9,7 @@
 
 #include "config.h"
 #include "core/time_trust.h"
+#include "runtime_diagnostics.h"
 
 // Deliberately NO <ctime> / ::time(nullptr): nowUnix and the certificate
 // notBefore/notAfter check read only the core's DERIVED accepted-monotonic clock
@@ -233,7 +234,7 @@ void noteVerifiedCertFloor(int64_t authenticated_cert_not_before_unix,
   portEXIT_CRITICAL(&s_state_mux);
   if (!ok && !s_floor_write_warned) {
     s_floor_write_warned = true;  // surface once; do not spam, do not block
-    Serial.println("time: persisted-floor NVS write failed (trust unaffected)");
+    PLANE_RADAR_LOG_E("time: persisted-floor NVS write failed (trust unaffected)\n");
   }
 }
 

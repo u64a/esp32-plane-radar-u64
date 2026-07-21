@@ -346,7 +346,7 @@ function Invoke-ProvisioningGate {
 
   $provisioningFiles = @($portalRel, $credsRel, $setupRel, $markerRel, $identRel,
     "src\core\txn_marker.cpp", "src\core\location_record.cpp")
-  $logApiPattern = "(?:Serial\s*\.\s*(?:print|println|printf|write)|(?<![A-Za-z0-9_])printf|(?<![A-Za-z0-9_])log_[eviwd]|(?<![A-Za-z0-9_])ets_printf|(?<![A-Za-z0-9_])ESP_LOG[EWIVD])\s*\("
+  $logApiPattern = "(?:Serial\s*\.\s*(?:print|println|printf|write)|(?<![A-Za-z0-9_])printf|(?<![A-Za-z0-9_])log_[eviwd]|(?<![A-Za-z0-9_])ets_printf|(?<![A-Za-z0-9_])ESP_LOG[EWIVD]|(?<![A-Za-z0-9_])PLANE_RADAR_LOG_E|(?<![A-Za-z0-9_])PLANE_RADAR_LOG_I)\s*\("
   $secretTokenPattern = "(?i)(password|passphrase|\bpsk\b|csrf|token|candidate|secret)"
   foreach ($rel in $provisioningFiles) {
     if (-not $index.ContainsKey($rel)) { continue }

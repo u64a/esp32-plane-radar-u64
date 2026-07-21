@@ -61,3 +61,20 @@ $testProcess.WaitForExit()
 if ($testProcess.ExitCode -ne 0) {
   throw "PlatformIO native tests failed with exit code $($testProcess.ExitCode)"
 }
+
+# Phase 10: also run the diagnostics-on native suite ([env:native-diag],
+# PLANE_RADAR_DIAGNOSTICS=1) which verifies the conditional WorkerResult field.
+$diagInfo = New-Object System.Diagnostics.ProcessStartInfo
+$diagInfo.FileName = $pio
+$diagInfo.WorkingDirectory = $projectRoot
+$diagInfo.Arguments = "test -e native-diag"
+$diagInfo.UseShellExecute = $false
+$diagInfo.EnvironmentVariables["PATH"] =
+  "$toolchainBin$([System.IO.Path]::PathSeparator)$($diagInfo.EnvironmentVariables["PATH"])"
+$diagInfo.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
+
+$diagProcess = [System.Diagnostics.Process]::Start($diagInfo)
+$diagProcess.WaitForExit()
+if ($diagProcess.ExitCode -ne 0) {
+  throw "PlatformIO native-diag tests failed with exit code $($diagProcess.ExitCode)"
+}

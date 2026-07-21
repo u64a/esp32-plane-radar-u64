@@ -4,8 +4,16 @@
 
 namespace core {
 
-inline uint32_t elapsedMs(uint32_t now_ms, uint32_t started_ms) {
+inline constexpr uint32_t elapsedMs(uint32_t now_ms, uint32_t started_ms) {
   return now_ms - started_ms;
+}
+
+// Rollover-safe microsecond elapsed time. Identical in structure to elapsedMs
+// but operates on micros() timestamps. The unsigned subtraction wraps correctly
+// across the uint32 micros() rollover (~71.6 min), so callers can use a pair of
+// micros() captures across any rendering operation shorter than that.
+inline constexpr uint32_t elapsedMicros(uint32_t now_us, uint32_t started_us) {
+  return now_us - started_us;
 }
 
 inline bool elapsedAtLeast(uint32_t now_ms, uint32_t started_ms,

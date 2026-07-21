@@ -352,6 +352,58 @@ function Invoke-WorkerPolicyGate {
   }
   Ok "Exactly one [env:supermini-worker] extends env:supermini and defines PLANE_RADAR_ADSB_WORKER=1."
 
+  # --- Phase 10 diagnostics env matrix additions ---
+  # supermini-quiet: extends supermini, LOG_LEVEL=0, no WORKER, no DIAGNOSTICS.
+  $quietEnvCount = ([regex]::Matches($iniCode, "(?m)^\[env:supermini-quiet\]")).Count
+  if ($quietEnvCount -ne 1) {
+    Fail "expected EXACTLY one [env:supermini-quiet]; found $quietEnvCount."
+  }
+  $quietEnv = Get-IniSection -Text $iniCode -SectionName "env:supermini-quiet"
+  if ($quietEnv -notmatch "(?m)^\s*extends\s*=\s*env:supermini\s*$") {
+    Fail "[env:supermini-quiet] must 'extends = env:supermini'."
+  }
+  if ($quietEnv -notmatch "-DPLANE_RADAR_LOG_LEVEL\s*=\s*0\b") {
+    Fail "[env:supermini-quiet] must define -DPLANE_RADAR_LOG_LEVEL=0."
+  }
+  if ($quietEnv -match "PLANE_RADAR_ADSB_WORKER") {
+    Fail "[env:supermini-quiet] must NOT define PLANE_RADAR_ADSB_WORKER."
+  }
+  if ($quietEnv -match "PLANE_RADAR_DIAGNOSTICS") {
+    Fail "[env:supermini-quiet] must NOT define PLANE_RADAR_DIAGNOSTICS."
+  }
+  Ok "[env:supermini-quiet] extends supermini, LOG_LEVEL=0, no WORKER, no DIAGNOSTICS."
+
+  # supermini-diag: extends supermini, DIAGNOSTICS=1, no WORKER.
+  $diagEnvCount = ([regex]::Matches($iniCode, "(?m)^\[env:supermini-diag\]")).Count
+  if ($diagEnvCount -ne 1) {
+    Fail "expected EXACTLY one [env:supermini-diag]; found $diagEnvCount."
+  }
+  $diagEnv = Get-IniSection -Text $iniCode -SectionName "env:supermini-diag"
+  if ($diagEnv -notmatch "(?m)^\s*extends\s*=\s*env:supermini\s*$") {
+    Fail "[env:supermini-diag] must 'extends = env:supermini'."
+  }
+  if ($diagEnv -notmatch "-DPLANE_RADAR_DIAGNOSTICS\s*=\s*1\b") {
+    Fail "[env:supermini-diag] must define -DPLANE_RADAR_DIAGNOSTICS=1."
+  }
+  if ($diagEnv -match "PLANE_RADAR_ADSB_WORKER") {
+    Fail "[env:supermini-diag] must NOT define PLANE_RADAR_ADSB_WORKER (diagnostics are independent of the worker)."
+  }
+  Ok "[env:supermini-diag] extends supermini, DIAGNOSTICS=1, no WORKER."
+
+  # supermini-worker-diag: extends supermini-worker, DIAGNOSTICS=1.
+  $wDiagEnvCount = ([regex]::Matches($iniCode, "(?m)^\[env:supermini-worker-diag\]")).Count
+  if ($wDiagEnvCount -ne 1) {
+    Fail "expected EXACTLY one [env:supermini-worker-diag]; found $wDiagEnvCount."
+  }
+  $wDiagEnv = Get-IniSection -Text $iniCode -SectionName "env:supermini-worker-diag"
+  if ($wDiagEnv -notmatch "(?m)^\s*extends\s*=\s*env:supermini-worker\s*$") {
+    Fail "[env:supermini-worker-diag] must 'extends = env:supermini-worker'."
+  }
+  if ($wDiagEnv -notmatch "-DPLANE_RADAR_DIAGNOSTICS\s*=\s*1\b") {
+    Fail "[env:supermini-worker-diag] must define -DPLANE_RADAR_DIAGNOSTICS=1."
+  }
+  Ok "[env:supermini-worker-diag] extends supermini-worker and defines DIAGNOSTICS=1."
+
   # The header must default the macro to 0 when undefined, so the default build is
   # worker-free with no extra flags and workerEnabled() tracks the macro.
   $workerH = Get-Indexed -Index $index -Rel $workerHRel
@@ -594,7 +646,15 @@ function Invoke-WorkerPolicyGate {
       Fail "the adapter must static_assert std::is_trivially_copyable<$t> for the byte-copied queue."
     }
   }
-  Ok "WorkerRequest/WorkerResultMsg are trivially-copyable metadata (gen/rev/epoch/CandidateResult/cancel; no snapshot/sprite/cred/String/pointer)."
+  # Phase 10: verify the conditional fetch_duration_ms field exists in WorkerResultMsg
+  # under #if PLANE_RADAR_DIAGNOSTICS (checked on the raw text which includes both branches).
+  if ($worker.Raw -notmatch "#\s*if\s+PLANE_RADAR_DIAGNOSTICS") {
+    Fail "adsb_worker.cpp must gate the fetch_duration_ms field with #if PLANE_RADAR_DIAGNOSTICS."
+  }
+  if ($worker.Raw -notmatch "\bfetch_duration_ms\b") {
+    Fail "WorkerResultMsg must carry the conditional fetch_duration_ms field (under #if PLANE_RADAR_DIAGNOSTICS)."
+  }
+  Ok "WorkerRequest/WorkerResultMsg are trivially-copyable metadata (gen/rev/epoch/CandidateResult/cancel; conditional fetch_duration_ms; no snapshot/sprite/cred/String/pointer)."
 
   # -----------------------------------------------------------------------
   # Invariant 6: ownership boundaries; single framebuffer + two snapshots.
@@ -908,7 +968,11 @@ function Invoke-TamperSelfTest {
       @{ Name = "14. dynamic FreeRTOS mutex creator added to worker code"; Rel = "src\services\adsb_worker.cpp";
         Mutate = { param($t) $t -replace '(void workerTask\(void\* /\*param\*/\) \{)', "`$1`n  xSemaphoreCreateMutex();" } },
       @{ Name = "15. quiescence guard keeps its text but loses its return"; Rel = "src\services\wifi_setup.cpp";
-        Mutate = { param($t) $t -replace 'return;  // worker not yet Paused', '// worker not yet Paused' } }
+        Mutate = { param($t) $t -replace 'return;  // worker not yet Paused', '// worker not yet Paused' } },
+      @{ Name = "16. supermini-diag adds PLANE_RADAR_ADSB_WORKER (must not)"; Rel = "platformio.ini";
+        Mutate = { param($t) $t -replace '(\[env:supermini-diag\][^\[]*-DPLANE_RADAR_DIAGNOSTICS=1)', "`$1`n  -DPLANE_RADAR_ADSB_WORKER=1" } },
+      @{ Name = "17. supermini-worker-diag loses DIAGNOSTICS=1"; Rel = "platformio.ini";
+        Mutate = { param($t) $t -replace '(\[env:supermini-worker-diag\][^\[]*)-DPLANE_RADAR_DIAGNOSTICS=1', '$1' } }
     )
 
     foreach ($case in $cases) {
@@ -938,7 +1002,7 @@ function Invoke-TamperSelfTest {
 
     Invoke-WorkerPolicyGate -Root $tempRoot -Quiet
     Write-Host "  OK (post-restore): the mirror passes again after all mutations reverted." -ForegroundColor Green
-    Write-Host "Tamper self-test passed: the gate rejects every representative regression (15 tamper cases)." -ForegroundColor Green
+    Write-Host "Tamper self-test passed: the gate rejects every representative regression (17 tamper cases)." -ForegroundColor Green
   } finally {
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
   }

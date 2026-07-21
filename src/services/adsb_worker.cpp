@@ -16,6 +16,7 @@
 #include <type_traits>
 
 #include "core/adsb_worker_protocol.h"
+#include "core/time_math.h"            // core::elapsedMs (fetch duration)
 #include "services/adsb_client.h"     // fetchCandidateControlled / discardCandidate
 #include "services/adsb_transport.h"  // FetchControl
 
@@ -55,12 +56,18 @@ struct WorkerRequest {
 // CandidateResult (a FetchResult plus a CandidateHandle that merely references
 // the shared store's inactive slot -- never an inline AircraftSnapshot), and the
 // cooperative-cancel observation.
+// Under PLANE_RADAR_DIAGNOSTICS, fetch_duration_ms carries the rollover-safe
+// fetchCandidateControlled wall time measured on the worker task; absent in
+// non-diagnostic builds (the queue backing storage is sizeof-derived and adjusts).
 struct WorkerResultMsg {
   uint32_t generation;
   uint32_t settings_revision;
   uint32_t connectivity_epoch;
   CandidateResult candidate;
   bool worker_cancelled;
+#if PLANE_RADAR_DIAGNOSTICS
+  uint32_t fetch_duration_ms;
+#endif
 };
 
 static_assert(std::is_trivially_copyable<WorkerRequest>::value,
@@ -160,8 +167,14 @@ void workerTask(void* /*param*/) {
     control.idle_ctx = nullptr;
     control.cancel = &workerCancel;
     control.cancel_ctx = &generation;
+#if PLANE_RADAR_DIAGNOSTICS
+    const uint32_t fetch_start_ms = millis();
+#endif
     const CandidateResult candidate = fetchCandidateControlled(
         req.lat, req.lon, req.radius_km, req.settings_revision, control);
+#if PLANE_RADAR_DIAGNOSTICS
+    const uint32_t fetch_duration_ms = core::elapsedMs(millis(), fetch_start_ms);
+#endif
 
     // Snapshot the cancel flag and complete the exact generation atomically
     // (Running -> ResultReady). ALWAYS complete -- including a cancelled fetch --
@@ -189,6 +202,9 @@ void workerTask(void* /*param*/) {
     msg.connectivity_epoch = req.connectivity_epoch;
     msg.candidate = candidate;
     msg.worker_cancelled = cancelled;
+#if PLANE_RADAR_DIAGNOSTICS
+    msg.fetch_duration_ms = fetch_duration_ms;
+#endif
 
     // Depth-1 result send. It succeeds under the one-in-flight invariant (main
     // consumed every prior result before dispatching again). On the never-expected
@@ -346,6 +362,9 @@ bool workerTakeResult(WorkerResult* out) {
       out->connectivity_epoch = msg.connectivity_epoch;
       out->candidate = msg.candidate;
       out->worker_cancelled = msg.worker_cancelled;
+#if PLANE_RADAR_DIAGNOSTICS
+      out->fetch_duration_ms = msg.fetch_duration_ms;
+#endif
       return true;
     case core::WorkerConsume::Rejected:
       // Unreachable under the one-in-flight invariant (the dequeued generation is

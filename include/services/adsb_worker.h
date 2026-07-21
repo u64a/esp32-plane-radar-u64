@@ -125,6 +125,13 @@ enum class WorkerResultStatus : uint8_t {
 // fetch did not fully succeed (including a cooperative abort), so a discard on it
 // is a safe no-op. It never contains an AircraftSnapshot -- only the small handle
 // that references the store's inactive slot.
+//
+// When PLANE_RADAR_DIAGNOSTICS is enabled, `fetch_duration_ms` carries the
+// rollover-safe duration of fetchCandidateControlled on the worker task (measured
+// with millis() + core::elapsedMs and written by the worker into WorkerResultMsg
+// before queue-send, then copied here by workerTakeResult). It is zero-initialised
+// in non-diagnostic builds and absent in the non-diagnostic struct layout; the
+// queue backing storage is sizeof(WorkerResultMsg)-derived so it auto-adjusts.
 struct WorkerResult {
   WorkerResultStatus status;
   uint32_t generation;
@@ -132,6 +139,9 @@ struct WorkerResult {
   uint32_t connectivity_epoch;  // wifiDisconnectSeq() captured at dispatch
   CandidateResult candidate;    // FetchResult + handle (handle invalid on abort)
   bool worker_cancelled;        // the worker cooperatively aborted the fetch
+#if PLANE_RADAR_DIAGNOSTICS
+  uint32_t fetch_duration_ms;   // fetchCandidateControlled wall time on worker task
+#endif
 };
 
 // How the main integration must react to a taken WorkerResult. Extracting this as

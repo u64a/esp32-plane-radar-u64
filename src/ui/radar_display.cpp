@@ -12,8 +12,10 @@
 #include "core/radar_status.h"
 #include "core/screen_geometry.h"
 #include "core/status_badge_layout.h"
+#include "core/time_math.h"
 #include "hardware/display.h"
 #include "hardware/display_font.h"
+#include "runtime_diagnostics.h"
 #include "services/adsb_client.h"
 #include "services/radar_location.h"
 #include "ui/radar_range.h"
@@ -72,6 +74,12 @@ lgfx::LovyanGFX* s_draw = &tft;
 LGFX_Sprite s_frame(&tft);
 bool s_frame_attempted = false;
 bool s_frame_ready = false;
+
+#if PLANE_RADAR_DIAGNOSTICS
+// Last-render diagnostics state (populated during radarDisplayDraw, readable after).
+// Not thread-safe; accessed only from the main task.
+RenderDiagnostics s_last_render_diag{};
+#endif
 
 class DrawScope {
  public:
@@ -761,7 +769,18 @@ void drawStaticGrid(Gfx& gfx) {
   drawRings(cx, cy, grid_r);
   drawCrosshairs(cx, cy, grid_r, radar::kColorGrid);
   initPalette();
+#if PLANE_RADAR_DIAGNOSTICS
+  {
+    const bool runways_on = radar::showRunways();
+    const uint32_t rw_start_us = micros();
+    runway::drawLargeAirportRunways(gfx);
+    s_last_render_diag.runway_us =
+        runways_on ? core::elapsedMicros(micros(), rw_start_us) : 0U;
+    s_last_render_diag.runways_enabled = runways_on;
+  }
+#else
   runway::drawLargeAirportRunways(gfx);
+#endif
   drawCenterDot(cx, cy);
   drawCardinalLabels();
   drawScaleLabel(cx, cy, grid_r);
@@ -775,7 +794,7 @@ bool ensureFrameSprite() {
   s_frame_attempted = true;
   s_frame.setColorDepth(16);
   if (!s_frame.createSprite(radar::kSize, radar::kSize)) {
-    Serial.println("radar: frame sprite alloc failed; using direct draw");
+    PLANE_RADAR_LOG_E("radar: frame sprite alloc failed; using direct draw\n");
     return false;
   }
   s_frame_ready = true;
@@ -839,11 +858,17 @@ void radarDisplayDraw(const RadarDisplayModel& model) {
   initLabelMetrics();
 
   if (ensureFrameSprite()) {
+#if PLANE_RADAR_DIAGNOSTICS
+    s_last_render_diag.used_sprite = true;
+#endif
     renderFrame(model);
     return;
   }
 
   // Fallback when the sprite can't be allocated: draw straight to the panel.
+#if PLANE_RADAR_DIAGNOSTICS
+  s_last_render_diag.used_sprite = false;
+#endif
   drawFrameDirect(model);
 }
 
@@ -863,5 +888,11 @@ void radarDisplayDraw() { radarDisplayDraw(liveModelFromPublished()); }
 void radarDisplayRefreshAircraft() {
   radarDisplayRefreshAircraft(liveModelFromPublished());
 }
+
+#if PLANE_RADAR_DIAGNOSTICS
+RenderDiagnostics radarDisplayLastDiagnostics() {
+  return s_last_render_diag;
+}
+#endif
 
 }  // namespace ui

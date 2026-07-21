@@ -42,4 +42,32 @@ void radarDisplayRefreshAircraft(const RadarDisplayModel& model);
 void radarDisplayDraw();
 void radarDisplayRefreshAircraft();
 
+#if PLANE_RADAR_DIAGNOSTICS
+/**
+ * Diagnostics-only last-render state. Populated by radarDisplayDraw() during
+ * the preceding frame and valid to read after radarDisplayDraw() returns (before
+ * the next call). All timings are in microseconds (micros()/core::elapsedMicros).
+ *
+ * Interpretation notes (hardware-only):
+ *   runway_us: includes SPI transfer overhead in sprite mode and differs between
+ *     sprite path (grid composited off-screen) vs direct-draw path (rendered live
+ *     to panel). Real-hardware data is required to characterise the difference.
+ *   used_sprite: true = composited sprite + pushSprite; false = direct draw.
+ *     Both paths render identical pixels; timing differs by SPI transfer overhead.
+ *   runways_enabled: whether drawLargeAirportRunways was actually called this frame.
+ * Runway caching decision: consider caching only after observing runway_us > 5 ms
+ * AND runway_us >= 20% of total frame time AND RAM allows the cache without
+ * threatening the single-frame sprite or TLS heap.
+ */
+struct RenderDiagnostics {
+  uint32_t runway_us;    // drawLargeAirportRunways wall time (0 if not enabled)
+  bool used_sprite;      // true = sprite+pushSprite path; false = direct draw
+  bool runways_enabled;  // whether drawLargeAirportRunways was called
+};
+
+/** Return the diagnostics snapshot from the most recent radarDisplayDraw() call.
+ *  Not thread-safe; call only from the main task after radarDisplayDraw returns. */
+RenderDiagnostics radarDisplayLastDiagnostics();
+#endif  // PLANE_RADAR_DIAGNOSTICS
+
 }  // namespace ui

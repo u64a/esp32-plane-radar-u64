@@ -5,6 +5,7 @@
 #include "config.h"
 #include "core/coordinates.h"
 #include "core/location_record.h"
+#include "runtime_diagnostics.h"
 
 namespace services::location {
 
@@ -113,8 +114,8 @@ core::CoordinateSaveResult saveFromStrings(const char* lat_str,
   bool ok = true;  // Unchanged: nothing to persist, already durably saved
   if (result == core::CoordinateSaveResult::Changed) {
     ok = persist(lat, lon);
-    Serial.printf("Radar location saved: %.6f, %.6f (%s)\n", lat, lon,
-                  ok ? "ok" : "FAILED");
+    PLANE_RADAR_LOG_I("Radar location saved: %.6f, %.6f (%s)\n", lat, lon,
+                      ok ? "ok" : "FAILED");
   } else if (result == core::CoordinateSaveResult::Invalid) {
     ok = false;  // could not apply the intended coordinates
   }

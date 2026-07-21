@@ -1,6 +1,7 @@
 #include "hardware/display_font.h"
 
 #include "hardware/display.h"
+#include "runtime_diagnostics.h"
 
 extern "C" {
 extern const uint8_t _binary_data_ui_font_vlw_start[] asm(
@@ -30,7 +31,7 @@ bool displayFontInit() {
   s_vlw_loaded = vlwDataLen() > 0 &&
                  tft.loadFont(vlwData(), lgfx::IFont::font_type_t::ft_vlw);
   if (!s_vlw_loaded) {
-    Serial.println("Smooth font load failed — using bitmap fallback");
+    PLANE_RADAR_LOG_E("Smooth font load failed -- using bitmap fallback\n");
   }
   return s_vlw_loaded;
 }

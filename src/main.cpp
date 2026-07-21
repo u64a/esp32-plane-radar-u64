@@ -15,8 +15,10 @@
 #include "core/frame_render.h"
 #include "core/poll_policy.h"
 #include "core/radar_data_state.h"
+#include "core/time_math.h"
 #include "core/time_trust.h"
 #include "hardware/display.h"
+#include "runtime_diagnostics.h"
 #include "services/adsb_client.h"
 #include "services/adsb_fetch.h"
 #include "services/adsb_worker.h"
@@ -60,6 +62,14 @@ bool g_owns_display = false;
 bool g_worker_faulted = false;
 #endif
 
+#if PLANE_RADAR_DIAGNOSTICS
+// Diagnostics-only: last fetch wall-clock duration (sync path: measured around
+// fetchCandidate; worker path: carried through the queue from the worker task).
+// Zero-initialized; overwritten on every accepted/completed fetch. Stale state
+// is harmless (overwritten before the next diagnostic log line).
+uint32_t g_diag_last_fetch_ms = 0;
+#endif
+
 // --- rendering ---------------------------------------------------------------
 
 // Advance freshness for `now`, then render only when an event forced it or the
@@ -83,7 +93,25 @@ void renderIfNeeded(uint32_t now_ms) {
   }
 
   const ui::RadarDisplayModel model{view, snapshot, wifi, phase};
+#if PLANE_RADAR_DIAGNOSTICS
+  const uint32_t render_start_us = micros();
+#endif
   ui::radarDisplayDraw(model);
+#if PLANE_RADAR_DIAGNOSTICS
+  {
+    const uint32_t render_us = core::elapsedMicros(micros(), render_start_us);
+    const ui::RenderDiagnostics rdiag = ui::radarDisplayLastDiagnostics();
+    Serial.printf(
+        "diag: render_us=%lu runway_us=%lu mode=%u age=%lus "
+        "runways=%d sprite=%d\n",
+        static_cast<unsigned long>(render_us),
+        static_cast<unsigned long>(rdiag.runway_us),
+        static_cast<unsigned>(view.mode),
+        static_cast<unsigned long>(view.age_seconds),
+        static_cast<int>(rdiag.runways_enabled),
+        static_cast<int>(rdiag.used_sprite));
+  }
+#endif
   g_last_key = key;
   g_has_last_key = true;
   g_force_redraw = false;
@@ -117,8 +145,8 @@ void onRangeTap() {
   ui::radar::rangeNext();  // marks an effective query change only on a real change
   char range_label[12];
   ui::radar::formatCurrentRing3Label(range_label, sizeof(range_label));
-  Serial.printf("Range: %s (outer ~%.0f km)\n", range_label,
-                ui::radar::rangeCurrent().outer_km);
+  PLANE_RADAR_LOG_I("Range: %s (outer ~%.0f km)\n", range_label,
+                    ui::radar::rangeCurrent().outer_km);
 }
 
 // --- ADS-B fetch flow --------------------------------------------------------
@@ -226,7 +254,7 @@ void finishAdsbFetch(const services::adsb::CandidateResult& candidate,
                            candidate.fetch.retry_after_ms);
 
   // Concise, payload-free outcome line (no host/URL/body/secrets).
-  Serial.printf(
+  PLANE_RADAR_LOG_I(
       "adsb: outcome=%s status=%d bytes=%lu count=%u rev=%lu publish=%s "
       "flap=%d next=%lums\n",
       outcomeName(outcome), candidate.fetch.http_status,
@@ -235,6 +263,31 @@ void finishAdsbFetch(const services::adsb::CandidateResult& candidate,
       static_cast<unsigned long>(current_revision), publishName(publish_result),
       disconnect_flap ? 1 : 0,
       static_cast<unsigned long>(g_poll.next_interval_ms));
+
+#if PLANE_RADAR_DIAGNOSTICS
+  // Self-contained diagnostic line (emitted even when PLANE_RADAR_LOG_LEVEL=0).
+  // Heap semantics: heap_min is since boot; largest_block is a post-fetch
+  // snapshot that reflects current fragmentation, not the minimum since boot.
+  // worker_hwm (when present) is meaningful only after representative fetch load.
+  Serial.printf(
+      "diag: fetch_ms=%lu outcome=%s bytes=%lu next_ms=%lu "
+      "heap_free=%lu heap_min=%lu heap_max=%lu",
+      static_cast<unsigned long>(g_diag_last_fetch_ms),
+      outcomeName(outcome),
+      static_cast<unsigned long>(candidate.fetch.bytes_received),
+      static_cast<unsigned long>(g_poll.next_interval_ms),
+      static_cast<unsigned long>(ESP.getFreeHeap()),
+      static_cast<unsigned long>(ESP.getMinFreeHeap()),
+      static_cast<unsigned long>(ESP.getMaxAllocHeap()));
+#if PLANE_RADAR_ADSB_WORKER
+  if (services::adsb::workerStarted()) {
+    Serial.printf(" worker_hwm=%lu",
+                  static_cast<unsigned long>(
+                      services::adsb::workerStackHighWaterBytes()));
+  }
+#endif
+  Serial.printf("\n");
+#endif  // PLANE_RADAR_DIAGNOSTICS
 
   g_force_redraw = true;  // fetch completion / publication is a render trigger
 }
@@ -268,8 +321,14 @@ void serviceAdsbSync() {
   const uint32_t disconnect_seq_before = wifiDisconnectSeq();
 
   core::adsbFetchStarted(&g_poll);
+#if PLANE_RADAR_DIAGNOSTICS
+  const uint32_t sync_fetch_start_ms = millis();
+#endif
   const services::adsb::CandidateResult candidate =
       services::adsb::fetchCandidate(lat, lon, fetch_km, query_revision);
+#if PLANE_RADAR_DIAGNOSTICS
+  g_diag_last_fetch_ms = core::elapsedMs(millis(), sync_fetch_start_ms);
+#endif
 
   // Before publication, run the controllable-latency side effects (the main task
   // was blocked in the fetch) so a range tap or portal save is visible.
@@ -290,7 +349,7 @@ void handleWorkerFault() {
   core::adsbFetchAbortedForPause(&g_poll);
   if (!g_worker_faulted) {
     g_worker_faulted = true;
-    Serial.println("adsb: worker faulted; halting worker fetches");
+    PLANE_RADAR_LOG_E("adsb: worker faulted; halting worker fetches\n");
   }
   g_force_redraw = true;
 }
@@ -358,6 +417,9 @@ void pumpWorkerResult() {
     case services::adsb::WorkerPollAction::Publish:
       // Publish via the shared completion, using the connectivity epoch captured
       // at dispatch (echoed back on the result) for flap detection.
+#if PLANE_RADAR_DIAGNOSTICS
+      g_diag_last_fetch_ms = result.fetch_duration_ms;
+#endif
       finishAdsbFetch(result.candidate, result.connectivity_epoch);
       break;
     case services::adsb::WorkerPollAction::DiscardAndAbort:
@@ -391,16 +453,15 @@ void adsbWorkerResumeHook(void*) { services::adsb::workerResume(); }
 }  // namespace
 
 void setup() {
-  Serial.begin(115200);
-  delay(500);
-  Serial.println();
-  Serial.println("Plane Radar");
+  PLANE_RADAR_SERIAL_BEGIN(115200);
+  PLANE_RADAR_LOG_I("\n");
+  PLANE_RADAR_LOG_I("Plane Radar\n");
 
   wifiControllerInit();
   displayInit();
   const bool frame_buffered = ui::radarDisplayPrepareFrame();
-  Serial.printf("radar: rendering mode: %s\n",
-                frame_buffered ? "frame sprite" : "direct draw");
+  PLANE_RADAR_LOG_I("radar: rendering mode: %s\n",
+                    frame_buffered ? "frame sprite" : "direct draw");
   services::location::init();
   ui::radar::rangeInit();
   services::adsb::setPollFn(wifiLoop);
@@ -418,7 +479,7 @@ void setup() {
                                      &adsbWorkerResumeHook, nullptr};
     wifiSetNetworkWorkHooks(hooks);
   } else {
-    Serial.println("adsb: static worker start failed; using synchronous path");
+    PLANE_RADAR_LOG_E("adsb: static worker start failed; using synchronous path\n");
   }
 #endif
   // Seed the trusted-time service (reads/validates the persisted floor, registers

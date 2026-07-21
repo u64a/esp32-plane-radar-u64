@@ -4,6 +4,7 @@
 
 #include <Preferences.h>
 
+#include "runtime_diagnostics.h"
 #include "services/settings_events.h"
 
 namespace ui::radar {
@@ -93,13 +94,13 @@ bool setUseMiles(bool use_miles) {
   // the prior runtime value (a later identical retry is not falsely "already
   // saved"). Distance units are visual-only: never a query revision bump.
   if (!saveBoolVerified(kPrefsMilesKey, use_miles)) {
-    Serial.printf("Distance units: %s (SAVE FAILED)\n",
-                  use_miles ? "miles" : "km");
+    PLANE_RADAR_LOG_E("Distance units: %s (SAVE FAILED)\n",
+                      use_miles ? "miles" : "km");
     return false;
   }
   s_use_miles = use_miles;
   services::settings::markVisualChanged();
-  Serial.printf("Distance units: %s (saved)\n", s_use_miles ? "miles" : "km");
+  PLANE_RADAR_LOG_I("Distance units: %s (saved)\n", s_use_miles ? "miles" : "km");
   return true;
 }
 
@@ -111,13 +112,13 @@ bool setShowRunways(bool show_runways) {
   // mark the visual-only change ONLY on a verified write. Runway overlay is
   // visual-only: redraw only, no query revision change.
   if (!saveBoolVerified(kPrefsRunwaysKey, show_runways)) {
-    Serial.printf("Runway overlay: %s (SAVE FAILED)\n",
-                  show_runways ? "on" : "off");
+    PLANE_RADAR_LOG_E("Runway overlay: %s (SAVE FAILED)\n",
+                      show_runways ? "on" : "off");
     return false;
   }
   s_show_runways = show_runways;
   services::settings::markVisualChanged();
-  Serial.printf("Runway overlay: %s (saved)\n", s_show_runways ? "on" : "off");
+  PLANE_RADAR_LOG_I("Runway overlay: %s (saved)\n", s_show_runways ? "on" : "off");
   return true;
 }
 

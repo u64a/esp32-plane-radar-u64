@@ -485,7 +485,7 @@ SHA-256, Authenticode signature, and GCC version before caching it. The test scr
 uses that compiler only for its child PlatformIO process; it does not change the
 user or system `PATH`. No Arduino or ESP32 packages are linked into native tests.
 
-The suite is certified at **561 test cases across 37 native suites**, run and
+The suite is certified at **567 test cases across 38 native suites** (both `native` and `native-diag` envs), run and
 passing **twice in succession** (no flaky/order-dependent cases). This includes
 the Phase 7 trust logic — `test_time_trust` (26 cases: trusted-time state
 machine, derived monotonic clock, stale-sample revoke, versioned
@@ -521,8 +521,10 @@ the network:
 .\scripts\verify-ca-bundle.ps1                # 4 pinned roots, no setInsecure, CA enforced, derived-time clock, CA-authenticated cert-notBefore floor
 .\scripts\verify-provisioning-policy.ps1      # 8 static release invariants against src/+include/+platformio.ini (no WiFiManager/OTA/mDNS, closed route set, no permanent listener, no secret logging, RAM/flash transaction policy, no insecure AP teardown, one framebuffer, bounded portal)
 .\scripts\verify-provisioning-policy.ps1 -SelfTest   # proves the gate itself rejects 9 representative negative tamper cases (re-added WiFiManager, forbidden/extra routes, secret logging, second framebuffer, insecure AP teardown, unguarded storage/teardown, commit-ordering ambiguity), on an isolated temp copy
-.\scripts\verify-adsb-worker-policy.ps1              # 10 static source invariants for the opt-in worker (static task/stack/queue sizing, snapshot reuse, main-loop ownership boundaries, cooperative cancellation ordering, default build stays worker-free)
-.\scripts\verify-adsb-worker-policy.ps1 -SelfTest    # proves the gate rejects 15 representative negative tamper cases, on an isolated temp copy
+.\scripts\verify-adsb-worker-policy.ps1              # 10 static source invariants + Phase 10 diag env matrix (17 tamper cases total)
+.\scripts\verify-adsb-worker-policy.ps1 -SelfTest    # proves the gate rejects 17 representative negative tamper cases, on an isolated temp copy
+.\scripts\verify-diagnostics-policy.ps1              # Phase 10: 12 diagnostics/logging source invariants
+.\scripts\verify-diagnostics-policy.ps1 -SelfTest    # proves the diagnostics gate rejects 12 representative tamper cases
 ```
 
 The worker policy gate proves these invariants hold in **source**; the
@@ -688,6 +690,121 @@ synchronous fetch path. On-device
 TLS heap peak and stack high-water marks for the worker build remain **unknown**
 and are a hardware-only gate (see [Hardware-only acceptance gates](#hardware-only-acceptance-gates)) —
 they have not yet been measured on real hardware.
+
+**Phase 10 observability** (`runtime_diagnostics.h`, compile-time logging macros, and
+optional fetch/render/heap metrics) adds **zero RAM and near-zero flash overhead to the
+default `supermini` build**. The diagnostics instrumentation is fully compiled out unless
+`PLANE_RADAR_DIAGNOSTICS=1` is defined; the quiet build (`supermini-quiet`, `LOG_LEVEL=0`)
+removes all logging including `Serial.begin`.
+Measured with the same pinned clean build for all envs:
+
+| Build measurement | Phase 9 `supermini` | Phase 10 `supermini` | Δ vs Ph 9 | Phase 10 `supermini-quiet` | Δ vs `supermini` | Phase 10 `supermini-diag` | Δ vs `supermini` | Phase 10 `supermini-worker` | Δ vs Ph 9 worker | Phase 10 `supermini-worker-diag` | Δ vs `supermini-worker` |
+|------|------:|------:|------:|------:|------:|------:|------:|------:|------:|------:|------:|
+| Linker-reported static RAM (bytes) | 65,044 | 65,044 | 0 | 64,916 | −128 | 65,052 | +8 | 73,924 | 0 | 73,948 | +24 |
+| Linker-reported firmware flash (bytes) | 1,143,328 | 1,143,352 | +24 | 1,138,238 | −5,114 | 1,143,990 | +638 | 1,146,218 | +24 | 1,147,010 | +792 |
+
+Notes (source gates; hardware confirmation required):
+- **supermini (default)**: +24 B flash from Phase 10 macro/constexpr additions; 0 RAM — diagnostics do not add any state to non-diag builds. Default Serial logging behavior is unchanged.
+- **supermini-quiet** (`LOG_LEVEL=0`): −128 B RAM and −5,114 B flash from removal of all Serial logging strings and Serial.begin. No output at all.
+- **supermini-diag** (`DIAGNOSTICS=1`): +8 B RAM (the `g_diag_last_fetch_ms` file-scope state and `s_last_render_diag` struct) and +638 B flash from the timing, heap-query, and render-diagnostic code paths.
+- **supermini-worker-diag** (`WORKER=1, DIAGNOSTICS=1`): +24 B RAM from `s_last_render_diag` and the diag `fetch_duration_ms` field in `WorkerResultMsg`; +792 B flash.
+- The diagnostic `g_diag_last_fetch_ms` symbol and `radarDisplayLastDiagnostics` function are **absent** from the default `supermini` and `supermini-worker` ELFs (verified with `nm`) and **present** in the diag variants — confirming zero diagnostic cost in non-diag builds.
+- **Worker symbols (`workerTask`, `s_worker_stack`, `s_result_q`, etc.)** remain **zero** in the default `supermini` ELF.
+- All timing/heap measurements are **hardware-only** (not performed here): render_us includes SPI transfer overhead in sprite mode; runway_us differs between sprite and direct-draw paths; worker_hwm is meaningful only after representative load; heap_min is since boot; largest_block is a post-fetch snapshot not the minimum since boot.
+
+### Diagnostics output format (hardware-only interpretation)
+
+When `PLANE_RADAR_DIAGNOSTICS=1`, two additional log lines appear on the serial port:
+
+**After each ADS-B fetch completion** (`diag: fetch_ms=…`):
+```
+diag: fetch_ms=<ms> outcome=<name> bytes=<n> next_ms=<ms> heap_free=<bytes> heap_min=<bytes> heap_max=<bytes> [worker_hwm=<bytes>]
+```
+- `fetch_ms`: wall time of `fetchCandidate` (sync path) or `fetchCandidateControlled` on the worker task (worker path, carried through the queue). Measures only the fetch execution; does not include `wifiLoop`/post-processing.
+- `outcome`: same name as the INFO completion line.
+- `bytes`: decoded response body bytes.
+- `next_ms`: scheduled delay until the next fetch (backoff).
+- `heap_free`: `ESP.getFreeHeap()` — current free internal heap.
+- `heap_min`: `ESP.getMinFreeHeap()` — minimum free internal heap **since boot**.
+- `heap_max`: `ESP.getMaxAllocHeap()` — largest single allocatable internal heap block at this snapshot.
+- `worker_hwm` (worker build only, when worker started): `workerStackHighWaterBytes()` — worker task minimum free stack since creation. Meaningful only after representative fetch load.
+
+**After each rendered frame** (`diag: render_us=…`):
+```
+diag: render_us=<us> runway_us=<us> mode=<0-3> age=<s>s runways=<0/1> sprite=<0/1>
+```
+- `render_us`: wall time of `radarDisplayDraw()` in µs. Includes SPI transfer overhead in sprite mode (`sprite=1`) but not in direct-draw mode (`sprite=0`). Hardware-only measurement.
+- `runway_us`: wall time of `drawLargeAirportRunways()` in µs. Zero when runways are disabled. Differs between sprite path (composited off-screen) and direct-draw (rendered live to panel); hardware-only.
+- `mode`: `RadarDataMode` value (0=Loading, 1=Live, 2=Stale, 3=Offline).
+- `age`: freshness age in seconds.
+- `runways`: 1 if `drawLargeAirportRunways` was called, 0 otherwise.
+- `sprite`: 1 if the sprite+pushSprite path was used, 0 for direct draw.
+
+**Runway cache decision threshold**: consider caching only after measuring `runway_us > 5000` (> 5 ms) on real hardware **and** `runway_us >= 20%` of total frame time **and** RAM evidence shows a cache cannot threaten the single-frame sprite or TLS heap budget.
+
+**No-secret policy**: no diagnostic line may contain a Wi-Fi credential, provisioning token, CSRF value, SSID, callsign, ICAO hex, host/URL, or body data. This is enforced by the diagnostics policy gate (invariant 4).
+
+### Build variants (Phase 10)
+
+| PlatformIO env | `LOG_LEVEL` | `DIAGNOSTICS` | `WORKER` | Description |
+|----------------|------------|---------------|----------|-------------|
+| `supermini` (default) | 2 (INFO) | 0 | 0 | Default release firmware; full logging; no metrics |
+| `supermini-quiet` | 0 (OFF) | 0 | 0 | No Serial output; no `Serial.begin`; smallest flash |
+| `supermini-diag` | 2 (INFO) | 1 | 0 | Full logging + fetch/render/heap metrics |
+| `supermini-worker` | 2 (INFO) | 0 | 1 | Opt-in async worker (no metrics) |
+| `supermini-worker-diag` | 2 (INFO) | 1 | 1 | Opt-in async worker + metrics |
+
+```bash
+pio run -e supermini-quiet          # silent production build
+pio run -e supermini-diag           # diagnostics-enabled (fetch/render/heap metrics)
+pio run -e supermini-worker-diag    # worker + diagnostics
+```
+
+**Log levels** (`include/runtime_diagnostics.h`):
+- `0` (`OFF`): all logging compiled out; `Serial.begin` suppressed.
+- `1` (`ERROR`): fault/save-failure/fallback messages only.
+- `2` (`INFO`): fault + ordinary startup/settings/fetch/range messages (default).
+
+Existing Serial output is replaced by `PLANE_RADAR_LOG_E(fmt, ...)` (ERROR) and
+`PLANE_RADAR_LOG_I(fmt, ...)` (INFO) macros. Diagnostic output (Serial.printf
+inside `#if PLANE_RADAR_DIAGNOSTICS`) is self-contained and always emitted when
+`DIAGNOSTICS=1`, regardless of `LOG_LEVEL`. The provisioning-policy gate
+(`verify-provisioning-policy.ps1`) treats `PLANE_RADAR_LOG_E` and
+`PLANE_RADAR_LOG_I` as log sinks, so secret-field checks apply to every log call.
+
+### Phase 10 policy gate and native tests
+
+```powershell
+.\scripts\verify-diagnostics-policy.ps1          # 12 Phase 10 invariants (source gate)
+.\scripts\verify-diagnostics-policy.ps1 -SelfTest # proves the gate rejects 12 representative tamper cases
+```
+
+The diagnostics policy gate proves (from source only — **not** ELF):
+1. Default/worker env isolation: `supermini` and `supermini-worker` do not define `PLANE_RADAR_DIAGNOSTICS`; diagnostic state and heap APIs are absent from unconditional code.
+2. Exact diag/quiet env wiring: `LOG_LEVEL=0` in `supermini-quiet`; `DIAGNOSTICS=1` in `supermini-diag`, `supermini-worker-diag`, `native-diag`; `supermini-diag` has no `ADSB_WORKER`.
+3. `runtime_diagnostics.h` defaults: `DIAGNOSTICS=0`, `LOG_LEVEL=2`; level constants OFF=0/ERROR=1/INFO=2; `kDiagnosticsEnabled` and `kLogLevel` constexpr reflection.
+4. No raw ungated Serial output: every `Serial.xxx` call in production `.cpp` files is inside a `#if PLANE_RADAR_DIAGNOSTICS` or `#if PLANE_RADAR_LOG_LEVEL` gate. *(Source gate — see ELF proof in Memory budget.)*
+5. Provisioning log secret sinks: `PLANE_RADAR_LOG_E` and `PLANE_RADAR_LOG_I` are added to the secret-pattern check.
+6. No logging in `adsb_worker.cpp`.
+7. Conditional `fetch_duration_ms` field in `WorkerResultMsg`/`WorkerResult` under `#if PLANE_RADAR_DIAGNOSTICS`; `workerTakeResult` copies it.
+8. Heap metric APIs: `ESP.getFreeHeap()`, `ESP.getMinFreeHeap()`, `ESP.getMaxAllocHeap()` in a diagnostics-gated block; never `xPortGetFreeHeapSize`.
+9. Render/runway instrumentation: `micros()` around `radarDisplayDraw` in `main.cpp`; `micros()` around `drawLargeAirportRunways` in `radar_display.cpp`; `radarDisplayLastDiagnostics()` called from main after the draw (not from within a DrawScope).
+10. One framebuffer: still exactly one `LGFX_Sprite` and one `createSprite`.
+11. No runway cache: no `std::vector`, `std::array`, `malloc`, `new`, or `s_runway_endpoints` in `runway_overlay.cpp`.
+12. Diagnostics source gating: `s_last_render_diag` and `RenderDiagnostics` declared only inside `#if PLANE_RADAR_DIAGNOSTICS` blocks.
+
+Two new native test suites are added:
+- **`test_runtime_diagnostics`** (runs under `[env:native]`, `DIAGNOSTICS=0`): verifies default values, constexpr reflection, `WorkerResult` trivial copyability without the conditional field, and `elapsedMicros` rollover safety.
+- **`test_runtime_diagnostics_on`** (runs under `[env:native-diag]`, `DIAGNOSTICS=1` only): verifies `kDiagnosticsEnabled=true`, that `WorkerResult::fetch_duration_ms` is `uint32_t`, and that `WorkerResult` remains trivially copyable with the added field.
+
+The full native suite is now **567 test cases across 38 native suites** (both envs). The `native-diag` env uses `test_filter = test_runtime_diagnostics_on` + `test_ignore =` (clearing the inherited exclusion) so the default `native` env and `native-diag` never run each other's macro-sensitive tests.
+
+The **ELF proof** (from `nm` on the build artifacts — *not* a source check):
+- `g_diag_last_fetch_ms` and `radarDisplayLastDiagnostics` symbols are **absent** from `supermini` and `supermini-worker` ELFs and **present** in the `supermini-diag` and `supermini-worker-diag` ELFs.
+- `workerTask`, `s_worker_stack`, `s_worker_tcb`, `s_request_q`, `s_result_q`, `workerCancel` are **absent** from the default `supermini` ELF.
+- No logging strings appear in the `supermini-quiet` ELF (verified with `nm` against symbol table).
+
+The updated **worker policy gate** (`verify-adsb-worker-policy.ps1`) now covers 17 tamper cases (2 new: `supermini-diag` must not add `ADSB_WORKER`; `supermini-worker-diag` must keep `DIAGNOSTICS=1`). All 10 original invariants are preserved.
 
 ### Web-flashable release image
 
