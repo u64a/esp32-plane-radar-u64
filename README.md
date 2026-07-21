@@ -953,7 +953,7 @@ Renders in memory and compares exact LF bytes to checked-in files. Exits 0 if id
 .\scripts\verify-airport-data.ps1              # Phase 11: OurAirports provenance gate (20 invariants)
 .\scripts\verify-airport-data.ps1 -SelfTest    # proves the gate rejects 25 tamper cases
 .\scripts\verify-egress-policy.ps1             # Phase 11: runtime egress source policy gate (12 invariants)
-.\scripts\verify-egress-policy.ps1 -SelfTest   # proves the gate rejects 35 tamper cases
+.\scripts\verify-egress-policy.ps1 -SelfTest   # proves the gate rejects 36 tamper cases
 ```
 
 The `scripts/native-test.ps1` script runs both Phase 11 live gates (`verify-airport-data.ps1` and `verify-egress-policy.ps1`) fail-fast in its current PowerShell process before any PlatformIO tests; it does not run gate self-tests.
@@ -978,5 +978,5 @@ New Phase 11 gate commands:
 .\scripts\verify-airport-data.ps1              # 20 source invariants
 .\scripts\verify-airport-data.ps1 -SelfTest    # 25 tamper cases
 .\scripts\verify-egress-policy.ps1             # 12 source invariants
-.\scripts\verify-egress-policy.ps1 -SelfTest   # 35 tamper cases
+.\scripts\verify-egress-policy.ps1 -SelfTest   # 36 tamper cases
 ```

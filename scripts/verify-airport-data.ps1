@@ -250,7 +250,7 @@ function Invoke-LiveGate {
   }
   $fetchLiteralBody = Get-PythonTopLevelFunctionBody $pyCodeText "_fetch_verified"
   if ($null -eq $fetchLiteralBody -or $fetchLiteralBody -notmatch '(?ms)^\s*req\s*=\s*urllib\.request\.Request\s*\(\s*url\s*,\s*headers\s*=\s*\{\s*"Accept-Encoding"\s*:\s*"identity"\s*\}\s*\)\s*$') {
-    Fail "_fetch_verified must construct Request(url, headers={\"Accept-Encoding\": \"identity\"})"
+    Fail '_fetch_verified must construct Request(url, headers={"Accept-Encoding": "identity"})'
   }
   if ($pyExecText -notmatch '(?m)^def\s+_parse_csv\b' -or $pyExecText -notmatch '\.decode\s*\(') { Fail "Generator missing _parse_csv function with decode" }
 
@@ -469,6 +469,7 @@ function Invoke-SelfTest {
       throw "SELF-TEST FAILURE: '$Label' should have failed but passed."
     } catch {
       if ($_.Exception.Message -match "SELF-TEST FAILURE") { throw }
+      if (-not $_.Exception.Message.StartsWith("AIRPORT DATA POLICY VIOLATION:")) { throw }
       Write-Host "OK (rejected): $Label"
     }
   }

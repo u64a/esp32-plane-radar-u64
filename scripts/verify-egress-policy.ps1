@@ -392,8 +392,8 @@ function Invoke-LiveGate {
         $val = $val -replace '\\(["''])', '$1'
       }
       if ($val -match '^(?:https?|wss?)://([^/\s]+)') {
-        $host = $Matches[1]
-        if (($approvedHosts -notcontains $host) -and $host -ne "192.168.4.1") { Fail "platformio.ini build flag defines external URL endpoint: '$val'" }
+        $urlHost = $Matches[1]
+        if (($approvedHosts -notcontains $urlHost) -and $urlHost -ne "192.168.4.1") { Fail "platformio.ini build flag defines external URL endpoint: '$val'" }
       } elseif ($val -match '^[a-zA-Z][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,}$' -and ($approvedHosts -notcontains $val)) {
         Fail "platformio.ini build flag defines external hostname endpoint: '$val'"
       } elseif ($val -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$' -and $val -ne "192.168.4.1") {
@@ -569,6 +569,7 @@ function Invoke-SelfTest {
       throw "SELF-TEST FAILURE: '$Label' should have failed but passed."
     } catch {
       if ($_.Exception.Message -match "SELF-TEST FAILURE") { throw }
+      if (-not $_.Exception.Message.StartsWith("EGRESS POLICY VIOLATION:")) { throw }
       Write-Host "OK (rejected): $Label"
     }
   }
@@ -764,6 +765,13 @@ function Invoke-SelfTest {
     Write-TmpPlatformio ($platformioOrig -replace [regex]::Escape("-DARDUINO_USB_MODE=1"), '-DADSB_HOST=evil.example.com')
     Expect-Fail "bare platformio hostname"
     Reset-Tmp
+
+    # Positive control: an approved URL macro reaches the URL approval branch.
+    Write-TmpPlatformio ($platformioOrig -replace [regex]::Escape("-DARDUINO_USB_MODE=1"), '-DAPI_URL=\"https://opendata.adsb.fi/path\"')
+    Invoke-LiveGate -Root $tmp
+    Write-Host "OK (accepted): approved platformio.ini URL endpoint"
+    Reset-Tmp
+
     # T35: only src\services\adsb_ca_bundle.cpp is PEM-exempt; a same-named
     # file elsewhere must still be endpoint-scanned.
     New-Item -ItemType Directory -Path $shadowTamperDir -Force | Out-Null
@@ -772,8 +780,13 @@ function Invoke-SelfTest {
     Expect-Fail "shadow adsb_ca_bundle.cpp is scanned"
     Reset-Tmp
 
+    # T36: URL-valued endpoint macros are normalized and rejected by host.
+    Write-TmpPlatformio ($platformioOrig -replace [regex]::Escape("-DARDUINO_USB_MODE=1"), '-DAPI_URL=\"https://evil.example/path\"')
+    Expect-Fail "escaped-quoted platformio URL"
+    Reset-Tmp
+
     Write-Host ""
-    Write-Host "OK: all 35 self-test tamper cases correctly rejected."
+    Write-Host "OK: all 36 self-test tamper cases correctly rejected."
   } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
   }
