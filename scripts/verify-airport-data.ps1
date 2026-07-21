@@ -92,7 +92,7 @@ function Get-PythonSkeleton {
       [void]$out.Append($ch); $i++
       while ($i -lt $Text.Length) {
         $current = $Text[$i]
-        if ($current -eq '\\' -and $i + 1 -lt $Text.Length) {
+        if ($current -eq '\' -and $i + 1 -lt $Text.Length) {
           if ($BlankStrings) { [void]$out.Append(' '); [void]$out.Append(' ') }
           else { [void]$out.Append($current); [void]$out.Append($Text[$i + 1]) }
           $i += 2; continue
@@ -197,22 +197,9 @@ function Invoke-LiveGate {
       Fail ("Generator " + $u.Name + " must be exactly _BASE_URL + `"" + $u.Suffix + "`"")
     }
   }
-  # Check only non-comment non-docstring lines for /main/: lines between triple-quotes are excluded
-  $inDocStr = $false
-  $pyCodeOnlyLines = foreach ($line in ($pyText -split "`n")) {
-    $stripped = $line.Trim()
-    $isComment = $stripped -match '^#'
-    $hasDq = $stripped -match '"""'
-    if ($hasDq -and -not $inDocStr) { $inDocStr = $true; continue }
-    elseif ($hasDq -and $inDocStr) { $inDocStr = $false; continue }
-    if ($inDocStr -or $isComment) { continue }
-    $line
-  }
-  # URL string constants in actual code must not use /main/
-  foreach ($line in ($pyCodeOnlyLines | Where-Object { $_ -match '"' -or $_ -match "'" })) {
-    if ($line -match [regex]::Escape("/main/")) {
-      Fail "Generator URL string in code contains /main/ -- must use only pinned commit URL"
-    }
+  # The literal-preserved skeleton excludes comments and triple-quoted docstrings.
+  if ($pyCodeText -match [regex]::Escape("/main/")) {
+    Fail "Generator code contains /main/ -- must use only pinned commit URL"
   }
 
   # 2. SHA-256: capture the ACTUAL values assigned in the generator, validate the
@@ -267,15 +254,24 @@ function Invoke-LiveGate {
   }
   if ($pyExecText -notmatch '(?m)^def\s+_parse_csv\b' -or $pyExecText -notmatch '\.decode\s*\(') { Fail "Generator missing _parse_csv function with decode" }
 
-  # 5. Exact deterministic writes; literal contents are intentionally inspected.
-  foreach ($write in @('OUT_H\.write_bytes\(header\.encode\("utf-8"\)\)', 'OUT_CPP\.write_bytes\(cpp\.encode\("utf-8"\)\)')) {
-    if ($pyCodeText -notmatch $write) { Fail "Generator must use deterministic UTF-8 write_bytes output" }
+  # 5. Exact deterministic writes must be executable statements in main. The
+  # literal-preserved body excludes comments and triple-quoted docstrings; anchors
+  # reject ordinary string literals that merely contain a write-looking call.
+  $mainLiteralBody = Get-PythonTopLevelFunctionBody $pyCodeText "main"
+  if ($null -eq $mainLiteralBody) { Fail "Could not locate main body for output-write checks" }
+  foreach ($write in @(
+    'OUT_H\.write_bytes\(header\.encode\("utf-8"\)\)',
+    'OUT_CPP\.write_bytes\(cpp\.encode\("utf-8"\)\)'
+  )) {
+    if ($mainLiteralBody -notmatch ('(?m)^\s*' + $write + '\s*$')) {
+      Fail "main must use deterministic UTF-8 write_bytes output"
+    }
   }
   if ($pyExecText -match '\bwrite_text\s*\(') { Fail "Generator must not use write_text" }
 
   # 6. Paired local arguments must be executable main-body enforcement.
-  $mainBody = Get-PythonTopLevelFunctionBody $pyExecText "main"
-  if ($null -eq $mainBody -or $mainBody -notmatch '(?ms)^\s*if\s+bool\s*\(\s*local_airports\s*\)\s*!=\s*bool\s*\(\s*local_runways\s*\)\s*:\s*\r?\n\s*parser\.error\s*\(') { Fail "main must enforce paired local CSV arguments with parser.error" }
+  $mainExecBody = Get-PythonTopLevelFunctionBody $pyExecText "main"
+  if ($null -eq $mainExecBody -or $mainExecBody -notmatch '(?ms)^\s*if\s+bool\s*\(\s*local_airports\s*\)\s*!=\s*bool\s*\(\s*local_runways\s*\)\s*:\s*\r?\n\s*parser\.error\s*\(') { Fail "main must enforce paired local CSV arguments with parser.error" }
 
   # 7. check_mode is independently bounded and side-effect free.
   if ($pyCodeText -notmatch [regex]::Escape("--check")) { Fail "Generator is missing --check mode" }
@@ -582,9 +578,14 @@ function Invoke-SelfTest {
     # T24: generic write_bytes/encode text cannot replace exact LF writes.
     $badPy24 = $pyOrig -replace [regex]::Escape('OUT_H.write_bytes(header.encode("utf-8"))'), 'OUT_H.write_bytes(header.encode("ascii"))'
     Expect-Fail "non-deterministic header write encoding" $badPy24 $hOrig $cppOrig $attrOrig
+    # T25: an exact-looking write inside an ordinary string cannot replace the
+    # executable header write statement.
+    $badPy25 = $pyOrig -replace [regex]::Escape('OUT_H.write_bytes(header.encode("utf-8"))'),
+      ("OUT_H.write_bytes(header.encode(`"ascii`"))" + "`n    'OUT_H.write_bytes(header.encode(`"utf-8`"))'")
+    Expect-Fail "header write hidden in string literal" $badPy25 $hOrig $cppOrig $attrOrig
 
     Write-Host ""
-    Write-Host "OK: all 24 self-test tamper cases correctly rejected."
+    Write-Host "OK: all 25 self-test tamper cases correctly rejected."
   } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
   }

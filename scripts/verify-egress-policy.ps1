@@ -227,7 +227,6 @@ function Invoke-LiveGate {
   $timekeeperPath = Join-Path $srcDir "services\timekeeper.cpp"
   if (-not (Test-Path $timekeeperPath)) { Fail "timekeeper.cpp not found" }
   $timekeeperRaw  = Get-Content -Raw $timekeeperPath
-  $timekeeperText = Get-CodeSkeleton $timekeeperRaw               # comments stripped, strings/chars kept
   $timekeeperSkel = Get-CodeSkeleton $timekeeperRaw -BlankStrings # strings+chars+comments blanked
   # Require the exact executable full SNTP server chain. Char-literal contents
   # are blanked in $timekeeperSkel, so the fallback tests accept the preserved
@@ -336,6 +335,7 @@ function Invoke-LiveGate {
   # Strategy: scan for string literals; after blanking adsb_ca_bundle.cpp (PEM),
   # any remaining dotted-IP or external host string is suspicious.
   $approvedHosts = @("opendata.adsb.fi", "time.cloudflare.com")
+  $pemBundlePath = [System.IO.Path]::GetFullPath((Join-Path $srcDir "services\adsb_ca_bundle.cpp"))
   # Pattern: quoted string that looks like an external hostname (TLD >= 2 alpha chars)
   # Requires at least one dot, TLD consisting of 2+ alpha chars only.
   # This excludes .h, .cpp, format strings, NVS keys, etc.
@@ -344,9 +344,9 @@ function Invoke-LiveGate {
 
   foreach ($f in $prodFiles) {
     $fname = [System.IO.Path]::GetFileName($f)
-    # Only the checked-in PEM bundle is exempt; similarly named source files
-    # remain endpoint-scanned and cannot hide an external destination.
-    if ($fname -ceq "adsb_ca_bundle.cpp") { continue }
+    # Only the checked-in PEM bundle at its canonical production path is exempt;
+    # a same-named file elsewhere remains endpoint-scanned.
+    if ([System.IO.Path]::GetFullPath($f) -ieq $pemBundlePath) { continue }
     $fText = Get-Content -Raw $f
     $fSkel = Get-CodeSkeleton $fText  # comments stripped, strings kept
     $hostMatches = $suspiciousHostRx.Matches($fSkel)
@@ -537,6 +537,15 @@ function Invoke-SelfTest {
   function Write-TmpReadme([string]$content) {
     [System.IO.File]::WriteAllText((Join-Path $tmp "README.md"), $content)
   }
+  $tamperFiles = @(
+    (Join-Path $tmp "src\services\extra_egress.ino"),
+    (Join-Path $tmp "src\services\extra_egress.cc"),
+    (Join-Path $tmp "src\services\adsb_ca_backdoor.ino"),
+    (Join-Path $tmp "src\services\alt_sntp.cpp"),
+    (Join-Path $tmp "src\services\shadow\adsb_ca_bundle.cpp")
+  )
+  $shadowTamperDir = Join-Path $tmp "src\services\shadow"
+
   function Reset-Tmp {
     Write-TmpConfig $configOrig
     Write-TmpTimekeeper $timekeeperOrig
@@ -544,11 +553,14 @@ function Invoke-SelfTest {
     Write-TmpTransport $transportOrig
     Write-TmpReadme $readmeOrig
     Write-TmpPlatformio $platformioOrig
-    # Remove any stray tamper files dropped by extension-coverage tests.
-    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $tmp "src\services\extra_egress.ino")
-    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $tmp "src\services\extra_egress.cc")
-    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $tmp "src\servicesdsb_ca_backdoor.ino")
-    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $tmp "src\serviceslt_sntp.cpp")
+    foreach ($tamperFile in $tamperFiles) {
+      Remove-Item -Force -ErrorAction SilentlyContinue $tamperFile
+    }
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $shadowTamperDir
+    foreach ($tamperFile in $tamperFiles) {
+      if (Test-Path $tamperFile) { throw "SELF-TEST CLEANUP FAILURE: tamper file remains: $tamperFile" }
+    }
+    if (Test-Path $shadowTamperDir) { throw "SELF-TEST CLEANUP FAILURE: tamper directory remains: $shadowTamperDir" }
   }
 
   function Expect-Fail([string]$Label) {
@@ -726,7 +738,7 @@ function Invoke-SelfTest {
     Expect-Fail "flipped does-not-send negation"
     Reset-Tmp
 
-    # T28: only the exact PEM filename is exempt from endpoint scanning.
+    # T28: a similarly named CA source is not exempt from endpoint scanning.
     [System.IO.File]::WriteAllText((Join-Path $tmp "src\services\adsb_ca_backdoor.ino"), 'const char* kEvil = "evil.example.com";' + "`n")
     Expect-Fail "similarly named CA source is scanned"
     Reset-Tmp
@@ -752,9 +764,16 @@ function Invoke-SelfTest {
     Write-TmpPlatformio ($platformioOrig -replace [regex]::Escape("-DARDUINO_USB_MODE=1"), '-DADSB_HOST=evil.example.com')
     Expect-Fail "bare platformio hostname"
     Reset-Tmp
+    # T35: only src\services\adsb_ca_bundle.cpp is PEM-exempt; a same-named
+    # file elsewhere must still be endpoint-scanned.
+    New-Item -ItemType Directory -Path $shadowTamperDir -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $shadowTamperDir "adsb_ca_bundle.cpp"),
+      'const char* kEvil = "https://evil.example/path";' + "`n")
+    Expect-Fail "shadow adsb_ca_bundle.cpp is scanned"
+    Reset-Tmp
 
     Write-Host ""
-    Write-Host "OK: all 34 self-test tamper cases correctly rejected."
+    Write-Host "OK: all 35 self-test tamper cases correctly rejected."
   } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
   }
