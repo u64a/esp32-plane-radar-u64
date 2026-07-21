@@ -129,9 +129,11 @@ enum class WorkerResultStatus : uint8_t {
 // When PLANE_RADAR_DIAGNOSTICS is enabled, `fetch_duration_ms` carries the
 // rollover-safe duration of fetchCandidateControlled on the worker task (measured
 // with millis() + core::elapsedMs and written by the worker into WorkerResultMsg
-// before queue-send, then copied here by workerTakeResult). It is zero-initialised
-// in non-diagnostic builds and absent in the non-diagnostic struct layout; the
-// queue backing storage is sizeof(WorkerResultMsg)-derived so it auto-adjusts.
+// before queue-send, then copied here by workerTakeResult). The field is ABSENT
+// from the non-diagnostic struct layout (compiled out entirely when
+// PLANE_RADAR_DIAGNOSTICS == 0) — it is not zero-initialised in non-diagnostic
+// builds; it simply does not exist. The queue backing storage is
+// sizeof(WorkerResultMsg)-derived so it auto-adjusts to either layout.
 struct WorkerResult {
   WorkerResultStatus status;
   uint32_t generation;

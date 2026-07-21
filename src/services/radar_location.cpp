@@ -114,8 +114,11 @@ core::CoordinateSaveResult saveFromStrings(const char* lat_str,
   bool ok = true;  // Unchanged: nothing to persist, already durably saved
   if (result == core::CoordinateSaveResult::Changed) {
     ok = persist(lat, lon);
-    PLANE_RADAR_LOG_I("Radar location saved: %.6f, %.6f (%s)\n", lat, lon,
-                      ok ? "ok" : "FAILED");
+    if (ok) {
+      PLANE_RADAR_LOG_I("Radar location saved: %.6f, %.6f\n", lat, lon);
+    } else {
+      PLANE_RADAR_LOG_E("Radar location persist failed: %.6f, %.6f\n", lat, lon);
+    }
   } else if (result == core::CoordinateSaveResult::Invalid) {
     ok = false;  // could not apply the intended coordinates
   }

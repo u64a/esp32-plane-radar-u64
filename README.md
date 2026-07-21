@@ -485,8 +485,7 @@ SHA-256, Authenticode signature, and GCC version before caching it. The test scr
 uses that compiler only for its child PlatformIO process; it does not change the
 user or system `PATH`. No Arduino or ESP32 packages are linked into native tests.
 
-The suite is certified at **567 test cases across 38 native suites** (both `native` and `native-diag` envs), run and
-passing **twice in succession** (no flaky/order-dependent cases). This includes
+The `native` env alone is certified at **567 cases across 38 suites**; `native-diag` runs **5 cases in 1 suite** (`test_runtime_diagnostics_on`); `scripts/native-test.ps1` runs both for **572 cases across 39 suite runs total**, passing **twice in succession** (no flaky/order-dependent cases). This includes
 the Phase 7 trust logic — `test_time_trust` (26 cases: trusted-time state
 machine, derived monotonic clock, stale-sample revoke, versioned
 persisted-floor record, and the CA-authenticated certificate-`notBefore` floor
@@ -710,7 +709,7 @@ Notes (source gates; hardware confirmation required):
 - **supermini-worker-diag** (`WORKER=1, DIAGNOSTICS=1`): +24 B RAM from `s_last_render_diag` and the diag `fetch_duration_ms` field in `WorkerResultMsg`; +792 B flash.
 - The diagnostic `g_diag_last_fetch_ms` symbol and `radarDisplayLastDiagnostics` function are **absent** from the default `supermini` and `supermini-worker` ELFs (verified with `nm`) and **present** in the diag variants — confirming zero diagnostic cost in non-diag builds.
 - **Worker symbols (`workerTask`, `s_worker_stack`, `s_result_q`, etc.)** remain **zero** in the default `supermini` ELF.
-- All timing/heap measurements are **hardware-only** (not performed here): render_us includes SPI transfer overhead in sprite mode; runway_us differs between sprite and direct-draw paths; worker_hwm is meaningful only after representative load; heap_min is since boot; largest_block is a post-fetch snapshot not the minimum since boot.
+- All timing/heap measurements are **hardware-only** (not performed here): render_us includes panel I/O in both paths (sprite mode: one final pushSprite SPI transfer; direct-draw: incremental SPI transfers per drawing call); runway_us measures off-screen RAM only in sprite mode but includes panel SPI in direct-draw; worker_hwm is meaningful only after representative load; heap_min is since boot; largest_block is a post-fetch snapshot not the minimum since boot.
 
 ### Diagnostics output format (hardware-only interpretation)
 
@@ -733,11 +732,11 @@ diag: fetch_ms=<ms> outcome=<name> bytes=<n> next_ms=<ms> heap_free=<bytes> heap
 ```
 diag: render_us=<us> runway_us=<us> mode=<0-3> age=<s>s runways=<0/1> sprite=<0/1>
 ```
-- `render_us`: wall time of `radarDisplayDraw()` in µs. Includes SPI transfer overhead in sprite mode (`sprite=1`) but not in direct-draw mode (`sprite=0`). Hardware-only measurement.
-- `runway_us`: wall time of `drawLargeAirportRunways()` in µs. Zero when runways are disabled. Differs between sprite path (composited off-screen) and direct-draw (rendered live to panel); hardware-only.
+- `render_us`: wall time of `radarDisplayDraw()` in µs. Includes panel I/O in **both** paths: sprite mode (`sprite=1`) ends with one `pushSprite` SPI transfer; direct-draw mode (`sprite=0`) makes incremental SPI transfers for every drawing call. Hardware-only measurement.
+- `runway_us`: wall time of `drawLargeAirportRunways()` in µs. In **sprite mode**, measures off-screen RAM drawing only — panel SPI is **not** included (runways are composited into the off-screen sprite before the final `pushSprite`). In **direct-draw mode**, panel SPI **is** included. Zero when the runway overlay is disabled. Hardware-only.
 - `mode`: `RadarDataMode` value (0=Loading, 1=Live, 2=Stale, 3=Offline).
 - `age`: freshness age in seconds.
-- `runways`: 1 if `drawLargeAirportRunways` was called, 0 otherwise.
+- `runways`: runway overlay setting (`radar::showRunways()`); 1 = overlay on, 0 = off. `drawLargeAirportRunways()` is always invoked but returns early when the overlay is disabled; `runway_us` is zero in that case.
 - `sprite`: 1 if the sprite+pushSprite path was used, 0 for direct draw.
 
 **Runway cache decision threshold**: consider caching only after measuring `runway_us > 5000` (> 5 ms) on real hardware **and** `runway_us >= 20%` of total frame time **and** RAM evidence shows a cache cannot threaten the single-frame sprite or TLS heap budget.
@@ -776,7 +775,7 @@ inside `#if PLANE_RADAR_DIAGNOSTICS`) is self-contained and always emitted when
 
 ```powershell
 .\scripts\verify-diagnostics-policy.ps1          # 12 Phase 10 invariants (source gate)
-.\scripts\verify-diagnostics-policy.ps1 -SelfTest # proves the gate rejects 12 representative tamper cases
+.\scripts\verify-diagnostics-policy.ps1 -SelfTest # proves the gate rejects 13 representative tamper cases
 ```
 
 The diagnostics policy gate proves (from source only — **not** ELF):
@@ -790,19 +789,19 @@ The diagnostics policy gate proves (from source only — **not** ELF):
 8. Heap metric APIs: `ESP.getFreeHeap()`, `ESP.getMinFreeHeap()`, `ESP.getMaxAllocHeap()` in a diagnostics-gated block; never `xPortGetFreeHeapSize`.
 9. Render/runway instrumentation: `micros()` around `radarDisplayDraw` in `main.cpp`; `micros()` around `drawLargeAirportRunways` in `radar_display.cpp`; `radarDisplayLastDiagnostics()` called from main after the draw (not from within a DrawScope).
 10. One framebuffer: still exactly one `LGFX_Sprite` and one `createSprite`.
-11. No runway cache: no `std::vector`, `std::array`, `malloc`, `new`, or `s_runway_endpoints` in `runway_overlay.cpp`.
+11. No runway cache: no `std::vector`, `std::array`, `malloc`, `new`, or `s_runway_endpoints` in `runway_overlay.cpp` or `radar_display.cpp`.
 12. Diagnostics source gating: `s_last_render_diag` and `RenderDiagnostics` declared only inside `#if PLANE_RADAR_DIAGNOSTICS` blocks.
 
 Two new native test suites are added:
-- **`test_runtime_diagnostics`** (runs under `[env:native]`, `DIAGNOSTICS=0`): verifies default values, constexpr reflection, `WorkerResult` trivial copyability without the conditional field, and `elapsedMicros` rollover safety.
+- **`test_runtime_diagnostics`** (runs under `[env:native]`, `DIAGNOSTICS=0`): verifies default values, constexpr reflection, `WorkerResult` trivial copyability without the conditional field (with a C++17 `std::void_t` detection idiom proving field absence), and `elapsedMicros` rollover safety.
 - **`test_runtime_diagnostics_on`** (runs under `[env:native-diag]`, `DIAGNOSTICS=1` only): verifies `kDiagnosticsEnabled=true`, that `WorkerResult::fetch_duration_ms` is `uint32_t`, and that `WorkerResult` remains trivially copyable with the added field.
 
-The full native suite is now **567 test cases across 38 native suites** (both envs). The `native-diag` env uses `test_filter = test_runtime_diagnostics_on` + `test_ignore =` (clearing the inherited exclusion) so the default `native` env and `native-diag` never run each other's macro-sensitive tests.
+The `native` env runs **567 cases across 38 suites**; `native-diag` runs **5 cases in 1 suite** (`test_runtime_diagnostics_on`); `scripts/native-test.ps1` executes **572 cases across 39 suite runs total**. The `native-diag` env uses `test_filter = test_runtime_diagnostics_on` + `test_ignore =` (clearing the inherited exclusion) so the default `native` env and `native-diag` never run each other's macro-sensitive tests.
 
-The **ELF proof** (from `nm` on the build artifacts — *not* a source check):
-- `g_diag_last_fetch_ms` and `radarDisplayLastDiagnostics` symbols are **absent** from `supermini` and `supermini-worker` ELFs and **present** in the `supermini-diag` and `supermini-worker-diag` ELFs.
-- `workerTask`, `s_worker_stack`, `s_worker_tcb`, `s_request_q`, `s_result_q`, `workerCancel` are **absent** from the default `supermini` ELF.
-- No logging strings appear in the `supermini-quiet` ELF (verified with `nm` against symbol table).
+The **ELF proof** (`nm` proves symbols; binary string scanning proves format strings — both from build artifacts, *not* a source check):
+- `g_diag_last_fetch_ms` and `radarDisplayLastDiagnostics` symbols are **absent** from `supermini` and `supermini-worker` ELFs (`nm` confirms) and **present** in the `supermini-diag` and `supermini-worker-diag` ELFs.
+- `workerTask`, `s_worker_stack`, `s_worker_tcb`, `s_request_q`, `s_result_q`, `workerCancel` symbols are **absent** from the default `supermini` ELF (`nm` confirms).
+- `supermini-quiet` firmware binary contains no logging format strings (binary string scan: `Radar location saved`, `diag: fetch_ms`, etc. are absent); `supermini-diag` binary contains both `diag: fetch_ms=…` and `diag: render_us=…` format strings (binary string scan confirms presence).
 
 The updated **worker policy gate** (`verify-adsb-worker-policy.ps1`) now covers 17 tamper cases (2 new: `supermini-diag` must not add `ADSB_WORKER`; `supermini-worker-diag` must keep `DIAGNOSTICS=1`). All 10 original invariants are preserved.
 

@@ -873,13 +873,8 @@ void radarDisplayDraw(const RadarDisplayModel& model) {
 }
 
 void radarDisplayRefreshAircraft(const RadarDisplayModel& model) {
-  initPalette();
-
-  if (ensureFrameSprite()) {
-    renderFrame(model);
-    return;
-  }
-
+  // Forward to radarDisplayDraw so every full-frame entry point populates
+  // RenderDiagnostics consistently (used_sprite, runway_us, runways_enabled).
   radarDisplayDraw(model);
 }
 

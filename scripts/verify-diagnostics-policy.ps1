@@ -528,25 +528,36 @@ function Invoke-DiagnosticsPolicyGate {
   Ok "Exactly one LGFX_Sprite and one createSprite."
 
   # -----------------------------------------------------------------------
-  # Invariant 11: no runway endpoint cache / dynamic container / allocation.
+  # Invariant 11: no runway endpoint cache / dynamic container / allocation
+  #               in runway_overlay.cpp OR radar_display.cpp.
   # -----------------------------------------------------------------------
-  Section "[11] No runway cache / dynamic allocation in runway_overlay.cpp"
+  Section "[11] No runway cache / dynamic allocation in runway UI source files"
+
+  $bannedPatterns = @(
+      @{ Name = "std::vector";      Pattern = "std::vector\b" },
+      @{ Name = "std::array";       Pattern = "std::array\b" },
+      @{ Name = "malloc";           Pattern = "\bmalloc\s*\(" },
+      @{ Name = "calloc";           Pattern = "\bcalloc\s*\(" },
+      @{ Name = "new (dynamic)";    Pattern = "(?<![A-Za-z0-9_:])new\s+\w" },
+      @{ Name = "cached endpoints"; Pattern = "s_runway_endpoints|s_endpoint_cache|cached_endpoint" }
+  )
 
   if (-not $index.ContainsKey($runwayRel)) { Fail "runway_overlay.cpp not found at $runwayRel" }
   $runway = Get-Indexed -Index $index -Rel $runwayRel
-  foreach ($banned in @(
-      @{ Name = "std::vector";    Pattern = "std::vector\b" },
-      @{ Name = "std::array";     Pattern = "std::array\b" },
-      @{ Name = "malloc";         Pattern = "\bmalloc\s*\(" },
-      @{ Name = "calloc";         Pattern = "\bcalloc\s*\(" },
-      @{ Name = "new (dynamic)";  Pattern = "(?<![A-Za-z0-9_:])new\s+\w" },
-      @{ Name = "cached endpoints"; Pattern = "s_runway_endpoints|s_endpoint_cache|cached_endpoint" }
-  )) {
+  foreach ($banned in $bannedPatterns) {
     if ($runway.Skeleton -match $banned.Pattern) {
       Fail "runway_overlay.cpp must not use '$($banned.Name)' (no runway cache or dynamic allocation; measurement first)."
     }
   }
-  Ok "runway_overlay.cpp has no dynamic container, allocation, or endpoint cache."
+
+  # radar_display.cpp must also be free of runway endpoint caches and dynamic
+  # containers (the display layer must not independently cache runway geometry).
+  foreach ($banned in $bannedPatterns) {
+    if ($display.Skeleton -match $banned.Pattern) {
+      Fail "radar_display.cpp must not use '$($banned.Name)' (no runway cache or dynamic allocation in display layer)."
+    }
+  }
+  Ok "runway_overlay.cpp and radar_display.cpp have no dynamic container, allocation, or endpoint cache."
 
   # -----------------------------------------------------------------------
   # Invariant 12: diagnostics source gating in radar_display.cpp.
@@ -626,7 +637,9 @@ function Invoke-TamperSelfTest {
       @{ Name = "11. std::vector added to runway_overlay.cpp (cache/dynamic alloc)"; Rel = "src\ui\runway_overlay.cpp";
         Mutate = { param($t) $t -replace '(namespace ui::runway \{)', "`$1`n#include <vector>`nstatic std::vector<int> s_runway_endpoints;" } },
       @{ Name = "12. s_last_render_diag accessed outside diag guard in radar_display.cpp"; Rel = "src\ui\radar_display.cpp";
-        Mutate = { param($t) $t -replace '(void radarDisplayDraw\(\) \{)', "`$1`n  s_last_render_diag.runway_us = 0;" } }
+        Mutate = { param($t) $t -replace '(void radarDisplayDraw\(\) \{)', "`$1`n  s_last_render_diag.runway_us = 0;" } },
+      @{ Name = "13. std::vector runway cache inserted into radar_display.cpp (display layer must not cache runway endpoints)"; Rel = "src\ui\radar_display.cpp";
+        Mutate = { param($t) $t -replace '(namespace ui \{)', "#include <vector>`nstatic std::vector<int> s_runway_endpoints;`n`$1" } }
     )
 
     foreach ($case in $cases) {
@@ -652,7 +665,7 @@ function Invoke-TamperSelfTest {
 
     Invoke-DiagnosticsPolicyGate -Root $tempRoot -Quiet
     Write-Host "  OK (post-restore): the mirror passes again after all mutations reverted." -ForegroundColor Green
-    Write-Host "Tamper self-test passed: the gate rejects all 12 representative regressions." -ForegroundColor Green
+    Write-Host "Tamper self-test passed: the gate rejects all 13 representative regressions." -ForegroundColor Green
   } finally {
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
   }

@@ -31,7 +31,7 @@ bool radarDisplayPrepareFrame();
 /** Draw the full frame (grid + conditional aircraft + status) for `model`. */
 void radarDisplayDraw(const RadarDisplayModel& model);
 
-/** Redraw the full frame for `model` (blits the composited grid; no flicker). */
+/** Forward to radarDisplayDraw(model); kept for call-site compatibility. */
 void radarDisplayRefreshAircraft(const RadarDisplayModel& model);
 
 /**
@@ -49,20 +49,27 @@ void radarDisplayRefreshAircraft();
  * the next call). All timings are in microseconds (micros()/core::elapsedMicros).
  *
  * Interpretation notes (hardware-only):
- *   runway_us: includes SPI transfer overhead in sprite mode and differs between
- *     sprite path (grid composited off-screen) vs direct-draw path (rendered live
- *     to panel). Real-hardware data is required to characterise the difference.
+ *   render_us: wall time of radarDisplayDraw(). Includes panel I/O in BOTH
+ *     paths: sprite mode ends with one pushSprite SPI transfer; direct-draw
+ *     makes incremental SPI transfers for every drawing operation.
+ *   runway_us: wall time of drawLargeAirportRunways(). In sprite mode this
+ *     measures off-screen RAM drawing only — panel SPI is NOT included
+ *     (runways are composited into the off-screen sprite before the final
+ *     pushSprite). In direct-draw mode, panel SPI IS included (each drawing
+ *     call transfers to the panel). Zero when the runway overlay is disabled.
  *   used_sprite: true = composited sprite + pushSprite; false = direct draw.
  *     Both paths render identical pixels; timing differs by SPI transfer overhead.
- *   runways_enabled: whether drawLargeAirportRunways was actually called this frame.
+ *   runways_enabled: reflects the runway overlay setting (radar::showRunways()).
+ *     drawLargeAirportRunways() is always called but returns early when the
+ *     overlay is disabled; runway_us is zero in that case.
  * Runway caching decision: consider caching only after observing runway_us > 5 ms
  * AND runway_us >= 20% of total frame time AND RAM allows the cache without
  * threatening the single-frame sprite or TLS heap.
  */
 struct RenderDiagnostics {
-  uint32_t runway_us;    // drawLargeAirportRunways wall time (0 if not enabled)
+  uint32_t runway_us;    // drawLargeAirportRunways wall time (0 if overlay disabled)
   bool used_sprite;      // true = sprite+pushSprite path; false = direct draw
-  bool runways_enabled;  // whether drawLargeAirportRunways was called
+  bool runways_enabled;  // runway overlay setting (radar::showRunways())
 };
 
 /** Return the diagnostics snapshot from the most recent radarDisplayDraw() call.

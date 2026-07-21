@@ -25,8 +25,11 @@
 // This header is Arduino-free (no Arduino.h, no Serial declaration): it
 // defines the constexpr reflection constants and the logging macros. The macros
 // expand to Serial calls only when included in Arduino translation units where
-// Serial is already in scope; on native tests the macros evaluate to no-ops,
-// matching the Arduino LOG_LEVEL=0 behaviour.
+// Serial is already in scope. At the default level (INFO, level 2) the macros
+// expand to Serial.printf — they are NOT automatically no-ops in native builds.
+// Native test suites compile at the default level but never invoke any
+// production code path that triggers these macros, so no Serial call is ever
+// reached in practice during a native test run.
 //
 // Usage in firmware source:
 //   #include "runtime_diagnostics.h"

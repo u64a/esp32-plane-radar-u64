@@ -57,6 +57,20 @@ static_assert(plane_radar::kDiagnosticsEnabled == (PLANE_RADAR_DIAGNOSTICS != 0)
 
 // ---- WorkerResult layout (DIAGNOSTICS=0: no fetch_duration_ms field) --------
 
+// C++17 detection idiom: prove WorkerResult has NO fetch_duration_ms member
+// when DIAGNOSTICS=0. std::void_t<> combined with decltype selects the partial
+// specialisation only when the member exists; the primary template (false_type)
+// fires when it is absent.
+template <typename T, typename = void>
+struct HasFetchDurationMs : std::false_type {};
+
+template <typename T>
+struct HasFetchDurationMs<T, std::void_t<decltype(T::fetch_duration_ms)>>
+    : std::true_type {};
+
+static_assert(!HasFetchDurationMs<services::adsb::WorkerResult>::value,
+              "WorkerResult must NOT have fetch_duration_ms when DIAGNOSTICS=0");
+
 // The non-diagnostic WorkerResult must remain trivially copyable.
 static_assert(std::is_trivially_copyable<services::adsb::WorkerResult>::value,
               "WorkerResult must be trivially copyable (non-diag layout)");

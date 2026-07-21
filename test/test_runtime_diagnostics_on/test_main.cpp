@@ -19,8 +19,9 @@
 //     and is at a reachable offset.
 //   * WorkerResult remains trivially copyable with the additional field.
 //   * The WorkerResultMsg internal queue payload (which also gains the field)
-//     keeps trivial copyability (proved indirectly via the public WorkerResult
-//     which mirrors the field).
+//     keeps trivial copyability; this is proved by its internal static_assert
+//     inside adsb_worker.cpp plus a successful worker-diag build — NOT by
+//     indirect inference from the public WorkerResult.
 //   * core::elapsedMicros remains rollover-safe.
 
 static_assert(__cplusplus >= 201703L, "Native tests require C++17");
