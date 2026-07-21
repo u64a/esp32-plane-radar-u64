@@ -700,15 +700,16 @@ Measured with the same pinned clean build for all envs:
 | Build measurement | Phase 9 `supermini` | Phase 10 `supermini` | Δ vs Ph 9 | Phase 10 `supermini-quiet` | Δ vs `supermini` | Phase 10 `supermini-diag` | Δ vs `supermini` | Phase 10 `supermini-worker` | Δ vs Ph 9 worker | Phase 10 `supermini-worker-diag` | Δ vs `supermini-worker` |
 |------|------:|------:|------:|------:|------:|------:|------:|------:|------:|------:|------:|
 | Linker-reported static RAM (bytes) | 65,044 | 65,044 | 0 | 64,916 | −128 | 65,052 | +8 | 73,924 | 0 | 73,948 | +24 |
+| Linker-reported firmware flash (bytes) | 1,143,328 | 1,143,278 | −50 | 1,138,158 | −5,120 | 1,143,892 | +614 | 1,146,152 | −42 | 1,146,920 | +768 |
 | `.pio/build/*/firmware.bin` (bytes) | 1,198,256 | 1,198,160 | −96 | 1,192,256 | −5,904 | 1,198,880 | +720 | 1,202,320 | −96 | 1,203,120 | +896 |
 | `.pio/build/*/firmware-merged.bin` (bytes) | 1,263,792 | 1,263,696 | −96 | 1,257,792 | −5,904 | 1,264,416 | +720 | 1,267,856 | −96 | 1,268,656 | +896 |
 
-Notes (final measurements at HEAD 4dc257d; confirmed against clean build artifacts):
-- **supermini (default)**: −96 B firmware.bin from Phase 9 baseline; 0 B static RAM. Diagnostics are fully compiled out.
-- **supermini-quiet** (`LOG_LEVEL=0`): −5,904 B firmware.bin (no Serial output, no `Serial.begin`, no logging format strings).
-- **supermini-diag** (`DIAGNOSTICS=1`): +8 B static RAM (`g_diag_last_fetch_ms` file-scope state and `s_last_render_diag` struct) and +720 B firmware.bin (timing, heap-query, and render-diagnostic code paths).
-- **supermini-worker** (opt-in): −96 B firmware.bin from Phase 9 worker baseline.
-- **supermini-worker-diag** (`WORKER=1, DIAGNOSTICS=1`): +24 B static RAM (`s_last_render_diag` and diag `fetch_duration_ms` field in `WorkerResultMsg`); +896 B firmware.bin.
+Notes (final Phase 10 firmware code at 4dc257d; subsequent commits are documentation-only; confirmed against clean build artifacts):
+- **supermini (default)**: −50 B linker flash and −96 B firmware.bin from Phase 9 baseline; 0 B static RAM. Diagnostics are fully compiled out.
+- **supermini-quiet** (`LOG_LEVEL=0`): −5,120 B linker flash and −5,904 B firmware.bin (no Serial output, no `Serial.begin`, no logging format strings).
+- **supermini-diag** (`DIAGNOSTICS=1`): +8 B static RAM (`g_diag_last_fetch_ms` file-scope state and `s_last_render_diag` struct); +614 B linker flash and +720 B firmware.bin (timing, heap-query, and render-diagnostic code paths).
+- **supermini-worker** (opt-in): −42 B linker flash and −96 B firmware.bin from Phase 9 worker baseline.
+- **supermini-worker-diag** (`WORKER=1, DIAGNOSTICS=1`): +24 B static RAM (`s_last_render_diag` and diag `fetch_duration_ms` field in `WorkerResultMsg`); +768 B linker flash and +896 B firmware.bin.
 
 ### Diagnostics output format (hardware-only interpretation)
 
