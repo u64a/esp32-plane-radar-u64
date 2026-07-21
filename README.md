@@ -836,3 +836,139 @@ Put the board in download mode (hold **BOOT**, tap **RESET**), then flash with C
 - [ArduinoJson](https://github.com/bblanchon/ArduinoJson)
 
 The secure setup portal uses only the Arduino‑ESP32 built‑in Wi‑Fi stack — an Arduino **`WiFiServer`** plus **`DNSServer`** — inside a temporary SoftAP session. The `WiFiServer` is constructed with the exact‑IP constructor `WiFiServer(IPAddress(192,168,4,1), 80, 1)`, so it binds **only** the SoftAP address `192.168.4.1` with a one‑client backlog (never `INADDR_ANY`); the portal treats it as listening only after `begin()` and `operator bool()` are both true, accepts through `accept()` (never `available()`), and tears down with `end()`. To keep request secrets out of `WiFiClient`'s internal 1436‑byte RxBuffer, the accepted client's bytes are pumped with non‑blocking `lwip_recv`/`lwip_send` on `WiFiClient::fd()` and each raw read chunk is wiped after it is parsed. The SoftAP itself is brought up via a controlled paired low‑level sequence (`esp_wifi_stop` → `esp_wifi_set_mode(AP)` → `esp_wifi_set_config(AP, WPA2‑PSK/CCMP + one‑time secret)` → `esp_wifi_start`) so the **first** joinable beacon already carries the secret — never an open/default beacon. There is **no** WiFiManager, `WebServer`, mDNS, or OTA dependency.
+
+## Runtime egress, privacy, and portal network behavior (Phase 11)
+
+### Runtime network egress (exact — two parties only)
+
+| Purpose | Protocol / port | External party |
+|---------|-----------------|----------------|
+| ADS-B live data | **HTTPS — TCP/443** | `opendata.adsb.fi` (Cloudflare-fronted) |
+| Time synchronization | **SNTP — UDP/123** | `time.cloudflare.com` |
+
+These are the **only** two external parties the firmware contacts at runtime. `time.cloudflare.com` is the sole default SNTP server because `adsb.fi` is already behind Cloudflare, so it adds no additional operator. Up to two optional compile-time SNTP fallback servers may be configured (`kSntpServerFallback1/2` in `config.h`), but these are **empty by default** and **policy-gated** — the egress policy gate (`scripts/verify-egress-policy.ps1`) fails if they are non-empty. **DHCP-provided NTP is explicitly disabled** (`esp_sntp_servermode_dhcp(false)`). There are **no** other default outbound parties beyond DNS for the two hosts above.
+
+**Build-time OurAirports and GitHub traffic** (downloading `airports.csv`/`runways.csv` from the pinned immutable commit URL during regeneration) is a **build/development-time activity only** and is not firmware runtime egress. Regeneration runs on a developer machine, not on the ESP32 device.
+
+### Privacy
+
+The firmware sends the following data to external parties at runtime:
+
+| Data sent | Recipient | Detail |
+|-----------|-----------|--------|
+| ADS-B query parameters | `opendata.adsb.fi` | Lat/lon formatted to 6 decimal places (`%.6f`), radius converted to nautical miles formatted to 0.1 NM (`%.1f`) in the URL path |
+| Normal TCP/IP source IP | `opendata.adsb.fi`, `time.cloudflare.com` | Standard link-layer metadata visible to the network path and DNS resolver |
+| SNTP client packets | `time.cloudflare.com` | Standard NTP exchange; no device-specific payload |
+
+**The firmware does not send:**
+- Wi-Fi credentials, provisioning secrets, CSRF tokens, or SSID to any external service
+- Device MAC address or any hardware identifier to any external service
+- Aircraft callsigns, ICAO hex addresses, or ADS-B payload copies to any external service
+- Analytics, heartbeat, error reporting, or telemetry of any kind to any external service
+
+**Local network note:** Normal Wi-Fi and DHCP link-layer operation exposes the device MAC address to the **local network** (access point and devices on the same LAN segment). This is standard 802.11 behavior and is not specific to this firmware.
+
+The ADS-B provider and DNS/SNTP resolver can observe the device's **public IP address** and the query parameters (lat/lon + radius). The lat/lon values are formatted to 6 decimal places: this is the same precision as configured by the user and sent in the URL, with no additional reduction or rounding applied beyond what the ADS-B API requires.
+
+### Portal network behavior
+
+The setup portal creates a **temporary, session-scoped SoftAP** at `192.168.4.1`:
+
+- **WPA2-PSK** with a MAC-derived, one-time-displayed password; never open
+- **Session-scoped**: exists only while a setup session is active (max 5 minutes)
+- **No permanent listener**: the portal is torn down after the session ends
+- **Wildcard DNS** at `192.168.4.1` (port 53) redirects all DNS queries to the captive portal for the duration of the session only
+- **HTTP at port 80** at `192.168.4.1` only (bound to the exact SoftAP IP, not `INADDR_ANY`)
+- **No mDNS, no OTA, no permanent LAN listener** after the session closes
+
+After setup completes the device connects to the configured home Wi-Fi as a normal station. The SoftAP and DNS server are fully torn down.
+
+### Source gate vs hardware packet-capture
+
+`scripts/verify-egress-policy.ps1` is a **source-only** gate. It proves from source code that:
+- Only the approved host constants are used for runtime connections
+- The DNS/TLS/HTTP Host header derives from `config::kAdsbHost`
+- DHCP NTP is disabled, empty fallbacks become `nullptr`
+- No banned clients (HTTPClient, WiFiUDP, mDNS, OTA, WiFiManager) appear in production source
+
+**The source gate is necessary but not sufficient.** A hardware **packet capture** on a physical device (e.g., via a Wi-Fi monitor-mode sniffer or router firewall log) is the final runtime proof that the firmware's actual network traffic matches this policy.
+
+### OurAirports data provenance (Phase 11)
+
+The embedded large-airport runway overlay data is generated from a **pinned, immutable OurAirports commit**:
+
+| Property | Value |
+|----------|-------|
+| Repository | `https://github.com/davidmegginson/ourairports-data` |
+| Commit | `79efa72ec1e344d91b081160634fa042a56a21b8` (2026-06-08T01:53:13Z) |
+| `airports.csv` SHA-256 | `092223c8d6a1cf60c13d450e61a91438cc80c5fd50f92f52f49a38826e04a354` |
+| `airports.csv` length | 12,651,071 bytes |
+| `runways.csv` SHA-256 | `312f9ded8a5a29f8634bd615b0a7aadd4ed01e773ae63e5aab7c510629440fec` |
+| `runways.csv` length | 3,951,490 bytes |
+| License | Public Domain / The Unlicense |
+| Filter | `type=large_airport`, 4-char ICAO ident, open runways, helipads excluded, endpoint coordinates required |
+| Filter schema version | 1 |
+| Result | **1,166 airports**, **1,706 runways** |
+
+**Regeneration (online, pinned URL):**
+```bash
+python3 scripts/build_large_airports.py
+```
+Downloads from the immutable pinned commit URL; verifies SHA-256 and byte length before parsing; writes deterministic LF bytes. No `/main/` URL is used.
+
+**Regeneration (offline, local CSV files):**
+```bash
+python3 scripts/build_large_airports.py \
+  --airports-csv path/to/airports.csv \
+  --runways-csv  path/to/runways.csv
+```
+Both flags must be specified together (both or neither). The local files must match the pinned SHA-256 and byte length.
+
+**Verify checked-in files match (offline check mode):**
+```bash
+python3 scripts/build_large_airports.py \
+  --airports-csv path/to/airports.csv \
+  --runways-csv  path/to/runways.csv \
+  --check
+```
+Renders in memory and compares exact LF bytes to checked-in files. Exits 0 if identical, non-zero otherwise. Never modifies files.
+
+**Update workflow:** to update to a new OurAirports commit, update `_COMMIT`, `AIRPORTS_SHA256`, `RUNWAYS_SHA256`, `AIRPORTS_LENGTH`, `RUNWAYS_LENGTH`, `AIRPORTS_BLOB`, `RUNWAYS_BLOB`, and `_COMMIT_DATE` in `scripts/build_large_airports.py`, regenerate both files, and update the provenance table above.
+
+**Generated files:** `include/data/large_airports.h` and `src/data/large_airports_data.cpp` are committed checked-in with LF line endings (enforced by `.gitattributes`). They contain a stable provenance comment block (commit/SHA-256/lengths/blob SHAs/license URL/filter schema version) and must not be edited manually.
+
+### Local-only release policy
+
+`.github/workflows/` is **intentionally absent** — there are no CI/CD workflows, no automated publishing, and no remote infrastructure. All verification, gate, and release operations run locally:
+
+```powershell
+.\scripts\verify-airport-data.ps1              # Phase 11: OurAirports provenance gate (20 invariants)
+.\scripts\verify-airport-data.ps1 -SelfTest    # proves the gate rejects 12 tamper cases
+.\scripts\verify-egress-policy.ps1             # Phase 11: runtime egress source policy gate (10 invariants)
+.\scripts\verify-egress-policy.ps1 -SelfTest   # proves the gate rejects 10 tamper cases
+```
+
+The `scripts/native-test.ps1` script runs `verify-airport-data.ps1` fail-fast at its start before any PlatformIO tests.
+
+No remote is added, no releases are published, and no GitHub Actions workflows are introduced by this project.
+
+### Phase 11 native tests and gate summary
+
+The Phase 11 native test suite `test_large_airport_data` adds **12 cases** in 1 suite to the native test run:
+
+- `test_airport_count_matches_constant` / `test_runway_count_matches_constant`: runtime count equals compile-time constant (1166/1706)
+- `test_airport_idents_are_4_chars` / `test_airport_idents_unique` / `test_airport_idents_sorted`: ident validity
+- `test_airport_lat_range` / `test_airport_lon_range`: coordinate bounds
+- `test_runway_lengths_positive` / `test_runway_index_bounds` / `test_runway_ordering`: runway structural integrity
+- `test_compile_time_extent_airport` / `test_compile_time_extent_runway`: `std::extent` matches constants
+
+The `native` env now runs **579 cases across 39 suites**; `native-diag` runs **5 cases in 1 suite**; `scripts/native-test.ps1` runs both for **584 cases across 40 suite runs total**.
+
+New Phase 11 gate commands:
+
+```powershell
+.\scripts\verify-airport-data.ps1              # 20 source invariants
+.\scripts\verify-airport-data.ps1 -SelfTest    # 12 tamper cases
+.\scripts\verify-egress-policy.ps1             # 10 source invariants
+.\scripts\verify-egress-policy.ps1 -SelfTest   # 10 tamper cases
+```
