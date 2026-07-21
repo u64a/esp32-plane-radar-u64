@@ -93,3 +93,26 @@ $diagProcess.WaitForExit()
 if ($diagProcess.ExitCode -ne 0) {
   throw "PlatformIO native-diag tests failed with exit code $($diagProcess.ExitCode)"
 }
+
+# Phase 12: headless LovyanGFX render + golden-image gate ([env:native-gfx]).
+# Runs AFTER the Phase 11 pure-logic native/native-diag gates and uses the same
+# pinned w64devkit compiler PATH. It compiles the real production UI drawing code
+# into a native binary, renders every named scene into an in-RAM 240x240 RGB565
+# LovyanGFX sprite canvas, and byte-compares the captured framebuffer against the
+# checked-in golden BMPs (test/golden). Fully offline/headless: no SDL2, no
+# window, no hardware. Read-only: goldens are rewritten only under an explicit
+# PLANE_RADAR_UPDATE_GOLDENS=1 opt-in, never during this gate. Fail fast.
+$gfxInfo = New-Object System.Diagnostics.ProcessStartInfo
+$gfxInfo.FileName = $pio
+$gfxInfo.WorkingDirectory = $projectRoot
+$gfxInfo.Arguments = "test -e native-gfx"
+$gfxInfo.UseShellExecute = $false
+$gfxInfo.EnvironmentVariables["PATH"] =
+  "$toolchainBin$([System.IO.Path]::PathSeparator)$($gfxInfo.EnvironmentVariables["PATH"])"
+$gfxInfo.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"
+
+$gfxProcess = [System.Diagnostics.Process]::Start($gfxInfo)
+$gfxProcess.WaitForExit()
+if ($gfxProcess.ExitCode -ne 0) {
+  throw "PlatformIO native-gfx render golden tests failed with exit code $($gfxProcess.ExitCode)"
+}

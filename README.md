@@ -416,6 +416,13 @@ src/
   ui/
   core/
   services/
+test/
+  native_gfx_support/            — Phase 12 headless render shims, selected ONLY by [env:native-gfx]
+    driver/gpio.h                — config.h gpio types/constants (native)
+    hardware/lgfx_config.hpp     — shadows the GC9A01 device with a headless LGFX_Sprite canvas
+    opencv2/opencv.hpp           — fake header that makes LovyanGFX pick its panel-free desktop backend (no SDL)
+  test_native_gfx/               — Unity render suite: headless display/font/adapters, BMP capture+gate, scenes
+  golden/                        — checked-in 24-bit BMP golden scenes (exact-byte gate)
 ```
 
 ## Wiring (GC9A01 ↔ ESP32-C3 Super Mini)
@@ -485,7 +492,7 @@ SHA-256, Authenticode signature, and GCC version before caching it. The test scr
 uses that compiler only for its child PlatformIO process; it does not change the
 user or system `PATH`. No Arduino or ESP32 packages are linked into native tests.
 
-The `native` env alone is certified at **580 cases across 39 suites**; `native-diag` runs **5 cases in 1 suite** (`test_runtime_diagnostics_on`); `scripts/native-test.ps1` runs both for **585 cases across 40 suite runs total**, passing **twice in succession** (no flaky/order-dependent cases). This includes
+The `native` env alone is certified at **580 cases across 39 suites**; `native-diag` runs **5 cases in 1 suite** (`test_runtime_diagnostics_on`); the Phase 12 `native-gfx` headless render gate runs **20 cases in 1 suite** (`test_native_gfx`, one per golden scene); `scripts/native-test.ps1` runs all three for **605 cases across 41 suite runs total**, passing **twice in succession** (no flaky/order-dependent cases). This includes
 the Phase 7 trust logic — `test_time_trust` (26 cases: trusted-time state
 machine, derived monotonic clock, stale-sample revoke, versioned
 persisted-floor record, and the CA-authenticated certificate-`notBefore` floor
@@ -530,6 +537,64 @@ The worker policy gate proves these invariants hold in **source**; the
 release-binary `nm` proof that the default `supermini` build links **zero**
 worker/integration symbols is the actual certification step (see
 [Memory budget](#memory-budget)).
+
+### Headless render golden gate (Phase 12)
+
+The `native-gfx` environment is a fully local, **offline, headless** rendering
+harness that exercises the **actual production UI drawing code** and gates it
+against checked-in golden images. It requires **no ESP32 hardware, no SDL2, and
+no window** — it runs as part of `scripts/native-test.ps1` (after `native` and
+`native-diag`, same pinned w64devkit compiler) and can also be run directly:
+
+```powershell
+pio test -e native-gfx
+```
+
+**What it compiles.** The real `src/ui/radar_display.cpp`,
+`src/ui/runway_overlay.cpp`, and `src/ui/status_screens.cpp`, plus the pure
+`core/` and `data/` modules, linked against the same pinned
+**LovyanGFX 1.2.25**. No drawing algorithm is duplicated.
+
+**How it renders headless.** LovyanGFX's self-contained, panel-free desktop
+backend is selected and its `LGFX` device is shadowed by an in-RAM **240×240
+RGB565 sprite canvas** (a `lgfx::LGFX_Sprite`). The production double-buffered
+frame path (`LGFX_Sprite s_frame(&tft)` → `pushSprite`) and the status-screen
+direct-draw path both run unchanged and composite into that canvas. The exact
+repository `data/ui_font.vlw` smooth-font bytes are loaded from disk so text
+metrics and anti-aliasing match the firmware's VLW path. All headless shims live
+under `test/native_gfx_support/` and `test/test_native_gfx/` and are selected
+**only** by `[env:native-gfx]`; the firmware display driver is never changed.
+
+**Scenes (20, one Unity test + one golden BMP each).** Radar: `radar_loading`,
+`radar_live_empty`, `radar_live_traffic` (multiple aircraft with
+headings/tags/speed vectors, inside-disc and beyond-ring rim behaviour),
+`radar_stale` (age badge), `radar_offline` (targets hidden), `radar_nowifi`
+(Wi-Fi-disconnected badge), `radar_runways` (runway overlay near the embedded
+large airport EHAM). Status/provisioning: `status_connecting` (saved-network),
+`status_portal_preparing`, `status_portal_credentials` (dummy SSID/password/
+countdown), `status_candidate_testing`, `status_candidate_failed`,
+`status_credential_fault`, `status_button_configure`,
+`status_button_confirm_erase`, `status_saved_wifi_failed`,
+`status_factory_erase_incomplete`, `status_factory_erase_ok`,
+`status_erase_incomplete_persistent`, `status_settings_save_failed`. Scenes pin
+all firmware adapters (location, range preset, runway/units toggles, snapshot)
+to deterministic literals so ordering never leaks state.
+
+**Golden policy.** Goldens are uncompressed **24-bit BMP** files under
+`test/golden/` so any standard image tool can open them. The gate is **exact
+byte comparison**. Normal runs are **read-only**: a mismatch writes the actual
+image under the ignored `.pio/native-gfx-out/` path and fails without touching
+the golden. Goldens are (re)written **only** when `PLANE_RADAR_UPDATE_GOLDENS=1`
+is set (an unmistakable opt-in), and every written file is printed. The suite is
+deterministic and byte-identical across repeated runs on the pinned host.
+
+**What it proves / does not prove.** It proves pixel **geometry, text, layout,
+and byte-for-byte deterministic drawing** of the real UI entry points. It is
+**not** a colour or panel proof: the BMP stores the raw RGB565 framebuffer
+decoded to RGB, so the GC9A01's **BGR channel order, colour inversion, SPI
+timing, and brightness are NOT modelled and remain hardware-only**. QEMU remains
+**deferred and is not a release gate** — it cannot prove Wi-Fi, TLS-over-Wi-Fi,
+or GC9A01 panel behaviour either.
 
 ### Memory budget
 

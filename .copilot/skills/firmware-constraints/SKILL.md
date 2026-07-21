@@ -26,7 +26,13 @@ source: "team-decision"
 ## Validation Levels
 
 - PlatformIO native tests prove deterministic logic.
-- LovyanGFX desktop rendering proves drawing behavior and golden scenes.
-- QEMU is optional and cannot prove Wi-Fi, TLS-over-Wi-Fi, or GC9A01 behavior.
+- The headless LovyanGFX render gate ([env:native-gfx], test/test_native_gfx +
+  test/golden BMPs; run by scripts/native-test.ps1) compiles the real production
+  UI drawing code and byte-compares each rendered 240x240 RGB565 scene against a
+  checked-in golden. It proves pixel geometry/text/layout and deterministic
+  drawing; it is offline/headless (no SDL, window, or hardware) and does NOT
+  prove panel colours, BGR order, inversion, SPI, or brightness.
+- QEMU is optional and cannot prove Wi-Fi, TLS-over-Wi-Fi, or GC9A01 behavior;
+  it is not a release gate.
 - Real RF, captive portal, heap peaks, panel output, power, and soak behavior remain
   hardware-only acceptance gates.
