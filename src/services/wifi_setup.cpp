@@ -13,12 +13,14 @@
 #include "core/coordinates.h"
 #include "core/factory_erase.h"
 #include "core/http_request.h"
+#include "core/network_work_intent.h"
 #include "core/portal_auth.h"
 #include "core/portal_secrets.h"
 #include "core/portal_session.h"
 #include "core/provision_button.h"
 #include "core/time_math.h"
 #include "core/url_form.h"
+#include "services/adsb_worker.h"  // PLANE_RADAR_ADSB_WORKER gate (Arduino-free)
 #include "services/config_portal.h"
 #include "services/device_identity.h"
 #include "services/provision_marker.h"
@@ -44,6 +46,52 @@ using core::PortalState;
 
 constexpr core::PortalSessionPolicy kPolicy = core::kDefaultPortalSessionPolicy;
 constexpr core::ProvisionButtonPolicy kBtnPolicy = config::kButtonPolicy;
+
+// ===========================================================================
+// Optional ADS-B network-worker deferral (compiled ONLY for the worker build).
+// ===========================================================================
+// In the default firmware PLANE_RADAR_ADSB_WORKER is 0, so none of this state,
+// the altered button latching, or the pause/resume hooks exist -- Configure and
+// factory Erase keep their exact immediate behavior with no object/ELF delta.
+#if PLANE_RADAR_ADSB_WORKER
+// Main-registered hooks (null until wifiSetNetworkWorkHooks runs).
+WifiNetworkWorkHooks s_nw_hooks{};
+// Deferred Configure/Erase latch (pure core; Configure idempotent, Erase wins).
+core::NetworkWorkIntentState s_nw_intent{};
+bool s_nw_intent_initialized = false;
+
+void nwRequestPause() {
+  if (s_nw_hooks.request_pause != nullptr) {
+    s_nw_hooks.request_pause(s_nw_hooks.ctx);
+  }
+}
+
+// True when there is no worker to wait on, or when the worker is provably Paused
+// with all results resolved. Fail-closed: a faulted worker's hook returns false,
+// so a pending intent simply keeps waiting (it never fabricates quiescence).
+bool nwQuiesced() {
+  return s_nw_hooks.quiesced == nullptr || s_nw_hooks.quiesced(s_nw_hooks.ctx);
+}
+
+void nwResume() {
+  if (s_nw_hooks.resume != nullptr) {
+    s_nw_hooks.resume(s_nw_hooks.ctx);
+  }
+}
+
+core::NetworkWorkIntentState* nwIntent() {
+  if (!s_nw_intent_initialized) {
+    core::networkWorkIntentInit(&s_nw_intent);
+    s_nw_intent_initialized = true;
+  }
+  return &s_nw_intent;
+}
+
+core::NetworkWorkIntent nwPendingIntent() {
+  return core::pendingIntent(*nwIntent());
+}
+#endif  // PLANE_RADAR_ADSB_WORKER
+
 
 // ===========================================================================
 // Wi-Fi event tracking (filtered, allocation-free, ISR/event-task safe)
@@ -999,6 +1047,15 @@ void applyActions(const PortalActions& a) {
     // settings (belt-and-suspenders; the failure/cancel paths already wipe).
     wipeCandidate();
   }
+#if PLANE_RADAR_ADSB_WORKER
+  // Honor the core's pause request BEFORE any radio-changing action so the worker
+  // is quiesced before the STA drops / AP radio comes up. Idempotent: the deferred
+  // Configure/Erase handshake already paused the worker, and first-boot honors it
+  // here too (the worker is started before wifiBootConnect()).
+  if (a.pause_adsb) {
+    nwRequestPause();
+  }
+#endif
   if (a.disconnect_sta) {
     executeDisconnectSta();
   }
@@ -1029,6 +1086,14 @@ void applyActions(const PortalActions& a) {
   if (a.force_immediate_adsb_fetch) {
     s_immediate_fetch_pending = true;
   }
+#if PLANE_RADAR_ADSB_WORKER
+  // Resume ONLY on the core's resume_adsb edge (emitted at a steady online state).
+  // The one immediate refresh is driven by the existing force_immediate_adsb_fetch
+  // latch above, so no second immediate latch is introduced.
+  if (a.resume_adsb) {
+    nwResume();
+  }
+#endif
   // pause_adsb / resume_adsb / stop_listener: no direct side effect here (ADS-B is
   // gated by wifiOwnsDisplay()/link state in main; teardown is folded into the
   // quiesce handlers).
@@ -1058,6 +1123,16 @@ void handleButtonEvent(core::ProvisionButtonEvent event, uint32_t now_ms) {
         break;  // fail-closed: no listener may open; only erase recovers
       }
       s_boot_failed_offline = false;
+#if PLANE_RADAR_ADSB_WORKER
+      // Worker build: LATCH the Configure intent and ask the worker to pause. Do
+      // NOT snapshot credentials, feed the FSM, or touch the radio/NVS until the
+      // worker is provably quiesced (serviced in serviceDeferredNetworkWork).
+      if (!core::portalInSession(s_session.state)) {
+        core::requestConfigure(nwIntent());
+        nwRequestPause();
+      }
+      break;
+#else
       // Capture the working creds for THIS setup transaction, but only when a new
       // session can actually open (not when already in a session, where the core
       // treats ConfigureButton as a no-op). If stored creds are believed present
@@ -1070,16 +1145,27 @@ void handleButtonEvent(core::ProvisionButtonEvent event, uint32_t now_ms) {
       }
       feed(PortalInput::ConfigureButton, now_ms);
       break;
+#endif
     case core::ProvisionButtonEvent::EraseConfirmed:
       if (s_erase_incomplete) {
         // The core is already in FactoryErase after an incomplete wipe; a second
         // physically-confirmed gesture retries the erase routine directly (the
-        // core would treat EraseConfirmed as a no-op here).
+        // core would treat EraseConfirmed as a no-op here). The network is already
+        // terminally off in this state, so no worker deferral applies.
         executeFactoryErase();  // never returns on a full verified erase
         break;
       }
+#if PLANE_RADAR_ADSB_WORKER
+      // Worker build: LATCH the Erase intent (supersedes any pending Configure)
+      // and pause the worker. The ErasePending marker write, terminalNetworkOff(),
+      // and the erase itself are deferred until proven quiescence.
+      core::requestErase(nwIntent());
+      nwRequestPause();
+      break;
+#else
       feed(PortalInput::EraseConfirmed, now_ms);  // never returns if it erases
       break;
+#endif
     case core::ProvisionButtonEvent::EraseCancelled:
     case core::ProvisionButtonEvent::None:
     default:
@@ -1450,6 +1536,7 @@ enum ScreenKind : uint8_t {
   kEraseIncomplete,
   kSettingsSaveFailed,
   kButtonPrompt,
+  kNetworkQuiescing,
 };
 
 void drawScreen(uint8_t kind, uint32_t param) {
@@ -1497,6 +1584,9 @@ void drawScreen(uint8_t kind, uint32_t param) {
     case kButtonPrompt:
       statusScreenButtonPrompt(static_cast<core::ProvisionButtonPrompt>(param));
       break;
+    case kNetworkQuiescing:
+      statusScreenNetworkQuiescing(param != 0);  // param: 1 = erase, 0 = configure
+      break;
     default:
       break;
   }
@@ -1516,6 +1606,20 @@ void updateDisplay(uint32_t now_ms) {
     drawScreen(kButtonPrompt, static_cast<uint32_t>(s_button_prompt));
     return;
   }
+#if PLANE_RADAR_ADSB_WORKER
+  // A latched Configure/Erase waiting for the worker to quiesce owns the panel
+  // with a truthful wait screen (after the gesture prompt releases). This sits
+  // above the fault screens so an Erase confirmed out of a credential fault shows
+  // the honest "stopping network before erase" wait rather than the frozen fault.
+  {
+    const core::NetworkWorkIntent pending = nwPendingIntent();
+    if (pending != core::NetworkWorkIntent::None) {
+      drawScreen(kNetworkQuiescing,
+                 pending == core::NetworkWorkIntent::Erase ? 1U : 0U);
+      return;
+    }
+  }
+#endif
   if (s_credential_fault) {
     drawScreen(kCredentialFault, 0);  // fail-closed: overrides every other screen
     return;
@@ -1559,6 +1663,41 @@ void updateDisplay(uint32_t now_ms) {
   }
 }
 
+#if PLANE_RADAR_ADSB_WORKER
+// Service a latched Configure/Erase intent (worker build). Runs on the main task
+// inside pumpCore(): request the worker pause idempotently, wait until it is
+// provably quiesced (Paused with every result resolved), then consume the intent
+// exactly once and execute the original path. Non-blocking -- it simply returns
+// while the worker is still winding down or faulted, so the wait screen keeps
+// owning the panel. A faulted worker never proves quiescence, so radio/NVS work
+// is never fabricated (fail-closed).
+void serviceDeferredNetworkWork(uint32_t now_ms) {
+  if (nwPendingIntent() == core::NetworkWorkIntent::None) {
+    return;
+  }
+  nwRequestPause();  // idempotent
+  if (!nwQuiesced()) {
+    return;  // worker not yet Paused / results unresolved / faulted: keep waiting
+  }
+  const core::NetworkWorkIntent intent = core::consumeIntent(nwIntent(), true);
+  if (intent == core::NetworkWorkIntent::Erase) {
+    // Feeds factory_erase -> executeFactoryErase(); never returns on a full wipe.
+    feed(PortalInput::EraseConfirmed, now_ms);
+    return;
+  }
+  if (intent == core::NetworkWorkIntent::Configure) {
+    // Deferred credential snapshot (kept out of the ISR/button path): only when a
+    // new session can actually open. A snapshot fault fails closed (no listener).
+    if (!core::portalInSession(s_session.state)) {
+      if (!snapshotOldConfig()) {
+        return;
+      }
+    }
+    feed(PortalInput::ConfigureButton, now_ms);
+  }
+}
+#endif  // PLANE_RADAR_ADSB_WORKER
+
 void pumpCore(uint32_t now_ms) {
   drainButton(now_ms);
   if (services::portal::active()) {
@@ -1566,6 +1705,9 @@ void pumpCore(uint32_t now_ms) {
     now_ms = millis();  // resample: the pre-pump time is now stale (fix: fresh time)
   }
   driveController(now_ms);
+#if PLANE_RADAR_ADSB_WORKER
+  serviceDeferredNetworkWork(millis());  // release a latched Configure/Erase once quiesced
+#endif
 }
 
 void ensureInit() {
@@ -1704,6 +1846,12 @@ void wifiBootConnect() {
   if (mr == services::provision_marker::ReadResult::Present &&
       marker == core::TxnMarkerState::ErasePending) {
     services::wifi_creds::setStorageRam();
+    // Worker-firmware safety: the static worker task was created in setup()
+    // (before wifiBootConnect), but NO dispatch has happened yet -- the main loop
+    // has not run. The task is blocked on its empty request queue and owns no
+    // transport or candidate, so this direct erase (terminalNetworkOff + wipe) is
+    // safe WITHOUT a pause/quiesce handshake: there is no in-flight worker network
+    // work at boot to defer. (In the default firmware there is no worker at all.)
     executeFactoryErase();    // resume erase; restarts on a full verified wipe
     updateDisplay(millis());  // incomplete resume: show the fail-closed screen
     return;
@@ -1797,7 +1945,11 @@ bool wifiLinkUp() { return linkUp(); }
 bool wifiOwnsDisplay() {
   return s_credential_fault || s_erase_incomplete || s_settings_save_failed ||
          core::portalInSession(s_session.state) || s_boot_ui_active ||
-         buttonPromptOwning() || s_boot_failed_offline;
+         buttonPromptOwning() || s_boot_failed_offline
+#if PLANE_RADAR_ADSB_WORKER
+         || nwPendingIntent() != core::NetworkWorkIntent::None
+#endif
+      ;
 }
 
 bool wifiConsumeImmediateFetch() {
@@ -1818,4 +1970,12 @@ bool wifiConsumeRangeTap() {
 
 uint32_t wifiDisconnectSeq() {
   return s_disconnect_seq.load(std::memory_order_relaxed);
+}
+
+void wifiSetNetworkWorkHooks(const WifiNetworkWorkHooks& hooks) {
+#if PLANE_RADAR_ADSB_WORKER
+  s_nw_hooks = hooks;  // main wires these to the worker facade
+#else
+  (void)hooks;  // default (worker-free) build: inert
+#endif
 }

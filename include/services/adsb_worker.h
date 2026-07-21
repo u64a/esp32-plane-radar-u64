@@ -14,22 +14,22 @@
 // The whole adapter is compiled in ONLY when PLANE_RADAR_ADSB_WORKER != 0
 // (the [env:supermini-worker] firmware build). The default firmware
 // ([env:supermini]) leaves it 0, so no worker task, no queues, and no 8 KB
-// worker stack are linked. workerEnabled() below is an inline constexpr gate on
-// that macro, so the integration layer MUST branch on it at compile time:
+// worker stack are linked.
 //
-//   if constexpr (services::adsb::workerEnabled()) {
-//     services::adsb::workerBegin();   // ... the rest of the worker path ...
-//   } else {
-//     // the existing synchronous fetch path
-//   }
-//
-// In the default build workerEnabled() is a constant false, so that branch is
-// discarded and, under the release -Os + --gc-sections build, NONE of the
-// non-constexpr facade functions below are referenced -- every stub in
-// adsb_worker.cpp is dead-stripped and the default ELF links ZERO worker
-// symbols. The inert stubs exist ONLY so the discarded branch stays well-formed
-// (a link-safety net); callers must NOT invoke the facade unconditionally, which
-// would defeat the dead-strip and link the stubs into the default firmware.
+// Callers MUST select the worker path with a COMPILE-TIME branch so the default
+// firmware references zero facade symbols:
+//   * `#if PLANE_RADAR_ADSB_WORKER` is the current CANONICAL firmware path (used
+//     by src/main.cpp and src/services/wifi_setup.cpp). It is chosen because the
+//     pinned Arduino build invocation does not currently make C++17
+//     `if constexpr` warning-free / effective in the firmware translation units.
+//   * `if constexpr (services::adsb::workerEnabled())` is an equally valid
+//     alternative wherever the effective language mode supports it cleanly (e.g.
+//     the native tests, which are compiled at C++17).
+// Either way the default build must reference NO facade symbol. The inert
+// definitions in adsb_worker.cpp are a link-safety net for any compile-time-
+// guarded caller; with the canonical `#if` gating the default main never names
+// them, so they are unreferenced and dead-stripped (the default ELF links ZERO
+// worker symbols -- verified with nm). Do NOT invoke the facade unconditionally.
 //
 // Every entry point is NON-BLOCKING and lifecycle-explicit. FreeRTOS types are
 // deliberately kept out of this header so the main-loop integration stays
@@ -52,12 +52,13 @@
 
 namespace services::adsb {
 
-// Compile-time gate: true only in the worker-enabled firmware. It is an inline
-// constexpr so the integration layer can branch with `if constexpr
-// (workerEnabled())`, letting the default ([env:supermini]) build discard and
-// dead-strip every reference to the non-constexpr facade below (see the file
-// header). It is deliberately NOT a runtime function -- that would force the
-// default build to link the facade.
+// Compile-time feature gate: true only in the worker-enabled firmware. It is an
+// inline constexpr reflection of the PLANE_RADAR_ADSB_WORKER macro for C++
+// constant-expression contexts (static_assert, `if constexpr` where the language
+// mode supports it, and native tests). The preprocessor `#if PLANE_RADAR_ADSB_
+// WORKER` remains the canonical firmware gate (see the file header); this is its
+// language-level companion. It is deliberately NOT a runtime function -- that
+// would force the default build to link the facade.
 inline constexpr bool workerEnabled() { return PLANE_RADAR_ADSB_WORKER != 0; }
 
 // Lock the gate to the macro AND force it to be a genuine constant expression: a
@@ -132,6 +133,43 @@ struct WorkerResult {
   CandidateResult candidate;    // FetchResult + handle (handle invalid on abort)
   bool worker_cancelled;        // the worker cooperatively aborted the fetch
 };
+
+// How the main integration must react to a taken WorkerResult. Extracting this as
+// a pure classifier keeps the "cancellation is an abort, not a completion" and
+// "a fault halts dispatch" contracts unit-testable without a FreeRTOS harness.
+enum class WorkerPollAction : uint8_t {
+  Ignore,           // None: the result queue was empty; do nothing
+  Publish,          // Completed: publish the candidate via the shared completion
+  DiscardAndAbort,  // Quiesced: discard the candidate and unwind the in-flight
+                    // poll WITHOUT a completion (retain backoff/immediate); never
+                    // publish or ratchet time/NVS, even after a late-cancelled OK
+  FaultHalt,        // Faulted: clear the in-flight poll without a normal outcome
+                    // and halt further worker dispatch (never fall back to sync)
+};
+
+inline WorkerPollAction workerPollActionFor(WorkerResultStatus status) {
+  switch (status) {
+    case WorkerResultStatus::Completed:
+      return WorkerPollAction::Publish;
+    case WorkerResultStatus::Quiesced:
+      return WorkerPollAction::DiscardAndAbort;
+    case WorkerResultStatus::Faulted:
+      return WorkerPollAction::FaultHalt;
+    case WorkerResultStatus::None:
+      break;
+  }
+  return WorkerPollAction::Ignore;
+}
+
+// Action when workerTakeResult() reported NO message (empty queue). Some adapter
+// fault paths (claim reject, complete reject, result-queue send failure) fault
+// the coordinator WITHOUT enqueuing a result, so an empty queue must still be
+// checked for a fault: faulted -> FaultHalt (unwind + halt dispatch), otherwise
+// Ignore. Pairs with workerFaulted() to make the result-less fault observation
+// native-testable without a FreeRTOS harness.
+inline WorkerPollAction workerPollActionForNoResult(bool faulted) {
+  return faulted ? WorkerPollAction::FaultHalt : WorkerPollAction::Ignore;
+}
 
 // --- lifecycle --------------------------------------------------------------
 

@@ -402,13 +402,13 @@ bool workerResume() {
 
 #else  // PLANE_RADAR_ADSB_WORKER
 
-// Default (worker-free) firmware: inert stubs that exist ONLY as a link-safety
-// net so the integration layer's discarded `if constexpr (workerEnabled())`
-// branch stays well-formed. workerEnabled() is a compile-time constant false here
-// (see adsb_worker.h), so under -Os + --gc-sections none of these are referenced
-// and every symbol below is dead-stripped -- no task, queue, or 8 KB stack, and
-// zero worker symbols in the default ELF. (workerEnabled() itself is the inline
-// constexpr in the header and is intentionally NOT defined here.)
+// Default (worker-free) firmware: inert definitions that are a link-safety net
+// for any compile-time-guarded caller. With the canonical `#if PLANE_RADAR_ADSB_
+// WORKER` gating (see adsb_worker.h), the default main/wifi_setup never name these
+// symbols, so they are unreferenced and dead-stripped under -Os + --gc-sections --
+// no task, queue, or 8 KB stack, and ZERO worker symbols in the default ELF.
+// (workerEnabled() itself is the inline constexpr in the header and is
+// intentionally NOT defined here.)
 namespace services::adsb {
 
 bool workerBegin() { return false; }

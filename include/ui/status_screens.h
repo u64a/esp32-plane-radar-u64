@@ -73,6 +73,15 @@ void statusScreenSettingsSaveFailed();
 void statusScreenButtonPrompt(core::ProvisionButtonPrompt prompt);
 
 /**
+ * Deferred network-work wait screen (worker builds only): a Configure or factory
+ * Erase gesture has been latched and the device is safely finishing/stopping the
+ * background ADS-B network work before touching the radio or storage. `erase`
+ * selects Erase vs. Configure wording. It never claims setup is open or that data
+ * has been erased -- only that network work is being wound down first.
+ */
+void statusScreenNetworkQuiescing(bool erase);
+
+/**
  * Factory erase result. The outcome aggregates every cleared subsystem; the
  * screen claims a clean wipe ONLY when core::factoryEraseAllCleared(outcome) is
  * true, otherwise it shows a truthful incomplete/failure warning so the user can

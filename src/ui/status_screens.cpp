@@ -328,6 +328,28 @@ void statusScreenEraseIncomplete() {
                 sizeof(lines) / sizeof(lines[0]));
 }
 
+void statusScreenNetworkQuiescing(bool erase) {
+  // Truthful wait screen: network work is being wound down BEFORE any radio/NVS
+  // change. Never claims setup is open or that anything has been erased yet.
+  if (erase) {
+    const TextLine lines[] = {
+        {"Please wait", 1.15f, &kPortalGfxTitle},
+        {"Stopping network", 1.05f, &kPortalGfxBody},
+        {"before erase...", 1.05f, &kPortalGfxBody},
+    };
+    drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
+                  sizeof(lines) / sizeof(lines[0]));
+    return;
+  }
+  const TextLine lines[] = {
+      {"Please wait", 1.15f, &kPortalGfxTitle},
+      {"Finishing network", 1.05f, &kPortalGfxBody},
+      {"before setup...", 1.05f, &kPortalGfxBody},
+  };
+  drawTextBlock(config::kColorYellow, config::kTextOnYellow, lines,
+                sizeof(lines) / sizeof(lines[0]));
+}
+
 void statusScreenSettingsSaveFailed() {
   const TextLine lines[] = {
       {"Wi-Fi saved", 1.12f, &kGfxTitle},

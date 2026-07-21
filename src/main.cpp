@@ -19,6 +19,7 @@
 #include "hardware/display.h"
 #include "services/adsb_client.h"
 #include "services/adsb_fetch.h"
+#include "services/adsb_worker.h"
 #include "services/radar_location.h"
 #include "services/settings_events.h"
 #include "services/timekeeper.h"
@@ -52,6 +53,12 @@ bool g_has_last_key = false;
 bool g_force_redraw = false;
 bool g_link_up = false;
 bool g_owns_display = false;
+
+#if PLANE_RADAR_ADSB_WORKER
+// Worker-only latch: an internal worker fault (impossible-state) halts all ADS-B
+// dispatch. Compiled only into the worker firmware.
+bool g_worker_faulted = false;
+#endif
 
 // --- rendering ---------------------------------------------------------------
 
@@ -146,41 +153,17 @@ const char* publishName(services::adsb::PublishResult result) {
   return "none";
 }
 
-// Perform one completion-relative ADS-B poll when connected and due. Captures the
-// query atomically, fetches a revision-bound candidate, re-consumes settings that
-// changed during the blocking I/O, and publishes only against the still-current
-// revision.
-void serviceAdsb() {
-  // Defense in depth: hold the (possibly immediate) fetch latch pending until
-  // trusted UTC is established this boot. adsbFetchAllowed() does NOT mutate poll
-  // state, so a pending immediate-fetch survives untrusted time and fires on the
-  // first loop after trust. ADS-B connections are forbidden before trusted UTC.
-  if (!core::adsbFetchAllowed(core::adsbFetchDue(g_poll, millis()),
-                              services::timekeeper::trusted())) {
-    return;
-  }
-
-  // Consume pending settings first so the capture below reflects the newest query.
-  applyPendingSettings(millis());
-
-  // Atomically capture the query parameters and the revision they belong to.
-  const double lat = services::location::lat();
-  const double lon = services::location::lon();
-  const float fetch_km = ui::radar::fetchRadiusKm();
-  const uint32_t query_revision = services::settings::revision();
-
-  // Snapshot the Wi-Fi disconnect sequence before the (blocking) fetch so a
-  // drop that occurs entirely inside uninterruptible DNS/TCP/TLS is observable
-  // afterward even if the stack auto-reconnected in the meantime.
-  const uint32_t disconnect_seq_before = wifiDisconnectSeq();
-
-  core::adsbFetchStarted(&g_poll);
-  const services::adsb::CandidateResult candidate =
-      services::adsb::fetchCandidate(lat, lon, fetch_km, query_revision);
-
-  // Before publication, run the controllable-latency side effects and re-consume
-  // settings so a range tap or portal save during the blocking fetch is visible.
-  wifiLoop();
+// Shared ADS-B completion: consume any settings/range change that landed during
+// the fetch, then run the revision gate, authenticated cert-floor ratchet,
+// publish classification, Wi-Fi-level + disconnect-flap handling, completion-
+// relative backoff, payload-free logging, freshness success, and redraw. Used
+// identically by the synchronous fetch and the async worker result so both share
+// one behavior. `disconnect_seq_before` is the connectivity epoch captured at
+// dispatch (echoed back on the worker result).
+void finishAdsbFetch(const services::adsb::CandidateResult& candidate,
+                     uint32_t disconnect_seq_before) {
+  // Re-consume a range tap or portal save that landed during the fetch so the
+  // revision gate below reflects the newest query.
   if (wifiConsumeRangeTap()) {
     onRangeTap();
   }
@@ -256,6 +239,155 @@ void serviceAdsb() {
   g_force_redraw = true;  // fetch completion / publication is a render trigger
 }
 
+// Synchronous ADS-B poll (default firmware, and the worker build's fallback when
+// static task creation failed). Captures the query atomically, performs the
+// blocking fetch on the main task, pumps the controllable-latency side effects,
+// then runs the shared completion.
+void serviceAdsbSync() {
+  // Defense in depth: hold the (possibly immediate) fetch latch pending until
+  // trusted UTC is established this boot. adsbFetchAllowed() does NOT mutate poll
+  // state, so a pending immediate-fetch survives untrusted time and fires on the
+  // first loop after trust. ADS-B connections are forbidden before trusted UTC.
+  if (!core::adsbFetchAllowed(core::adsbFetchDue(g_poll, millis()),
+                              services::timekeeper::trusted())) {
+    return;
+  }
+
+  // Consume pending settings first so the capture below reflects the newest query.
+  applyPendingSettings(millis());
+
+  // Atomically capture the query parameters and the revision they belong to.
+  const double lat = services::location::lat();
+  const double lon = services::location::lon();
+  const float fetch_km = ui::radar::fetchRadiusKm();
+  const uint32_t query_revision = services::settings::revision();
+
+  // Snapshot the Wi-Fi disconnect sequence before the (blocking) fetch so a drop
+  // that occurs entirely inside uninterruptible DNS/TCP/TLS is observable
+  // afterward even if the stack auto-reconnected in the meantime.
+  const uint32_t disconnect_seq_before = wifiDisconnectSeq();
+
+  core::adsbFetchStarted(&g_poll);
+  const services::adsb::CandidateResult candidate =
+      services::adsb::fetchCandidate(lat, lon, fetch_km, query_revision);
+
+  // Before publication, run the controllable-latency side effects (the main task
+  // was blocked in the fetch) so a range tap or portal save is visible.
+  wifiLoop();
+  finishAdsbFetch(candidate, disconnect_seq_before);
+}
+
+#if PLANE_RADAR_ADSB_WORKER
+// Single fail-closed reaction to any observed worker fault: a Faulted dispatch, a
+// Faulted result, or a result-LESS fault seen on an empty queue (claim reject,
+// complete reject, or result-queue send failure -- adapter paths that fault the
+// coordinator WITHOUT enqueuing a result). Clear any accepted in-flight poll
+// WITHOUT a normal outcome (safe no-op if none), halt further dispatch, log once,
+// and force a redraw. Never a completion; never a switch to synchronous while the
+// long-lived task exists. Reused by every fault site so unwind/logging cannot
+// diverge.
+void handleWorkerFault() {
+  core::adsbFetchAbortedForPause(&g_poll);
+  if (!g_worker_faulted) {
+    g_worker_faulted = true;
+    Serial.println("adsb: worker faulted; halting worker fetches");
+  }
+  g_force_redraw = true;
+}
+
+// Asynchronous ADS-B dispatch (worker firmware). Non-blocking: it captures the
+// immutable query and hands it to the worker, then returns. The result is
+// consumed later by pumpWorkerResult(). Exactly one adsbFetchStarted() is
+// recorded, and only for an Accepted dispatch; Rejected (busy/paused) and Faulted
+// never advance poll state. A worker fault halts dispatch and never falls back to
+// synchronous fetching while the long-lived task exists.
+void serviceAdsbAsync() {
+  if (g_worker_faulted) {
+    return;
+  }
+  if (g_poll.fetch_in_flight) {
+    return;  // a dispatch is outstanding; wait for its result before another
+  }
+  if (!core::adsbFetchAllowed(core::adsbFetchDue(g_poll, millis()),
+                              services::timekeeper::trusted())) {
+    return;
+  }
+  applyPendingSettings(millis());
+
+  services::adsb::WorkerQuery query;
+  query.lat = services::location::lat();
+  query.lon = services::location::lon();
+  query.radius_km = ui::radar::fetchRadiusKm();
+  query.settings_revision = services::settings::revision();
+  query.connectivity_epoch = wifiDisconnectSeq();
+
+  const services::adsb::WorkerDispatchResult dispatched =
+      services::adsb::workerDispatch(query);
+  switch (dispatched.status) {
+    case services::adsb::WorkerDispatchStatus::Accepted:
+      core::adsbFetchStarted(&g_poll);  // exactly once, only for Accepted
+      break;
+    case services::adsb::WorkerDispatchStatus::Rejected:
+      break;  // busy/paused: non-blocking, no duplicate fetch, no poll advance
+    case services::adsb::WorkerDispatchStatus::Faulted:
+      handleWorkerFault();  // halt dispatch; never switch to synchronous
+      break;
+  }
+}
+
+// Drain at most one worker result (worker firmware). Non-blocking. Main ALONE
+// publishes/discards the candidate here. Called before/after the top-level
+// wifiLoop() and while a status screen owns the panel so a deferred Configure/
+// Erase can drive the worker to Paused.
+void pumpWorkerResult() {
+  services::adsb::WorkerResult result;
+  if (!services::adsb::workerTakeResult(&result)) {
+    // Empty queue. Some adapter fault paths (claim reject, complete reject,
+    // result-queue send failure) fault the coordinator WITHOUT enqueuing a
+    // result, so a result-less fault must still be observed here rather than
+    // silently wedging an accepted in-flight poll. The pure classifier keeps this
+    // decision native-testable.
+    if (services::adsb::workerPollActionForNoResult(
+            services::adsb::workerFaulted()) ==
+        services::adsb::WorkerPollAction::FaultHalt) {
+      handleWorkerFault();
+    }
+    return;
+  }
+  switch (services::adsb::workerPollActionFor(result.status)) {
+    case services::adsb::WorkerPollAction::Publish:
+      // Publish via the shared completion, using the connectivity epoch captured
+      // at dispatch (echoed back on the result) for flap detection.
+      finishAdsbFetch(result.candidate, result.connectivity_epoch);
+      break;
+    case services::adsb::WorkerPollAction::DiscardAndAbort:
+      // Cancelled for a pause: discard (idempotent) and unwind the in-flight poll
+      // WITHOUT recording a completion, retaining backoff/immediate state. Never
+      // publish or ratchet time/NVS on this path, even after a late-cancelled OK.
+      services::adsb::discardCandidate(result.candidate.handle);
+      core::adsbFetchAbortedForPause(&g_poll);
+      g_force_redraw = true;
+      break;
+    case services::adsb::WorkerPollAction::FaultHalt:
+      // Impossible-state fault surfaced on the take path: the same fail-closed
+      // unwind as a result-less fault (candidate already discarded by the adapter).
+      handleWorkerFault();
+      break;
+    case services::adsb::WorkerPollAction::Ignore:
+      break;
+  }
+}
+
+// Main-owned network-work hooks: the Wi-Fi controller calls these (all on the main
+// task, non-blocking) to defer Configure/Erase until the worker is quiesced. The
+// quiesced hook is a pure query -- main resolves any pending result in
+// pumpWorkerResult() before the controller evaluates it (pumped before wifiLoop
+// and while owning the panel), so worker Paused implies ownership fully resolved.
+void adsbWorkerPauseHook(void*) { services::adsb::workerRequestPause(); }
+bool adsbWorkerQuiescedHook(void*) { return services::adsb::workerQuiesced(); }
+void adsbWorkerResumeHook(void*) { services::adsb::workerResume(); }
+#endif  // PLANE_RADAR_ADSB_WORKER
+
 }  // namespace
 
 void setup() {
@@ -272,6 +404,23 @@ void setup() {
   services::location::init();
   ui::radar::rangeInit();
   services::adsb::setPollFn(wifiLoop);
+#if PLANE_RADAR_ADSB_WORKER
+  // The single framebuffer is already allocated (radarDisplayPrepareFrame above).
+  // Start the long-lived static worker and register the network-work hooks BEFORE
+  // wifiBootConnect() so first-boot / open-session pause actions are honored. If
+  // static task creation fails, retain the synchronous path: no hooks are
+  // registered and the loop falls back on serviceAdsbSync() because
+  // workerStarted() stays false (sync never runs concurrently with a started or
+  // faulted worker).
+  if (services::adsb::workerBegin()) {
+    const WifiNetworkWorkHooks hooks{&adsbWorkerPauseHook,
+                                     &adsbWorkerQuiescedHook,
+                                     &adsbWorkerResumeHook, nullptr};
+    wifiSetNetworkWorkHooks(hooks);
+  } else {
+    Serial.println("adsb: static worker start failed; using synchronous path");
+  }
+#endif
   // Seed the trusted-time service (reads/validates the persisted floor, registers
   // the SNTP callback). Starts UNTRUSTED; ADS-B is gated until a fresh sample.
   services::timekeeper::init();
@@ -303,9 +452,22 @@ void setup() {
 }
 
 void loop() {
+  // Worker firmware: pump results BEFORE the top-level wifiLoop so a pending
+  // Quiesced result is taken + discarded (worker -> Paused) before the controller
+  // evaluates a deferred Configure/Erase in this same iteration.
+#if PLANE_RADAR_ADSB_WORKER
+  pumpWorkerResult();
+#endif
+
   // The controller owns the whole Wi-Fi lifecycle: boot connect, the secure setup
   // portal, the credential transaction, background reconnects, and the button.
   wifiLoop();
+
+  // ... and AFTER the top-level wifiLoop, so a result that arrived during it is
+  // resolved promptly.
+#if PLANE_RADAR_ADSB_WORKER
+  pumpWorkerResult();
+#endif
 
   const uint32_t now_ms = millis();
   const bool owns = wifiOwnsDisplay();
@@ -318,9 +480,13 @@ void loop() {
   applyPendingSettings(now_ms);
 
   if (owns) {
-    // Provisioning / boot-connect / gesture prompts own the panel: skip ADS-B and
-    // the radar redraw so status screens are not overdrawn. Keep the link edge in
-    // sync so releasing ownership does not fabricate a reconnect edge.
+    // Provisioning / boot-connect / gesture prompts / a pending network-work wait
+    // own the panel: skip ADS-B and the radar redraw so status screens are not
+    // overdrawn. Keep pumping worker results so a deferred Configure/Erase can
+    // still drive the worker to Paused while a status screen is up.
+#if PLANE_RADAR_ADSB_WORKER
+    pumpWorkerResult();
+#endif
     g_link_up = wifiLinkUp();
     g_owns_display = true;
     delay(10);
@@ -352,14 +518,29 @@ void loop() {
   }
 
   if (up) {
-    serviceAdsb();  // fetch when due; internally pumps wifiLoop (may take the panel)
+#if PLANE_RADAR_ADSB_WORKER
+    if (services::adsb::workerStarted()) {
+      serviceAdsbAsync();  // dispatch when due; result pumped elsewhere
+    } else {
+      serviceAdsbSync();  // worker creation failed: safe synchronous fallback
+    }
+#else
+    serviceAdsbSync();  // fetch when due; internally pumps wifiLoop
+#endif
   }
 
-  // serviceAdsb()'s internal wifiLoop() (the ADS-B poll hook) can acquire the
-  // panel mid-fetch (e.g. a configure gesture opening setup). Recheck ownership
-  // and skip the final radar render if it changed, so a status screen is never
-  // overdrawn; the next loop forces a redraw when ownership is released.
+  // Resolve any result the dispatch/fetch produced, then recheck ownership: the
+  // sync fallback's internal wifiLoop() (or a button gesture drained this loop)
+  // can acquire the panel (e.g. a configure gesture). Skip the final radar render
+  // if it changed so a status screen is never overdrawn; the next loop forces a
+  // redraw when ownership is released.
+#if PLANE_RADAR_ADSB_WORKER
+  pumpWorkerResult();
+#endif
   if (wifiOwnsDisplay()) {
+#if PLANE_RADAR_ADSB_WORKER
+    pumpWorkerResult();
+#endif
     g_link_up = wifiLinkUp();
     g_owns_display = true;
     delay(10);

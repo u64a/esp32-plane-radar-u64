@@ -134,6 +134,49 @@ void test_null_state_is_safe() {
                         IN(core::consumeIntent(nullptr, true)));
 }
 
+void test_configure_superseded_by_erase_while_waiting_releases_only_erase() {
+  // Mirrors the worker deferral handshake: Configure is latched, the worker is
+  // not yet quiesced across several wifiLoop ticks, then Erase is confirmed and
+  // supersedes. Once quiescence is proven, ONLY Erase releases -- Configure's
+  // credential snapshot is never taken.
+  NetworkWorkIntentState s = fresh();
+  core::requestConfigure(&s);
+  for (int i = 0; i < 3; ++i) {
+    TEST_ASSERT_EQUAL_INT(IN(NetworkWorkIntent::None),
+                          IN(core::consumeIntent(&s, false)));  // still winding down
+    TEST_ASSERT_EQUAL_INT(IN(NetworkWorkIntent::Configure),
+                          IN(core::pendingIntent(s)));
+  }
+  core::requestErase(&s);  // supersede while still waiting
+  TEST_ASSERT_EQUAL_INT(IN(NetworkWorkIntent::Erase), IN(core::pendingIntent(s)));
+  TEST_ASSERT_EQUAL_INT(IN(NetworkWorkIntent::None),
+                        IN(core::consumeIntent(&s, false)));  // still not quiesced
+  TEST_ASSERT_EQUAL_INT(IN(NetworkWorkIntent::Erase),
+                        IN(core::consumeIntent(&s, true)));  // quiesced -> Erase
+  TEST_ASSERT_EQUAL_INT(IN(NetworkWorkIntent::None),
+                        IN(core::consumeIntent(&s, true)));  // one-shot
+}
+
+void test_repeated_wait_ticks_never_release_until_quiescence() {
+  // Many not-quiesced ticks (repeated wifiLoop passes while the worker is still
+  // Running/ResultReady) must NEVER release; exactly the first quiesced tick does.
+  NetworkWorkIntentState s = fresh();
+  core::requestErase(&s);
+  int releases = 0;
+  for (int i = 0; i < 10; ++i) {
+    releases += (core::consumeIntent(&s, false) != NetworkWorkIntent::None) ? 1 : 0;
+  }
+  TEST_ASSERT_EQUAL_INT(0, releases);
+  TEST_ASSERT_EQUAL_INT(IN(NetworkWorkIntent::Erase), IN(core::pendingIntent(s)));
+
+  int quiesced_releases = 0;
+  for (int i = 0; i < 5; ++i) {
+    quiesced_releases +=
+        (core::consumeIntent(&s, true) != NetworkWorkIntent::None) ? 1 : 0;
+  }
+  TEST_ASSERT_EQUAL_INT(1, quiesced_releases);  // one-shot on the first quiesced tick
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_init_is_none);
@@ -143,6 +186,8 @@ int main(int, char**) {
   RUN_TEST(test_erase_supersedes_configure);
   RUN_TEST(test_configure_never_downgrades_erase_even_after_many_requests);
   RUN_TEST(test_consumption_is_one_shot_then_a_new_request_latches_again);
+  RUN_TEST(test_configure_superseded_by_erase_while_waiting_releases_only_erase);
+  RUN_TEST(test_repeated_wait_ticks_never_release_until_quiescence);
   RUN_TEST(test_null_state_is_safe);
   return UNITY_END();
 }

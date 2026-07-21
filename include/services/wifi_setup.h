@@ -50,3 +50,25 @@ bool wifiConsumeRangeTap();
 // flap detection). Written only from the Arduino event task, read lock-free from
 // the main loop. Survives auto-reconnect; wraps at 2^32.
 uint32_t wifiDisconnectSeq();
+
+// Main-owned hooks that let the Wi-Fi controller defer radio/NVS mutations
+// (Configure re-open, factory Erase) until the OPTIONAL ADS-B network worker is
+// provably quiesced, WITHOUT this header depending on FreeRTOS or the worker.
+// Fixed function pointers + one context keep the coupling Arduino-free. All three
+// callbacks run on the main task and MUST be non-blocking:
+//   * request_pause -- idempotently ask the worker to pause (cooperative).
+//   * quiesced      -- true ONLY when the worker is provably Paused AND every
+//                      taken result/candidate has been resolved by main.
+//   * resume        -- return a paused worker to service.
+// The default (no hooks registered) keeps the immediate, worker-free Configure/
+// Erase behavior: quiescence is treated as trivially true.
+struct WifiNetworkWorkHooks {
+  void (*request_pause)(void* ctx);
+  bool (*quiesced)(void* ctx);
+  void (*resume)(void* ctx);
+  void* ctx;
+};
+
+// Register the network-work hooks (copied by value). Only the worker-enabled
+// build calls this; in the default build it is an inert no-op.
+void wifiSetNetworkWorkHooks(const WifiNetworkWorkHooks& hooks);
