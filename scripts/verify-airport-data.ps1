@@ -12,15 +12,20 @@ param(
 #              --runways-csv <csv> --check
 #
 # Invariants proved from source alone (20 total):
-#   1.  Pinned commit URL; no /main/ in URL constants.
-#   2.  SHA-256 format and expected values (lowercase hex 64 chars).
-#   3.  Byte lengths: airports=12651071, runways=3951490.
-#   4.  Hash-before-parse: sha256 verified before decode in both fetch/read functions.
+#   1.  Exact pinned _COMMIT/_BASE_URL/AIRPORTS_URL/RUNWAYS_URL/LICENSE_URL
+#       assignments; pinned commit URL composition; no /main/ in URL constants.
+#   2.  SHA-256 captured from the generator's own assignments, validated as
+#       lowercase hex 64 chars, and required to equal the pinned values.
+#   3.  Exact AIRPORTS_LENGTH/RUNWAYS_LENGTH assignments: airports=12651071,
+#       runways=3951490.
+#   4.  Hash-before-parse: each verifier compares length to expected_length AND
+#       computed SHA-256 to expected_sha256 before returning raw bytes.
 #   5.  Identity encoding: Accept-Encoding: identity set in fetch.
 #   6.  Exact-LF check/write: check mode compares read_bytes directly to rendered
 #       UTF-8 LF bytes; files are written via write_bytes(encode('utf-8')).
 #   7.  Paired local arguments: both or neither local CSV flags.
-#   8.  Check mode: --check renders without modifying files.
+#   8.  Check mode: --check renders without modifying files; the
+#       'def check_mode ... return' body MUST be locatable (FAIL otherwise).
 #   9.  Stable provenance in .h: commit/SHA-256/lengths/blobs/license/filter ver.
 #  10.  Stable provenance in .cpp: same provenance block.
 #  11.  .gitattributes LF rules for both generated files.
@@ -115,10 +120,24 @@ function Invoke-LiveGate {
   $pyCodeLines = ($pyText -split "`n") | Where-Object { $_ -notmatch '^\s*#' }
   $pyCodeText  = $pyCodeLines -join "`n"
 
-  # 1. Pinned commit constant (_COMMIT = "...") and no /main/ in URL string constants
-  $commitAssignRx = [regex]('"' + [regex]::Escape($COMMIT) + '"')
-  if (-not $commitAssignRx.IsMatch($pyCodeText)) {
-    Fail "Generator _COMMIT constant is not set to the pinned commit $COMMIT"
+  # 1. Exact pinned constants and pinned URL composition. A changed live URL must
+  #    fail even if the old pinned commit string still appears elsewhere.
+  if ($pyCodeText -notmatch ('(?m)^\s*_COMMIT\s*=\s*"' + [regex]::Escape($COMMIT) + '"\s*$')) {
+    Fail "Generator _COMMIT must be exactly _COMMIT = `"$COMMIT`""
+  }
+  $baseUrlRx = [regex]('(?s)_BASE_URL\s*=\s*\(\s*"https://raw\.githubusercontent\.com/davidmegginson/ourairports-data/"\s*\+\s*_COMMIT\s*\)')
+  if (-not $baseUrlRx.IsMatch($pyCodeText)) {
+    Fail "Generator _BASE_URL must be composed from the pinned raw.githubusercontent base + _COMMIT"
+  }
+  foreach ($u in @(
+    @{ Name = "AIRPORTS_URL"; Suffix = "/airports.csv" },
+    @{ Name = "RUNWAYS_URL";  Suffix = "/runways.csv" },
+    @{ Name = "LICENSE_URL";  Suffix = "/LICENSE" }
+  )) {
+    $urlAssignRx = [regex]('(?m)^\s*' + $u.Name + '\s*=\s*_BASE_URL\s*\+\s*"' + [regex]::Escape($u.Suffix) + '"\s*$')
+    if (-not $urlAssignRx.IsMatch($pyCodeText)) {
+      Fail ("Generator " + $u.Name + " must be exactly _BASE_URL + `"" + $u.Suffix + "`"")
+    }
   }
   # Check only non-comment non-docstring lines for /main/: lines between triple-quotes are excluded
   $inDocStr = $false
@@ -131,7 +150,6 @@ function Invoke-LiveGate {
     if ($inDocStr -or $isComment) { continue }
     $line
   }
-  $pyCodeOnlyText = $pyCodeOnlyLines -join "`n"
   # URL string constants in actual code must not use /main/
   foreach ($line in ($pyCodeOnlyLines | Where-Object { $_ -match '"' -or $_ -match "'" })) {
     if ($line -match [regex]::Escape("/main/")) {
@@ -139,38 +157,63 @@ function Invoke-LiveGate {
     }
   }
 
-  # 2. SHA-256 format and expected values
-  if ($pyCodeText -notmatch [regex]::Escape($AIRPORTS_SHA256)) {
-    Fail "Generator missing expected airports.csv SHA-256 $AIRPORTS_SHA256"
+  # 2. SHA-256: capture the ACTUAL values assigned in the generator, validate the
+  #    lowercase-64-hex format of the CAPTURED value (not just the hardcoded
+  #    PowerShell expectation), and require the pinned value.
+  foreach ($s in @(
+    @{ Name = "AIRPORTS_SHA256"; Expected = $AIRPORTS_SHA256 },
+    @{ Name = "RUNWAYS_SHA256";  Expected = $RUNWAYS_SHA256 }
+  )) {
+    $shaAssignRx = [regex]('(?m)^\s*' + $s.Name + '\s*=\s*"([^"]*)"\s*$')
+    $shaMatch = $shaAssignRx.Match($pyCodeText)
+    if (-not $shaMatch.Success) {
+      Fail ("Generator " + $s.Name + " string assignment not found")
+    }
+    $captured = $shaMatch.Groups[1].Value
+    if ($captured -cnotmatch '^[0-9a-f]{64}$') {
+      Fail ("Generator " + $s.Name + " value '" + $captured + "' is not lowercase 64-hex")
+    }
+    if ($captured -cne $s.Expected) {
+      Fail ("Generator " + $s.Name + " ('" + $captured + "') != pinned " + $s.Expected)
+    }
   }
-  if ($pyCodeText -notmatch [regex]::Escape($RUNWAYS_SHA256)) {
-    Fail "Generator missing expected runways.csv SHA-256 $RUNWAYS_SHA256"
+
+  # 3. Byte lengths: exact constant assignments (underscore separators optional).
+  if ($pyCodeText -notmatch '(?m)^\s*AIRPORTS_LENGTH\s*=\s*12_?651_?071\s*$') {
+    Fail "Generator AIRPORTS_LENGTH must be exactly 12_651_071"
   }
-  $shaRx = [regex]"^[0-9a-f]{64}$"
-  if (-not $shaRx.IsMatch($AIRPORTS_SHA256)) { Fail "airports SHA-256 not valid lowercase hex" }
-  if (-not $shaRx.IsMatch($RUNWAYS_SHA256))  { Fail "runways SHA-256 not valid lowercase hex" }
+  if ($pyCodeText -notmatch '(?m)^\s*RUNWAYS_LENGTH\s*=\s*3_?951_?490\s*$') {
+    Fail "Generator RUNWAYS_LENGTH must be exactly 3_951_490"
+  }
 
-  # 3. Byte lengths (Python uses underscore separators in integer literals)
-  if ($pyCodeText -notmatch "12[_]?651[_]?071") { Fail "Generator missing expected airports.csv length 12651071" }
-  if ($pyCodeText -notmatch "3[_]?951[_]?490")  { Fail "Generator missing expected runways.csv length 3951490" }
-
-  # 4. Hash-before-parse: _fetch_verified verifies SHA-256 and length before
+  # 4. Hash-before-parse: each verifier compares the byte length to
+  #    expected_length AND the computed SHA-256 to expected_sha256 before
   #    returning raw bytes; decode/CSV parsing happens only in _parse_csv after.
   if ($pyCodeText -notmatch "_read_local_verified" -or $pyCodeText -notmatch "_fetch_verified") {
     Fail "Generator missing _fetch_verified/_read_local_verified functions"
   }
   foreach ($functionName in @("_fetch_verified", "_read_local_verified")) {
-    $verifyFuncRx = [regex]("(?s)def " + [regex]::Escape($functionName) + ".*?return data")
+    $verifyFuncRx = [regex]("(?s)def " + [regex]::Escape($functionName) + "\b.*?return data")
     $verifyMatch = $verifyFuncRx.Match($pyText)
     if (-not $verifyMatch.Success) { Fail "Could not locate $functionName body" }
     $verifyBody = $verifyMatch.Value
     $verifyCode = (($verifyBody -split "`n") | ForEach-Object {
       $_ -replace '\s+#.*$', ''
     }) -join "`n"
-    $hashIndex = $verifyCode.IndexOf("hashlib.sha256")
     $returnIndex = $verifyCode.LastIndexOf("return data")
+    # Length comparison against expected_length, before returning raw bytes.
+    $lenMatch = [regex]::Match($verifyCode, '!=\s*expected_length')
+    if (-not $lenMatch.Success -or $lenMatch.Index -gt $returnIndex) {
+      Fail "$functionName must compare the byte length to expected_length before returning raw bytes"
+    }
+    # Computed SHA-256 present AND compared to expected_sha256, before returning.
+    $hashIndex = $verifyCode.IndexOf("hashlib.sha256")
     if ($hashIndex -lt 0 -or $hashIndex -gt $returnIndex) {
-      Fail "$functionName must verify hashlib.sha256 before returning raw bytes"
+      Fail "$functionName must compute hashlib.sha256 before returning raw bytes"
+    }
+    $shaCmpMatch = [regex]::Match($verifyCode, '!=\s*expected_sha256')
+    if (-not $shaCmpMatch.Success -or $shaCmpMatch.Index -gt $returnIndex) {
+      Fail "$functionName must compare the computed SHA-256 to expected_sha256 before returning raw bytes"
     }
     # Decode/CSV parsing must not occur in a verifier; it returns raw bytes.
     if ($verifyCode -match [regex]::Escape("decode(") -or $verifyCode -match "csv.DictReader") {
@@ -213,20 +256,21 @@ function Invoke-LiveGate {
   if ($pyCodeText -notmatch [regex]::Escape("check_mode")) {
     Fail "Generator is missing check_mode function"
   }
-  $checkModeRx = [regex]"(?s)def check_mode.*?return \d"
+  $checkModeRx = [regex]"(?s)def check_mode\b.*?return \d"
   $checkMatch = $checkModeRx.Match($pyText)
-  if ($checkMatch.Success) {
-    $checkBody = $checkMatch.Value
-    if ($checkBody -match "write_bytes" -or $checkBody -match "write_text") {
-      Fail "check_mode must not write files"
-    }
-    if ($checkBody -notmatch '(?m)^\s*on_disk\s*=\s*path\.read_bytes\(\)\s*$') {
-      Fail "check_mode must compare path.read_bytes() directly to rendered bytes"
-    }
-    if ($checkBody -match 'path\.read_bytes\(\)\s*\.' -or
-        $checkBody -match [regex]::Escape(".replace(b")) {
-      Fail "check_mode must not normalize CRLF or otherwise transform on-disk bytes"
-    }
+  if (-not $checkMatch.Success) {
+    Fail "Could not locate the 'def check_mode ... return <int>' body; body checks cannot be silently skipped"
+  }
+  $checkBody = $checkMatch.Value
+  if ($checkBody -match "write_bytes" -or $checkBody -match "write_text") {
+    Fail "check_mode must not write files"
+  }
+  if ($checkBody -notmatch '(?m)^\s*on_disk\s*=\s*path\.read_bytes\(\)\s*$') {
+    Fail "check_mode must compare path.read_bytes() directly to rendered bytes"
+  }
+  if ($checkBody -match 'path\.read_bytes\(\)\s*\.' -or
+      $checkBody -match [regex]::Escape(".replace(b")) {
+    Fail "check_mode must not normalize CRLF or otherwise transform on-disk bytes"
   }
 
   # 9. Stable provenance in .h
@@ -501,8 +545,30 @@ function Invoke-SelfTest {
       ($firstEndpointLine -replace '^\s*\{(\d+),\s*-?\d+', '  {$1, 900000001')
     Expect-Fail "out-of-range runway endpoint" $pyOrig $hOrig $badCpp14 $attrOrig
 
+    # T15: a changed live URL path must fail even though the pinned commit string
+    # still appears elsewhere (base + _COMMIT are unchanged; only the suffix moved).
+    $badPy15 = $pyOrig -replace [regex]::Escape('AIRPORTS_URL = _BASE_URL + "/airports.csv"'),
+      'AIRPORTS_URL = _BASE_URL + "/data/airports.csv"'
+    Expect-Fail "changed live airports URL path" $badPy15 $hOrig $cppOrig $attrOrig
+
+    # T16: the CAPTURED generator SHA must be lowercase 64-hex -- an uppercase
+    # 64-char value (right length, wrong case) is rejected on format.
+    $badPy16 = $pyOrig -replace "092223c8d6a1cf60c13d450e61a91438cc80c5fd50f92f52f49a38826e04a354",
+      "092223C8D6A1CF60C13D450E61A91438CC80C5FD50F92F52F49A38826E04A354"
+    Expect-Fail "uppercase (non-lowercase-hex) generator SHA" $badPy16 $hOrig $cppOrig $attrOrig
+
+    # T17: a verifier that computes hashlib.sha256 but no longer COMPARES it to
+    # expected_sha256 must fail (occurrence of hashlib.sha256 is insufficient).
+    $badPy17 = $pyOrig -replace [regex]::Escape("actual_sha != expected_sha256"), "actual_sha != actual_sha"
+    Expect-Fail "verifier SHA comparison bypass" $badPy17 $hOrig $cppOrig $attrOrig
+
+    # T18: if the check_mode body cannot be located the gate must FAIL (never
+    # silently skip its body checks).
+    $badPy18 = $pyOrig -replace [regex]::Escape("def check_mode("), "def check_mode_renamed("
+    Expect-Fail "check_mode body not locatable" $badPy18 $hOrig $cppOrig $attrOrig
+
     Write-Host ""
-    Write-Host "OK: all 14 self-test tamper cases correctly rejected."
+    Write-Host "OK: all 18 self-test tamper cases correctly rejected."
   } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
   }

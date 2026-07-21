@@ -7,10 +7,11 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 # Phase 11: run the airport-data offline gate fail-fast before any PlatformIO tests.
 Write-Host "--- verify-airport-data gate ---"
 $airportGate = Join-Path $PSScriptRoot "verify-airport-data.ps1"
+# The gate runs under $ErrorActionPreference = "Stop" and THROWS on any violation,
+# which propagates and aborts this script. Do not inspect $LASTEXITCODE afterward:
+# a successful PowerShell script does not reset a previous native exit code, so a
+# stale value would be unsafe. Rely on the thrown exception instead.
 & $airportGate -ProjectRoot $projectRoot
-if ($LASTEXITCODE -ne 0) {
-  throw "verify-airport-data gate failed with exit code $LASTEXITCODE"
-}
 Write-Host ""
 
 $toolchainVersion = "2.8.0"

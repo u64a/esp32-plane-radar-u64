@@ -870,7 +870,13 @@ The firmware sends the following data to external parties at runtime:
 
 **Local network note:** Normal Wi-Fi and DHCP link-layer operation exposes the device MAC address to the **local network** (access point and devices on the same LAN segment). This is standard 802.11 behavior and is not specific to this firmware.
 
-The ADS-B provider and DNS/SNTP resolver can observe the device's source address (including a **public IP address** after NAT where applicable) and the query parameters (lat/lon + radius). The lat/lon values are formatted/rounded to six decimal places and the radius to 0.1 NM; this formatting is **not** a privacy-preserving precision reduction and is not necessarily the same precision as the configured values.
+The ADS-B provider and DNS/SNTP services can observe the device's source address (including a **public IP address** after NAT where applicable), but each party observes only what its own protocol carries:
+
+- The **ADS-B provider** (`opendata.adsb.fi`) sees the source address plus the lat/lon and radius request path (the `%.6f`/`%.1f` values in the HTTPS URL). It does **not** perform the DNS or SNTP exchanges.
+- The **DNS resolver** sees the source address plus the queried hostnames (`opendata.adsb.fi`, `time.cloudflare.com`). Because the ADS-B request travels over HTTPS, the DNS resolver does **not** see the HTTPS URL path or the lat/lon/radius query parameters.
+- The **SNTP service** (`time.cloudflare.com`) sees the source address plus the standard NTP time exchange. It does **not** see any HTTPS URL path or query parameters.
+
+The lat/lon values are formatted/rounded to six decimal places and the radius to 0.1 NM; this formatting is **not** a privacy-preserving precision reduction and is not necessarily the same precision as the configured values.
 
 ### Portal network behavior
 
@@ -945,9 +951,9 @@ Renders in memory and compares exact LF bytes to checked-in files. Exits 0 if id
 
 ```powershell
 .\scripts\verify-airport-data.ps1              # Phase 11: OurAirports provenance gate (20 invariants)
-.\scripts\verify-airport-data.ps1 -SelfTest    # proves the gate rejects 14 tamper cases
+.\scripts\verify-airport-data.ps1 -SelfTest    # proves the gate rejects 18 tamper cases
 .\scripts\verify-egress-policy.ps1             # Phase 11: runtime egress source policy gate (12 invariants)
-.\scripts\verify-egress-policy.ps1 -SelfTest   # proves the gate rejects 16 tamper cases
+.\scripts\verify-egress-policy.ps1 -SelfTest   # proves the gate rejects 27 tamper cases
 ```
 
 The `scripts/native-test.ps1` script runs `verify-airport-data.ps1` fail-fast at its start before any PlatformIO tests.
@@ -970,7 +976,7 @@ New Phase 11 gate commands:
 
 ```powershell
 .\scripts\verify-airport-data.ps1              # 20 source invariants
-.\scripts\verify-airport-data.ps1 -SelfTest    # 14 tamper cases
+.\scripts\verify-airport-data.ps1 -SelfTest    # 18 tamper cases
 .\scripts\verify-egress-policy.ps1             # 12 source invariants
-.\scripts\verify-egress-policy.ps1 -SelfTest   # 16 tamper cases
+.\scripts\verify-egress-policy.ps1 -SelfTest   # 27 tamper cases
 ```

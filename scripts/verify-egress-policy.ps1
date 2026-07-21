@@ -26,25 +26,43 @@ param(
 #   2.  Empty fallback SNTP constants: kSntpServerFallback1="" and
 #       kSntpServerFallback2="" in config.h.
 #   3.  Approved DNS/TLS/HTTP Host chain: config host/port flow from the ADS-B
-#       call site through espTlsConnect, WiFi.hostByName(host, address), and
-#       client.connect(address, port, host, ca_bundle, ...) to HTTP Host.
-#   4.  configTime path uses config SNTP constants; empty fallbacks become
-#       nullptr; esp_sntp_servermode_dhcp(false) is present.
-#   5.  Exactly one production DNS and outbound client-connect path; no
-#       HTTPClient, WiFiUDP, raw outbound socket, alternate client, or direct
-#       numeric IP construction (the inbound portal remains allowed).
+#       call site through espTlsConnect; the actual std::snprintf(http_request,
+#       ...) statement is bounded and its final Host %s argument must be
+#       config::kAdsbHost; WiFi.hostByName(host,address) and
+#       client.connect(address,port,host,ca_bundle,...) are scoped to the actual
+#       espTlsConnect function body (executable checks run on a strings- and
+#       comments-blanked skeleton so string literals cannot satisfy them).
+#   4.  Full SNTP server chain as executable code: s1=kSntpServerPrimary,
+#       s2/s3 = kSntpServerFallbackN[0] != '\0' ? kSntpServerFallbackN : nullptr,
+#       configTime(0,0,s1,s2,s3). Alternate SNTP paths (configTzTime,
+#       sntp_setservername/esp_sntp_setservername) are banned; the time-sync
+#       notification callback stays allowed. esp_sntp_servermode_dhcp(false) set.
+#   5.  Exactly one production DNS and outbound client-connect executable path
+#       (counted on the blanked skeleton); no HTTPClient, WiFiUDP, raw outbound
+#       socket, alternate client (esp_http_client, esp_tls_conn*, getaddrinfo,
+#       dns_gethostbyname, tcp_connect, udp_connect, AsyncUDP, NetworkClient/
+#       NetworkUDP), or direct numeric IP construction (inbound portal allowed).
 #   6.  No mDNS, OTA, WiFiManager, or additional outbound client in
 #       production source.
 #   7.  No hardcoded external hostname, URL, or dotted-IP string literal other
-#       than the exact two approved hosts and local portal IP 192.168.4.1.
-#   8.  README precisely discloses query precision, local MAC exposure, no
-#       credentials/telemetry externally, DNS/DHCP, temporary portal, and the
-#       source-gate versus hardware-packet-capture limitation.
+#       than the exact two approved hosts and local portal IP 192.168.4.1 --
+#       scanned in src/ + include/ AND in endpoint-defining platformio.ini build
+#       flags (-D macros / URL / IP literals).
+#   8.  README precisely discloses query precision, the six-decimal/0.1-NM
+#       formatting being NOT a privacy-preserving reduction, per-party
+#       observability (ADS-B provider vs DNS resolver vs SNTP service), local MAC
+#       exposure, an explicit "does not send" credentials/telemetry negation,
+#       DNS/DHCP, the temporary portal, and the source-gate versus
+#       hardware-packet-capture limitation.
 #   9.  DHCP NTP disable: esp_sntp_servermode_dhcp(false) present.
-#  10.  No second configTime call in production source.
+#  10.  No second configTime call in production source (counted with
+#       \bconfigTime\s*\( so a spaced call cannot hide).
 #  11.  Egress checks cover production C/C++/Arduino source and headers
 #       (.c/.cc/.cpp/.cxx/.h/.hh/.hpp/.ino).
-#  12.  All constant/chain checks operate on comment-stripped code.
+#  12.  Executable call checks/counts operate on comments-and-strings-blanked
+#       skeletons; strings-preserved text is used only where literal contents
+#       (exact constants, the HTTP format string, host/URL/IP literals) are
+#       intentionally inspected.
 #
 # Compatible with Windows PowerShell 5.1 and PowerShell 7.
 # ===========================================================================
@@ -104,6 +122,8 @@ function Invoke-LiveGate {
   $configText = Read-Source $configH
   $configCode = Get-CodeSkeleton $configText
   $readmeText = Read-Source $readmeFile
+  $platformioFile = Join-Path $Root "platformio.ini"
+  $platformioText = Read-Source $platformioFile
 
   # Scan every production C/C++/Arduino implementation/header extension.
   $sourceExtensions = @(".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".ino")
@@ -120,18 +140,6 @@ function Invoke-LiveGate {
     $txt = Get-Content -Raw $f
     $combinedSkel += (Get-CodeSkeleton $txt -BlankStrings) + "`n"
   }
-  # Also a version with strings preserved (for Host/connect argument checks)
-  $combinedRaw = ""
-  foreach ($f in $prodFiles) {
-    $combinedRaw += (Get-Content -Raw $f) + "`n"
-  }
-  # Comments stripped, strings kept (for string content checks)
-  $combinedCommentStripped = ""
-  foreach ($f in $prodFiles) {
-    $txt = Get-Content -Raw $f
-    $combinedCommentStripped += (Get-CodeSkeleton $txt) + "`n"
-  }
-
   # -------------------------------------------------------------------------
   # 1. Exact approved host/port constants in config.h
   # -------------------------------------------------------------------------
@@ -158,24 +166,58 @@ function Invoke-LiveGate {
   # -------------------------------------------------------------------------
   # 3. DNS/TLS/HTTP Host derives from config::kAdsbHost
   # -------------------------------------------------------------------------
-  # The connect call in adsb_client.cpp must use config::kAdsbHost
+  # The connect call in adsb_client.cpp must use config::kAdsbHost.
   $adsbClientPath = Join-Path $srcDir "services\adsb_client.cpp"
   if (-not (Test-Path $adsbClientPath)) { Fail "adsb_client.cpp not found" }
-  $adsbClientCode = Get-CodeSkeleton (Get-Content -Raw $adsbClientPath)
-  if ($adsbClientCode -notmatch '(?s)espTlsConnect\s*\(\s*client\s*,\s*config::kAdsbHost\s*,\s*config::kAdsbPort\s*,') {
+  $adsbClientRaw  = Get-Content -Raw $adsbClientPath
+  # Strings-and-comments-blanked skeleton: executable call checks cannot be
+  # satisfied by string-literal contents.
+  $adsbClientSkel = Get-CodeSkeleton $adsbClientRaw -BlankStrings
+  # Comments-stripped, strings-preserved skeleton: used ONLY where the literal
+  # HTTP format string content ("Host: %s") is intentionally inspected.
+  $adsbClientCode = Get-CodeSkeleton $adsbClientRaw
+  if ($adsbClientSkel -notmatch '(?s)espTlsConnect\s*\(\s*client\s*,\s*config::kAdsbHost\s*,\s*config::kAdsbPort\s*,') {
     Fail "adsb_client.cpp must pass config::kAdsbHost/config::kAdsbPort to espTlsConnect"
   }
-  # The snprintf Host argument must be config::kAdsbHost, not a hardcoded string.
-  $hostPatRx = [regex]"(?s)Host:\s*%s.*?config::kAdsbHost"
-  if (-not $hostPatRx.IsMatch($adsbClientCode)) {
-    Fail "adsb_client.cpp: HTTP Host header must be derived from config::kAdsbHost"
+  # Extract and BOUND the actual std::snprintf(http_request, ...) statement so the
+  # Host %s argument check cannot span into the later espTlsConnect call's
+  # config::kAdsbHost. The final format argument (the Host: %s substitution) must
+  # be config::kAdsbHost; a hardcoded Host literal (blanked to spaces here since
+  # strings are preserved but their contents cannot satisfy a symbol match) fails.
+  $snprintfRx = [regex]'(?s)std::snprintf\s*\(\s*http_request\s*,.*?\)\s*;'
+  $snMatch = $snprintfRx.Match($adsbClientCode)
+  if (-not $snMatch.Success) {
+    Fail "adsb_client.cpp: could not locate the std::snprintf(http_request, ...) statement"
+  }
+  $snStmt = $snMatch.Value
+  if ($snStmt -notmatch '(?s)Host:\s*%s') {
+    Fail "adsb_client.cpp: HTTP request must carry a 'Host: %s' header"
+  }
+  if ($snStmt -notmatch '(?s),\s*config::kAdsbHost\s*\)\s*;\s*$') {
+    Fail "adsb_client.cpp: HTTP Host header argument must be config::kAdsbHost (final snprintf argument)"
   }
   $transportPath = Join-Path $srcDir "services\adsb_transport_esp.cpp"
   if (-not (Test-Path $transportPath)) { Fail "adsb_transport_esp.cpp not found" }
-  $transportCode = Get-CodeSkeleton (Get-Content -Raw $transportPath)
-  if ($transportCode -notmatch '(?s)WiFi\.hostByName\s*\(\s*host\s*,\s*address\s*\)' -or
-      $transportCode -notmatch '(?s)client\.connect\s*\(\s*address\s*,\s*port\s*,\s*host\s*,\s*ca_bundle\s*,') {
-    Fail "espTlsConnect must resolve supplied host and connect(address, port, host, ca_bundle, ...)"
+  $transportRaw  = Get-Content -Raw $transportPath
+  $transportSkel = Get-CodeSkeleton $transportRaw -BlankStrings
+  # Scope the resolver/connect chain to the actual espTlsConnect function body:
+  # slice from its signature to the next known function definition so text in
+  # another function, a string, or a comment cannot satisfy it.
+  $espFnRx = [regex]'(?s)ConnectOutcome\s+espTlsConnect\s*\([^)]*\)\s*\{'
+  $espFnMatch = $espFnRx.Match($transportSkel)
+  if (-not $espFnMatch.Success) {
+    Fail "adsb_transport_esp.cpp: could not locate espTlsConnect function body"
+  }
+  $espBodyStart = $espFnMatch.Index + $espFnMatch.Length
+  $nextFnRx = [regex]'(?m)^\w[\w:<>&\*\s]*\b(?:espVerifyPeerCertValidity|espSendAll)\s*\('
+  $nextFnMatch = $nextFnRx.Match($transportSkel, $espBodyStart)
+  $espBodyEnd = if ($nextFnMatch.Success) { $nextFnMatch.Index } else { $transportSkel.Length }
+  $espBody = $transportSkel.Substring($espBodyStart, $espBodyEnd - $espBodyStart)
+  if ($espBody -notmatch '(?s)WiFi\.hostByName\s*\(\s*host\s*,\s*address\s*\)') {
+    Fail "espTlsConnect must resolve the supplied host via WiFi.hostByName(host, address)"
+  }
+  if ($espBody -notmatch '(?s)client\.connect\s*\(\s*address\s*,\s*port\s*,\s*host\s*,\s*ca_bundle\s*,') {
+    Fail "espTlsConnect must connect(address, port, host, ca_bundle, ...) with the resolved address"
   }
 
   # -------------------------------------------------------------------------
@@ -184,29 +226,49 @@ function Invoke-LiveGate {
   # -------------------------------------------------------------------------
   $timekeeperPath = Join-Path $srcDir "services\timekeeper.cpp"
   if (-not (Test-Path $timekeeperPath)) { Fail "timekeeper.cpp not found" }
-  $timekeeperText = Get-CodeSkeleton (Get-Content -Raw $timekeeperPath)
-  if ($timekeeperText -notmatch [regex]::Escape("config::kSntpServerPrimary")) {
-    Fail "timekeeper.cpp must use config::kSntpServerPrimary"
+  $timekeeperRaw  = Get-Content -Raw $timekeeperPath
+  $timekeeperText = Get-CodeSkeleton $timekeeperRaw               # comments stripped, strings/chars kept
+  $timekeeperSkel = Get-CodeSkeleton $timekeeperRaw -BlankStrings # strings+chars+comments blanked
+  # Require executable code equivalent to the full SNTP server chain:
+  #   s1 = config::kSntpServerPrimary
+  #   s2 = kSntpServerFallback1[0] != '\0' ? kSntpServerFallback1 : nullptr
+  #   s3 = kSntpServerFallback2[0] != '\0' ? kSntpServerFallback2 : nullptr
+  # The char literal '\0' interiors are inspected, so the strings/chars-preserved
+  # skeleton is used here; the configTime executable call is verified separately
+  # on the strings-blanked skeleton so a string literal cannot fabricate it.
+  $sntpChainRequired = @(
+    @{ Pat = '=\s*config::kSntpServerPrimary\s*;'; Msg = "timekeeper.cpp must assign s1 = config::kSntpServerPrimary" },
+    @{ Pat = "config::kSntpServerFallback1\s*\[\s*0\s*\]\s*!=\s*'\\0'\s*\?\s*config::kSntpServerFallback1\s*:\s*nullptr"; Msg = "timekeeper.cpp must derive s2 from kSntpServerFallback1 (empty => nullptr)" },
+    @{ Pat = "config::kSntpServerFallback2\s*\[\s*0\s*\]\s*!=\s*'\\0'\s*\?\s*config::kSntpServerFallback2\s*:\s*nullptr"; Msg = "timekeeper.cpp must derive s3 from kSntpServerFallback2 (empty => nullptr)" }
+  )
+  foreach ($req in $sntpChainRequired) {
+    if ($timekeeperText -notmatch $req.Pat) { Fail $req.Msg }
   }
-  if ($timekeeperText -notmatch [regex]::Escape("config::kSntpServerFallback1")) {
-    Fail "timekeeper.cpp must reference config::kSntpServerFallback1"
+  # The configTime call must pass (0, 0, s1, s2, s3) as executable code.
+  if ($timekeeperSkel -notmatch 'configTime\s*\(\s*0\s*,\s*0\s*,\s*\w+\s*,\s*\w+\s*,\s*\w+\s*\)') {
+    Fail "timekeeper.cpp must call configTime(0, 0, s1, s2, s3)"
   }
-  if ($timekeeperText -notmatch "nullptr") {
-    Fail "timekeeper.cpp: empty fallbacks must become nullptr"
+  # Ban alternate SNTP server configuration paths. The existing time-sync
+  # notification callback (sntp_set_time_sync_notification_cb) remains allowed.
+  foreach ($banned in @('\bconfigTzTime\s*\(', '\bsntp_setservername\s*\(', '\besp_sntp_setservername\s*\(')) {
+    if ($timekeeperSkel -match $banned) {
+      Fail "timekeeper.cpp contains banned alternate SNTP configuration API: $banned"
+    }
   }
 
   # -------------------------------------------------------------------------
   # 9. DHCP NTP disable (checked here as part of timekeeper verification)
   # -------------------------------------------------------------------------
-  $timekeeperSkel = Get-CodeSkeleton $timekeeperText
   if ($timekeeperSkel -notmatch [regex]::Escape("esp_sntp_servermode_dhcp(false)")) {
     Fail "timekeeper.cpp: esp_sntp_servermode_dhcp(false) must be present (not just in a comment)"
   }
 
   # -------------------------------------------------------------------------
-  # 10. No second configTime call in production source
+  # 10. No second configTime call in production source. Count on the
+  #     strings-blanked skeleton with \bconfigTime\s*\( so whitespace cannot hide
+  #     a spaced second call and a string literal cannot fabricate one.
   # -------------------------------------------------------------------------
-  $configTimeCalls = [regex]::Matches($combinedCommentStripped, [regex]::Escape("configTime("))
+  $configTimeCalls = [regex]::Matches($combinedSkel, '\bconfigTime\s*\(')
   if ($configTimeCalls.Count -gt 1) {
     Fail "Production source has more than one configTime call ($($configTimeCalls.Count))"
   }
@@ -226,11 +288,11 @@ function Invoke-LiveGate {
   if ($combinedSkel -match '\bWiFiUDP\b') {
     Fail "Production source contains WiFiUDP (banned)"
   }
-  $dnsCalls = [regex]::Matches($combinedCommentStripped, '\bWiFi\.hostByName\s*\(')
+  $dnsCalls = [regex]::Matches($combinedSkel, '\bWiFi\.hostByName\s*\(')
   if ($dnsCalls.Count -ne 1) {
     Fail "Production source must contain exactly one WiFi.hostByName call; found $($dnsCalls.Count)"
   }
-  $connectCalls = [regex]::Matches($combinedCommentStripped, '\.\s*connect\s*\(')
+  $connectCalls = [regex]::Matches($combinedSkel, '\.\s*connect\s*\(')
   if ($connectCalls.Count -ne 1) {
     Fail "Production source must contain exactly one outbound client .connect call; found $($connectCalls.Count)"
   }
@@ -239,14 +301,20 @@ function Invoke-LiveGate {
     '(?<![\w.])connect\s*\(', '(?<![\w.])lwip_connect\s*\(',
     '(?<![\w.])sendto\s*\(', '(?<![\w.])lwip_sendto\s*\(',
     '\bAsyncClient\b', '\bAsyncTCP\b', '\bEthernetClient\b',
-    '\bPubSubClient\b', '\bMQTTClient\b', '\bWebSocketsClient\b'
+    '\bPubSubClient\b', '\bMQTTClient\b', '\bWebSocketsClient\b',
+    # Additional high-signal outbound/DNS APIs (none used by production code; the
+    # local captive-portal lwip_recv/lwip_send path stays allowed).
+    '\besp_http_client\w*\b', '\besp_tls_conn\w*\s*\(',
+    '\bgetaddrinfo\s*\(', '\bdns_gethostbyname\s*\(',
+    '\btcp_connect\s*\(', '\budp_connect\s*\(',
+    '\bAsyncUDP\b', '\bNetworkClient\b', '\bNetworkUDP\b'
   )) {
     if ($combinedSkel -match $pat) {
       Fail "Production source contains banned outbound socket/client API: $pat"
     }
   }
   $numericIpRx = [regex]'IPAddress\s*\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\)'
-  foreach ($m in $numericIpRx.Matches($combinedCommentStripped)) {
+  foreach ($m in $numericIpRx.Matches($combinedSkel)) {
     if ($m.Value -notmatch '^IPAddress\s*\(\s*192\s*,\s*168\s*,\s*4\s*,\s*1\s*\)$') {
       Fail "Production source contains direct numeric IP construction: $($m.Value)"
     }
@@ -264,7 +332,7 @@ function Invoke-LiveGate {
   }
   # include directives for these libraries (in skeleton after blanking)
   foreach ($pat in @('#include.*mDNS', '#include.*OTA', '#include.*WiFiManager')) {
-    if ($combinedCommentStripped -imatch $pat) {
+    if ($combinedSkel -imatch $pat) {
       Fail "Production source includes disallowed header: $pat"
     }
   }
@@ -320,6 +388,44 @@ function Invoke-LiveGate {
     }
   }
 
+  # platformio.ini is part of the declared production scope: an endpoint-defining
+  # build flag/macro (e.g. -DSOME_HOST="evil.example" or a URL/IP baked into a
+  # -D define) would silently introduce a runtime destination the C/C++ scan
+  # never sees. Scan build-flag define (-D...) lines for host/URL/IP endpoints.
+  foreach ($rawLine in ($platformioText -split "`r?`n")) {
+    $line = $rawLine
+    if ($line -notmatch '-D') { continue }  # focus on build-flag define lines
+    # -Dname="host.tld" / -Dname='host.tld' macro endpoint literals
+    foreach ($dm in ([regex]'-D\s*\w+\s*=\s*(["''])([^"'']*)\1').Matches($line)) {
+      $val = $dm.Groups[2].Value
+      if ($val -match '^(?:https?|wss?)://([^/\s]+)') {
+        $h = $Matches[1]
+        if (($approvedHosts -notcontains $h) -and $h -ne "192.168.4.1") {
+          Fail "platformio.ini build flag defines external URL endpoint: '$val'"
+        }
+      }
+      elseif ($val -match '^[a-zA-Z][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,}$' -and
+              ($approvedHosts -notcontains $val)) {
+        Fail "platformio.ini build flag defines external hostname endpoint: '$val'"
+      }
+      elseif ($val -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$' -and $val -ne "192.168.4.1") {
+        Fail "platformio.ini build flag defines external IP endpoint: '$val'"
+      }
+    }
+    # bare URL / dotted-IP endpoint literals on a build-flag line
+    foreach ($um in ([regex]'(?:https?|wss?)://([^/\s"'']+)').Matches($line)) {
+      $h = $um.Groups[1].Value
+      if (($approvedHosts -notcontains $h) -and $h -ne "192.168.4.1") {
+        Fail "platformio.ini contains external URL endpoint literal: '$($um.Value)'"
+      }
+    }
+    foreach ($ipm in ([regex]'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b').Matches($line)) {
+      if ($ipm.Groups[1].Value -ne "192.168.4.1") {
+        Fail "platformio.ini contains external IP endpoint literal: '$($ipm.Groups[1].Value)'"
+      }
+    }
+  }
+
   # -------------------------------------------------------------------------
   # 8. README has runtime egress table and privacy disclosure
   # -------------------------------------------------------------------------
@@ -331,14 +437,37 @@ function Invoke-LiveGate {
       $readmeText -notmatch "UDP.*123|123.*UDP") {
     Fail "README missing SNTP runtime egress entry (time.cloudflare.com / UDP/123)"
   }
+  # Explicit negation: the "does not send" block must actually negate sending
+  # credentials/telemetry to an external service. Affirmative wording that merely
+  # mentions the keywords must NOT satisfy this.
+  $negBlockRx = [regex]'(?is)does not send:?\s*(?<body>.*?)(?:\r?\n\r?\n|\r?\n#{1,6}\s)'
+  $negMatch = $negBlockRx.Match($readmeText)
+  if (-not $negMatch.Success) {
+    Fail "README must contain an explicit 'does not send' negation block"
+  }
+  $negBody = $negMatch.Groups['body'].Value
+  foreach ($kw in @('credential', 'telemetry')) {
+    if ($negBody -notmatch "(?is)$kw") {
+      Fail "README 'does not send' negation block must explicitly cover: $kw"
+    }
+  }
+  if ($negBody -notmatch '(?is)external service') {
+    Fail "README 'does not send' negation block must reference 'external service'"
+  }
   $readmeRequired = @(
     '(?is)ADS-B query parameters.*lat/lon.*formatted/rounded.*six decimal places.*radius.*0\.1 NM',
     '(?is)MAC address.*local network',
-    '(?is)credentials.*external service',
-    '(?is)telemetry.*external service',
     '(?is)DNS/DHCP infrastructure',
     '(?is)temporary.*session-scoped SoftAP',
-    '(?is)source-only.*packet capture.*final runtime proof'
+    '(?is)source-only.*packet capture.*final runtime proof',
+    # Six-decimal / 0.1-NM formatting must be disclosed as NOT a privacy-preserving
+    # precision reduction.
+    '(?is)six decimal.*not.*privacy-preserving precision reduction',
+    # The three external parties observe DIFFERENT things; DNS/SNTP must NOT be
+    # described as seeing the HTTPS query path.
+    '(?is)ADS-B provider.*source address.*lat/lon',
+    '(?is)DNS resolver.*source address.*hostname',
+    '(?is)SNTP service.*source address.*NTP'
   )
   foreach ($required in $readmeRequired) {
     if ($readmeText -notmatch $required) {
@@ -371,6 +500,8 @@ function Invoke-SelfTest {
   $adsbClientOrig = Get-Content -Raw $adsbClientPath
   $transportPath   = Join-Path $Root "src\services\adsb_transport_esp.cpp"
   $transportOrig   = Get-Content -Raw $transportPath
+  $platformioPath  = Join-Path $Root "platformio.ini"
+  $platformioOrig  = Get-Content -Raw $platformioPath
 
   $tmp = [System.IO.Path]::Combine(
     $env:TEMP,
@@ -391,15 +522,18 @@ function Invoke-SelfTest {
   )
   foreach ($d in $dirs) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 
-  # Copy all production source files to the temp tree
-  foreach ($f in (Get-ChildItem -Recurse -Path (Join-Path $Root "src") -Include "*.cpp","*.h")) {
+  # Copy all production source files to the temp tree, using the SAME extension
+  # set the live gate scans (.c/.cc/.cpp/.cxx/.h/.hh/.hpp/.ino), so self-test
+  # coverage matches the live scope.
+  $selfTestExtensions = @("*.c", "*.cc", "*.cpp", "*.cxx", "*.h", "*.hh", "*.hpp", "*.ino")
+  foreach ($f in (Get-ChildItem -Recurse -Path (Join-Path $Root "src") -Include $selfTestExtensions)) {
     $rel = $f.FullName.Substring((Join-Path $Root "src").Length + 1)
     $dest = Join-Path (Join-Path $tmp "src") $rel
     $destDir = Split-Path $dest -Parent
     if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
     Copy-Item $f.FullName $dest
   }
-  foreach ($f in (Get-ChildItem -Recurse -Path (Join-Path $Root "include") -Include "*.h")) {
+  foreach ($f in (Get-ChildItem -Recurse -Path (Join-Path $Root "include") -Include $selfTestExtensions)) {
     $rel = $f.FullName.Substring((Join-Path $Root "include").Length + 1)
     $dest = Join-Path (Join-Path $tmp "include") $rel
     $destDir = Split-Path $dest -Parent
@@ -407,9 +541,13 @@ function Invoke-SelfTest {
     Copy-Item $f.FullName $dest
   }
   Copy-Item $readmeFile (Join-Path $tmp "README.md")
+  Copy-Item $platformioPath (Join-Path $tmp "platformio.ini")
 
   function Write-TmpConfig([string]$content) {
     [System.IO.File]::WriteAllText((Join-Path $tmp "include\config.h"), $content)
+  }
+  function Write-TmpPlatformio([string]$content) {
+    [System.IO.File]::WriteAllText((Join-Path $tmp "platformio.ini"), $content)
   }
   function Write-TmpTimekeeper([string]$content) {
     [System.IO.File]::WriteAllText((Join-Path $tmp "src\services\timekeeper.cpp"), $content)
@@ -429,6 +567,10 @@ function Invoke-SelfTest {
     Write-TmpAdsbClient $adsbClientOrig
     Write-TmpTransport $transportOrig
     Write-TmpReadme $readmeOrig
+    Write-TmpPlatformio $platformioOrig
+    # Remove any stray tamper files dropped by extension-coverage tests.
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $tmp "src\services\extra_egress.ino")
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $tmp "src\services\extra_egress.cc")
   }
 
   function Expect-Fail([string]$Label) {
@@ -538,8 +680,76 @@ function Invoke-SelfTest {
     Expect-Fail "removed packet-capture caveat"
     Reset-Tmp
 
+    # T17: a removed executable WiFi.hostByName call plus a matching STRING literal
+    # must NOT satisfy the gate (executable checks run on strings-blanked skeleton).
+    Write-TmpTransport ($transportOrig -replace [regex]::Escape("if (!WiFi.hostByName(host, address)) {"),
+      'const char* kFake = "WiFi.hostByName(host, address)"; if (false) {')
+    Expect-Fail "string literal cannot fabricate WiFi.hostByName call"
+    Reset-Tmp
+
+    # T18: a removed client.connect executable call plus a matching STRING literal
+    # must NOT satisfy the gate.
+    Write-TmpTransport ($transportOrig -replace [regex]::Escape("const int ok = client.connect(address, port, host, ca_bundle, nullptr, nullptr);"),
+      'const char* kFake = "client.connect(address, port, host, ca_bundle, ...)"; const int ok = 0;')
+    Expect-Fail "string literal cannot fabricate client.connect call"
+    Reset-Tmp
+
+    # T19: tampering ONLY the HTTP Host-header argument (leaving the TLS connect
+    # to config::kAdsbHost intact) must fail: the snprintf's final format argument
+    # is no longer config::kAdsbHost.
+    Write-TmpAdsbClient ($adsbClientOrig -replace [regex]::Escape("config::kAdsbHost);"), '"opendata.adsb.fi");')
+    Expect-Fail "Host-header argument decoupled from config::kAdsbHost"
+    Reset-Tmp
+
+    # T20: a WiFi.hostByName call in ANOTHER function (espSendAll) must not satisfy
+    # the espTlsConnect-scoped chain check even though the global count stays one.
+    $badTransport20 = ($transportOrig -replace [regex]::Escape("if (!WiFi.hostByName(host, address)) {"), "if (false) {") `
+      -replace [regex]::Escape("  size_t sent = 0;"), "  WiFi.hostByName(host, address);`n  size_t sent = 0;"
+    Write-TmpTransport $badTransport20
+    Expect-Fail "hostByName outside espTlsConnect body"
+    Reset-Tmp
+
+    # T21: breaking the fallback2 ternary (no empty => nullptr guard) must fail.
+    Write-TmpTimekeeper ($timekeeperOrig -replace [regex]::Escape("config::kSntpServerFallback2[0] != '\0' ? config::kSntpServerFallback2 : nullptr"),
+      "config::kSntpServerFallback2")
+    Expect-Fail "broken SNTP fallback2 ternary"
+    Reset-Tmp
+
+    # T22: a spaced second configTime ( call must be counted and rejected.
+    Write-TmpTimekeeper ($timekeeperOrig + "`nvoid rearm2() { configTime (0, 0, `"x`"); }`n")
+    Expect-Fail "spaced second configTime call"
+    Reset-Tmp
+
+    # T23: an alternate SNTP configuration API (configTzTime) is banned.
+    Write-TmpTimekeeper ($timekeeperOrig + "`nvoid altSntp() { configTzTime(`"UTC0`", config::kSntpServerPrimary); }`n")
+    Expect-Fail "banned configTzTime SNTP path"
+    Reset-Tmp
+
+    # T24: an alternate outbound/DNS API (getaddrinfo) is banned.
+    Write-TmpAdsbClient ($adsbClientOrig + "`nvoid alt() { getaddrinfo(`"h`", `"443`", nullptr, nullptr); }`n")
+    Expect-Fail "banned getaddrinfo outbound API"
+    Reset-Tmp
+
+    # T25: an endpoint-defining build flag in platformio.ini is caught.
+    Write-TmpPlatformio ($platformioOrig -replace [regex]::Escape("-DARDUINO_USB_MODE=1"), '-DADSB_HOST="evil.example.com"')
+    Expect-Fail "platformio.ini build-flag endpoint"
+    Reset-Tmp
+
+    # T26: a banned external URL in a NON-.cpp/.h extension (.ino) is scanned,
+    # proving the live extension coverage is real.
+    [System.IO.File]::WriteAllText((Join-Path $tmp "src\services\extra_egress.ino"),
+      'namespace { const char* kEvil = "https://evil.example/path"; }' + "`n")
+    Expect-Fail "banned URL in .ino extension"
+    Reset-Tmp
+
+    # T27: flipping the "does not send" negation (while retaining every keyword)
+    # must fail: affirmative wording cannot pass the privacy negation gate.
+    Write-TmpReadme ($readmeOrig -replace [regex]::Escape("The firmware does not send:"), "The firmware does send:")
+    Expect-Fail "flipped does-not-send negation"
+    Reset-Tmp
+
     Write-Host ""
-    Write-Host "OK: all 16 self-test tamper cases correctly rejected."
+    Write-Host "OK: all 27 self-test tamper cases correctly rejected."
   } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
   }
