@@ -357,6 +357,19 @@ concurrency behavior are **hardware-only** gates that have **not** been run yet.
 A green native/offline run for the worker is not proof of on-device readiness,
 and it does **not** make `supermini-worker` the default release firmware.
 
+These gates are now **executable**: an operator-driven checklist, bound to the
+exact flashed image SHA-256 and split into **DEFAULT RELEASE** vs **WORKER
+PROMOTION**, is defined in `scripts/hardware-acceptance-policy.json` and enforced
+by `scripts/verify-hardware-evidence.ps1`. See
+[Phase 12 local release pipeline and hardware handoff](#phase-12-local-release-pipeline-and-hardware-handoff)
+for the full procedure.
+
+**QEMU was evaluated and deliberately deferred.** There is **no** compatible
+Espressif ESP32-C3 QEMU installed here, and QEMU cannot meaningfully prove the
+Wi-Fi radio, real TLS-over-Wi-Fi handshakes, or GC9A01 SPI panel behaviour that
+these gates cover. There is therefore **no QEMU release gate**; on-device
+hardware evidence remains the acceptance path.
+
 ## Configuration
 
 Edit **`include/config.h`** for hardware and behavior:
@@ -876,7 +889,7 @@ Two new native test suites are added:
 - **`test_runtime_diagnostics`** (runs under `[env:native]`, `DIAGNOSTICS=0`): verifies default values, constexpr reflection, `WorkerResult` trivial copyability without the conditional field (with a C++17 `std::void_t` detection idiom proving field absence), and `elapsedMicros` rollover safety.
 - **`test_runtime_diagnostics_on`** (runs under `[env:native-diag]`, `DIAGNOSTICS=1` only): verifies `kDiagnosticsEnabled=true`, that `WorkerResult::fetch_duration_ms` is `uint32_t`, and that `WorkerResult` remains trivially copyable with the added field.
 
-The `native` env runs **580 cases across 39 suites**; `native-diag` runs **5 cases in 1 suite** (`test_runtime_diagnostics_on`); `scripts/native-test.ps1` executes **585 cases across 40 suite runs total**. The `native-diag` env uses `test_filter = test_runtime_diagnostics_on` + `test_ignore =` (clearing the inherited exclusion) so the default `native` env and `native-diag` never run each other's macro-sensitive tests.
+The `native` env runs **580 cases across 39 suites**; `native-diag` runs **5 cases in 1 suite** (`test_runtime_diagnostics_on`). The `native-diag` env uses `test_filter = test_runtime_diagnostics_on` + `test_ignore =` (clearing the inherited exclusion) so the default `native` env and `native-diag` never run each other's macro-sensitive tests. Since Phase 12, `scripts/native-test.ps1` also runs the headless `native-gfx` render gate (**21 cases in 1 suite**), for **606 cases across 41 suite runs total** (see [Native tests](#native-tests)).
 
 The **ELF proof** (`nm` proves symbols; binary-safe scanning proves format strings — both from build artifacts, *not* a source check):
 - **Diagnostic symbols**: `g_diag_last_fetch_ms` and `radarDisplayLastDiagnostics` are **absent** from `supermini` and `supermini-worker` ELFs (`nm` confirms) and **present** in `supermini-diag` and `supermini-worker-diag` ELFs. This proves zero diagnostic cost in non-diag builds.
@@ -886,29 +899,188 @@ The **ELF proof** (`nm` proves symbols; binary-safe scanning proves format strin
 
 The updated **worker policy gate** (`verify-adsb-worker-policy.ps1`) now covers 17 tamper cases (2 new: `supermini-diag` must not add `ADSB_WORKER`; `supermini-worker-diag` must keep `DIAGNOSTICS=1`). All 10 original invariants are preserved.
 
-### Web-flashable release image
+### Release image (local pipeline)
 
-Single `.bin` for [esptool-js](https://espressif.github.io/esptool-js/) and similar tools (ESP32-C3, 4 MB, flash at **0x0**):
+The default release image is **`supermini/firmware-merged.bin`**, produced inside
+a reproducible, re-verifiable release package entirely locally by
+`scripts/build-release.ps1` (no remote, no CI, no publication). See
+[Phase 12 local release pipeline and hardware handoff](#phase-12-local-release-pipeline-and-hardware-handoff)
+for the full pipeline, the manifest/checksum/proof layout, and the hardware
+evidence workflow.
 
-```bash
-chmod +x scripts/merge-firmware.sh   # once
-./scripts/merge-firmware.sh
+Build + merge + proof + publish all five envs to `release/<sha>/`:
+
+```powershell
+.\scripts\build-release.ps1
 ```
 
-Writes `release/plane-radar-merged.bin`. Skip rebuild if firmware is already built:
+Low-level PlatformIO merge for a single env (output `.pio/build/supermini/firmware-merged.bin`,
+ESP32-C3, 4 MB, flash at **0x0**):
 
-```bash
-./scripts/merge-firmware.sh --no-build
-```
-
-Or via PlatformIO only (output: `.pio/build/supermini/firmware-merged.bin`):
-
-```bash
+```powershell
 pio run -e supermini
 pio run -t merge -e supermini
 ```
 
-Put the board in download mode (hold **BOOT**, tap **RESET**), then flash with Chrome/Edge over USB.
+Flash + verify the default merged image (put the board in download mode: hold
+**BOOT**, tap **RESET**), or use a Web-Serial flasher such as
+[esptool-js](https://espressif.github.io/esptool-js/) at offset **0x0**:
+
+```powershell
+esptool.py --chip esp32c3 write_flash 0x0 release/<sha>/supermini/firmware-merged.bin
+esptool.py --chip esp32c3 verify_flash 0x0 release/<sha>/supermini/firmware-merged.bin
+```
+
+The former Unix `scripts/merge-firmware.sh` helper (which wrote a single
+`release/plane-radar-merged.bin`) has been **retired** in favour of this
+Windows/local pipeline.
+
+## Phase 12 local release pipeline and hardware handoff
+
+Everything here runs **locally**: no remote, no GitHub Actions, no publication.
+Release artifacts stay under the git-ignored `release/` directory.
+
+### Build a release (`scripts/build-release.ps1`)
+
+```powershell
+.\scripts\build-release.ps1
+```
+
+Fail-closed: the build aborts **before** building or publishing unless PlatformIO
+is exactly **6.1.19**; git `HEAD` exists with a clean tracked/index worktree, **no
+untracked files**, and **no git remote**; the output path resolves strictly inside
+`release/`; and every required source gate is green — `scripts/native-test.ps1`
+(**606/41**, which also runs the airport + egress gates), plus
+`check-native-test-access`, CA, provisioning, worker, and diagnostics policy gates.
+
+It then deletes `.pio` once and freshly builds **and merges** exactly the five
+firmware envs (`supermini`, `supermini-worker`, `supermini-quiet`,
+`supermini-diag`, `supermini-worker-diag`), enforces the **exact** approved
+resource/file sizes (see [Build variants](#build-variants-phase-10) and
+[Memory budget](#memory-budget)), runs the current-head ELF/binary proofs, and
+only if **every** invariant passes stages and publishes the package to
+`release/<full-git-sha>/`. It refuses to overwrite an existing release unless
+`-Force` (which replaces only that exact validated path).
+
+Output tree:
+
+```
+release/<full-git-sha>/
+  manifest.json          schema/commit/branch/UTC, local-only state, PlatformIO/
+                         platform/framework/toolchain/dependency pins, airport
+                         source commit, per-env options + RAM/flash/file sizes,
+                         SHA-256 of every file, proof + gate/test summary, and the
+                         default-artifact identity (worker images are eval-only)
+  CHECKSUMS.sha256       sorted "<sha256>  <path>" over manifest + all files
+                         (except CHECKSUMS itself)
+  binary-proof.json      machine-readable proof (every invariant, pass/fail)
+  binary-proof.txt       human-readable proof
+  supermini/             firmware.bin, firmware-merged.bin, firmware.elf,
+                         firmware.map, build.log, merge.log, nm-symbols.txt
+  supermini-worker/      (evaluation-only)
+  supermini-quiet/       (evaluation-only)
+  supermini-diag/        (evaluation-only)
+  supermini-worker-diag/ (evaluation-only)
+```
+
+The **only** default release image is **`supermini/firmware-merged.bin`**; the
+worker images are clearly marked **evaluation-only**. All files are LF / UTF-8
+without BOM. This package binds the **exact current-head binaries only** — it does
+**not** claim raw byte equivalence to any Phase 10/11 artifact.
+
+### Current-head ELF/binary proofs
+
+Using the pinned PlatformIO RISC-V `nm` and binary-safe byte searching, the build
+proves and records (pass/fail) for every env, aborting before publishing on any
+failure:
+
+- the default `supermini` links **zero** worker/integration symbols (`workerTask`,
+  `s_worker_stack`, `s_worker_tcb`, `s_request_q`, `s_result_q`, `workerCancel`),
+  matched as whole demangled tokens (so `core::workerCancelRequested` is not a
+  false match);
+- `supermini-worker` and `supermini-worker-diag` contain exactly one worker stack
+  symbol of exactly **0x2000 (8192) bytes**;
+- diagnostic symbols (`g_diag_last_fetch_ms`, `radarDisplayLastDiagnostics`) and
+  the heap-diagnostic API (`ESP.getFreeHeap`/`getMinFreeHeap`/`getMaxAllocHeap`,
+  plus `heap_caps_get_minimum_free_size`) are **absent** from non-diag ELFs and
+  **present** in the diag ELFs — while the shared `heap_caps_get_free_size` /
+  `heap_caps_get_largest_free_block` (present in every build) are explicitly **not**
+  used as isolation indicators;
+- the diagnostic binary strings `diag: fetch_ms=` / `diag: render_us=` are absent
+  from non-diag firmware binaries and present in both diag binaries;
+- the quiet binary lacks the Serial logging strings and the **exact** startup log
+  `Plane Radar\n`, while the non-quiet builds contain them (plain `Plane Radar`
+  appears in every build's portal HTML and is deliberately not used as an
+  indicator).
+
+A compact `nm-symbols.txt` (the relevant demangled symbols) is saved per env for
+later audit.
+
+### Verify a release (`scripts/verify-release.ps1`)
+
+Re-verifies an existing package **without rebuilding**:
+
+```powershell
+.\scripts\verify-release.ps1 -Path release/<sha>
+.\scripts\verify-release.ps1 -SelfTest        # isolated tamper self-test
+```
+
+It checks: safe path under `release/`; manifest↔directory commit binding (and, by
+default, that the commit matches the current `HEAD` — `-AllowStaleHead` validates
+an archived local package); every manifest artifact size + SHA-256; every
+`CHECKSUMS` line recomputed with no missing/extra/duplicate/traversal paths; the
+binary proof overall + every invariant pass; the default-artifact identity/role;
+and the approved exact resource policy. `-SelfTest` builds a synthetic package in
+an isolated temp fixture and proves the verifier accepts a well-formed package and
+rejects an artifact-byte change, a manifest-commit change, a corrupted checksum, a
+false proof, and traversal/duplicate/missing checksum entries. Works under Windows
+PowerShell 5.1 and pwsh 7.
+
+### Executable hardware handoff
+
+`scripts/hardware-acceptance-policy.json` is a strict, executable checklist split
+into **DEFAULT RELEASE** (items 1–8, 10–12) and a separate **WORKER PROMOTION**
+gate (item 9, a 72 h `supermini-worker-diag` soak). Each item has exact commands,
+numeric pass/fail thresholds, and exact evidence filenames, and binds evidence to
+the flashed image SHA.
+
+```powershell
+# Create a PENDING evidence template bound to the exact flashed default image:
+.\scripts\initialize-hardware-evidence.ps1 -Path release/<sha>
+
+# After an operator completes real-hardware evidence, verify a gate:
+.\scripts\verify-hardware-evidence.ps1 -Path release/<sha>                       # default release
+.\scripts\verify-hardware-evidence.ps1 -Path release/<sha> -Gate worker-promotion
+.\scripts\verify-hardware-evidence.ps1 -SelfTest                                 # isolated self-test
+```
+
+`initialize-hardware-evidence.ps1` first re-verifies the release, then writes
+`release/<sha>/hardware-evidence/hardware-results.json` (every item `pending`, with
+thresholds, expected evidence filenames, and operator fields) plus the empty
+evidence subdirectories — it **never** fabricates passing evidence, and the
+evidence lives under the ignored release package (never committed).
+`verify-hardware-evidence.ps1` re-verifies the release, requires the results to
+bind to the exact default merged image SHA/size/commit, and requires every
+mandatory item `pass` with all required non-empty evidence and every numeric value
+at/above/below its threshold (it fails on `pending`/`blocked`/`waived`). It only
+**reports** worker-promotion readiness — it never promotes the worker; the default
+artifact always remains `supermini`.
+
+Item 6 measures memory/performance on the `supermini-diag` build of the **same
+commit**, but the released default remains `supermini`. Thresholds are conservative
+and justified in the policy from the ESP32-C3 one-framebuffer design (240×240
+RGB565 sprite ≈ 115 KB, ~23 ms SPI transfer floor at 40 MHz) rather than any
+measured claim.
+
+### Headless goldens vs hardware-only panel proof
+
+The [headless render golden gate](#headless-render-golden-gate-phase-12) proves
+pixel **geometry, text, layout, and byte-for-byte deterministic drawing** of the
+real UI code. It is **not** a colour/panel proof: the GC9A01's BGR channel order,
+colour inversion, SPI timing, and brightness are decoded away in the BMP and remain
+**hardware-only** (item 10). **QEMU** was evaluated and **deferred** — no compatible
+Espressif ESP32-C3 QEMU is installed, it cannot meaningfully prove Wi-Fi/TLS/GC9A01
+behaviour, and there is **no QEMU release gate**.
 
 ## Dependencies
 
@@ -1050,7 +1222,7 @@ The Phase 11 native test suite `test_large_airport_data` adds **13 cases** in 1 
 - `test_runway_endpoint_coordinate_ranges` / `test_runway_lengths_positive` / `test_runway_index_bounds` / `test_runway_ordering`: runway structural integrity
 - `test_compile_time_extent_airport` / `test_compile_time_extent_runway`: `std::extent` matches constants
 
-With the pinned local toolchain, `scripts/native-test.ps1` passes **580 cases across 39 suites** in `native` and **5 cases in 1 suite** in `native-diag`, for **585 cases across 40 suite runs total**.
+With the pinned local toolchain, `scripts/native-test.ps1` passes **580 cases across 39 suites** in `native`, **5 cases in 1 suite** in `native-diag`, and (since Phase 12) **21 cases in 1 suite** in the headless `native-gfx` render gate, for **606 cases across 41 suite runs total**.
 
 New Phase 11 gate commands:
 
