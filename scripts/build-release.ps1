@@ -63,10 +63,15 @@ $envNames = @($policy.environments | ForEach-Object { $_.name })
 # ===========================================================================
 Write-Step "Preconditions"
 $pio = Resolve-PlatformIoExe
-$pioVersion = (& $pio --version 2>&1 | Select-Object -First 1)
+# Materialize the full output (and capture the exit code) BEFORE selecting a line:
+# piping a native command straight into `Select-Object -First 1` stops the pipeline
+# early, terminates pio.exe, and corrupts $LASTEXITCODE.
+$pioVersionRaw = @(& $pio --version 2>&1)
+$pioExit = $LASTEXITCODE
+$pioVersion = ($pioVersionRaw | Select-Object -First 1)
 $expectedPio = "PlatformIO Core, version $($policy.pins.platformio_core)"
-if ($LASTEXITCODE -ne 0 -or "$pioVersion".Trim() -ne $expectedPio) {
-  throw "PlatformIO $($policy.pins.platformio_core) is required; found: $pioVersion"
+if ($pioExit -ne 0 -or "$pioVersion".Trim() -ne $expectedPio) {
+  throw "PlatformIO $($policy.pins.platformio_core) is required; found: $pioVersion (exit $pioExit)"
 }
 Write-Ok "PlatformIO $($policy.pins.platformio_core)"
 
