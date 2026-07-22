@@ -94,6 +94,7 @@ function Get-ContainedReparsePoints {
       if ($c.PSIsContainer) { $stack.Push($c.FullName) }
     }
   }
+  if ($hits.Count -eq 0) { return @() }
   return , ($hits.ToArray())
 }
 
@@ -126,7 +127,7 @@ function Remove-TreeSafe {
   if (Test-IsReparsePoint $full) {
     throw "Refusing to recursively delete a reparse point (junction/symlink) at the target: $full"
   }
-  $contained = @(Get-ContainedReparsePoints $full)
+  $contained = @(Get-ContainedReparsePoints $full | Where-Object { $_ -and ("$_").Length -gt 0 })
   if ($contained.Count -gt 0) {
     throw ("Refusing to recurse: reparse point(s) present under '$full': " + [string]::Join('; ', @($contained | Select-Object -First 5)))
   }
