@@ -78,7 +78,10 @@ function New-CompleteHardwareFixture {
       [ordered]@{
         id = 'fx-heap'; gate = 'default-release'; order = 1; title = 'fixture heap'; mandatory = $true
         environment = 'supermini'; image = $defaultRel
-        thresholds = @([ordered]@{ key = 'min_free_heap_bytes'; op = '>='; value = 40000; unit = 'bytes'; rationale = 'x' })
+        thresholds = @(
+          [ordered]@{ key = 'min_free_heap_bytes'; op = '>='; value = 40000; unit = 'bytes'; rationale = 'x' },
+          [ordered]@{ key = 'session_timeout_seconds'; op = 'between'; value = @(290, 310); unit = 's'; rationale = 'bounded range rejects an immediate portal death' }
+        )
         evidence = @([ordered]@{ name = 'diag/heap.txt'; description = 'heap' })
       },
       [ordered]@{
@@ -108,9 +111,14 @@ function New-CompleteHardwareFixture {
     $item.operator.name = 'selftest'; $item.operator.date = '2026-01-01'
     foreach ($t in $item.thresholds) {
       if ($t.key -eq 'min_free_heap_bytes') { $t.measured = 51000 }
+      elseif ($t.key -eq 'session_timeout_seconds') { $t.measured = 300 }
       elseif ($t.key -eq 'verify_flash') { $t.measured = 'pass' }
     }
-    foreach ($e in $item.evidence) { $e.present = $true }
+    foreach ($e in $item.evidence) {
+      $ef = Join-Path $evidenceDir ($e.name -replace '/', '\')
+      $e.size = [int64](Get-Item $ef).Length
+      $e.sha256 = (Get-Sha256Hex $ef)
+    }
   }
   $resultsPath = Join-Path $evidenceDir 'hardware-results.json'
   Write-JsonFileLf $resultsPath $results
@@ -202,6 +210,134 @@ function Invoke-HardwareSelfTest {
       Set-Content -LiteralPath (Join-Path $ev 'diag\heap.txt') -Value $null -NoNewline
     }
     Expect "rejects empty evidence file" (-not (Run-Hw $t).Ok)
+
+    # 7. Wrong per-item image size.
+    $t = New-TamperCtx 'wrong-item-size' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      $o.items[0].image_size = 123456789
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects wrong per-item image size" (-not (Run-Hw $t).Ok)
+
+    # 8. Wrong per-item image path.
+    $t = New-TamperCtx 'wrong-item-image' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      $o.items[0].image = 'supermini-worker/firmware-merged.bin'
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects wrong per-item image path" (-not (Run-Hw $t).Ok)
+
+    # 9. Wrong per-item environment.
+    $t = New-TamperCtx 'wrong-item-env' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      $o.items[0].environment = 'supermini-worker'
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects wrong per-item environment" (-not (Run-Hw $t).Ok)
+
+    # 10. Duplicate item id.
+    $t = New-TamperCtx 'duplicate-item' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      $o.items = @($o.items + $o.items[0])
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects duplicate item id" (-not (Run-Hw $t).Ok)
+
+    # 11. Extra (unexpected) item id.
+    $t = New-TamperCtx 'extra-item' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      $extra = $o.items[0] | ConvertTo-Json -Depth 64 | ConvertFrom-Json
+      $extra.id = 'rogue-item'
+      $o.items = @($o.items + $extra)
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects extra item id" (-not (Run-Hw $t).Ok)
+
+    # 12. Forged evidence hash (recorded sha256 no longer matches the file).
+    $t = New-TamperCtx 'forged-evidence-hash' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      $o.items[0].evidence[0].sha256 = ('a' * 64)
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects forged evidence hash" (-not (Run-Hw $t).Ok)
+
+    # 13. Forged evidence size (recorded size no longer matches the file).
+    $t = New-TamperCtx 'forged-evidence-size' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      $o.items[0].evidence[0].size = 999999
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects forged evidence size" (-not (Run-Hw $t).Ok)
+
+    # 14. Missing operator name on a mandatory pass item.
+    $t = New-TamperCtx 'missing-operator' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      $o.items[0].operator.name = ''
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects missing operator name" (-not (Run-Hw $t).Ok)
+
+    # 15. Non-ISO operator date.
+    $t = New-TamperCtx 'bad-operator-date' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      $o.items[0].operator.date = '01/02/2026'
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects non-ISO operator date" (-not (Run-Hw $t).Ok)
+
+    # 16. Unsafe ADS / colon evidence filename.
+    $t = New-TamperCtx 'ads-evidence' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      $o.items[0].evidence[0].name = 'diag/heap.txt:evil'
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects ADS/colon evidence filename" (-not (Run-Hw $t).Ok)
+
+    # 17. Weakened threshold in the results copy (operator edited op/value).
+    $t = New-TamperCtx 'threshold-meta-weakened' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      foreach ($th in $o.items[0].thresholds) { if ($th.key -eq 'min_free_heap_bytes') { $th.value = 1 } }
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects weakened results threshold value" (-not (Run-Hw $t).Ok)
+
+    # 18. Missing threshold key in results.
+    $t = New-TamperCtx 'threshold-missing-key' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      $o.items[0].thresholds = @($o.items[0].thresholds | Where-Object { $_.key -ne 'min_free_heap_bytes' })
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects missing threshold key" (-not (Run-Hw $t).Ok)
+
+    # 19. 'between' op: measured below the bounded range (too-early / immediate-death).
+    $t = New-TamperCtx 'between-below' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      foreach ($th in $o.items[0].thresholds) { if ($th.key -eq 'session_timeout_seconds') { $th.measured = 5 } }
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects between-op measured below range" (-not (Run-Hw $t).Ok)
+
+    # 20. 'between' op: measured above the bounded range.
+    $t = New-TamperCtx 'between-above' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      foreach ($th in $o.items[0].thresholds) { if ($th.key -eq 'session_timeout_seconds') { $th.measured = 999 } }
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects between-op measured above range" (-not (Run-Hw $t).Ok)
   }
   finally {
     if (Test-Path $fixtureRoot) { Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue }

@@ -30,6 +30,12 @@
     "airports": 1166,
     "runways": 1706
   },
+  "tests": {
+    "native_test_summary": "606 cases across 41 suite runs (native 580/39 + native-diag 5/1 + native-gfx 21/1)",
+    "native_test_total_cases": 606,
+    "native_test_suite_runs": 41,
+    "note": "build-release records manifest.tests.native_test = native_test_summary and gates_run=true; verify-release checks manifest.tests.native_test equals this string and gates_run is true."
+  },
   "toolchain_tools": {
     "nm": "toolchain-riscv32-esp/bin/riscv32-esp-elf-nm.exe",
     "cppfilt": "toolchain-riscv32-esp/bin/riscv32-esp-elf-c++filt.exe"

@@ -38,9 +38,10 @@
       "environment": "supermini",
       "image": "supermini/firmware-merged.bin",
       "procedure": [
-        "Erase the chip: esptool.py --chip esp32c3 erase_flash",
-        "Flash the merged image at 0x0: esptool.py --chip esp32c3 --baud 921600 write_flash --flash_mode keep --flash_freq 80m --flash_size 4MB 0x0 supermini/firmware-merged.bin",
-        "Verify: esptool.py --chip esp32c3 verify_flash 0x0 supermini/firmware-merged.bin (must report a byte-exact match)",
+        "Set the pinned PlatformIO flasher: $py=\"$env:USERPROFILE\\.platformio\\penv\\Scripts\\python.exe\"; $esptool=\"$env:USERPROFILE\\.platformio\\packages\\tool-esptoolpy\\esptool.py\" (<COMx> is the device USB serial port, e.g. COM5)",
+        "Erase the chip: & $py $esptool --chip esp32c3 --port <COMx> erase_flash",
+        "Flash the merged image at 0x0: & $py $esptool --chip esp32c3 --port <COMx> --baud 921600 write_flash --flash_mode keep --flash_freq 80m --flash_size 4MB 0x0 supermini/firmware-merged.bin",
+        "Verify: & $py $esptool --chip esp32c3 --port <COMx> verify_flash 0x0 supermini/firmware-merged.bin (must report a byte-exact match)",
         "Power-cycle; capture serial at 115200; confirm first boot reaches the secured (WPA2, non-open) provisioning display"
       ],
       "thresholds": [
@@ -63,14 +64,14 @@
       "image": "supermini/firmware-merged.bin",
       "procedure": [
         "On EACH of Android, iOS, Windows, macOS: confirm the AP beacon is WPA2 (never open); a wrong password is rejected; a valid join opens the captive portal and a save succeeds",
-        "Confirm the 5-minute (300 s) session timeout is enforced",
+        "Confirm the setup session self-terminates AROUND the 300 s policy (bounded 290-310 s: it must NOT die immediately, nor persist well past 5 minutes)",
         "After completion confirm the AP, DNS (:53), and HTTP (:80) are all gone (no permanent listener)"
       ],
       "thresholds": [
         { "key": "ap_open_beacon_observed", "op": "==", "value": "no", "unit": "", "rationale": "the first joinable beacon must already carry WPA2-PSK; never open/default" },
         { "key": "wrong_password_rejected", "op": "==", "value": "yes", "unit": "", "rationale": "an incorrect PSK must be rejected on all four OSes" },
         { "key": "valid_join_save_succeeded", "op": "==", "value": "yes", "unit": "", "rationale": "a valid join/portal/save must succeed on all four OSes" },
-        { "key": "session_timeout_seconds", "op": "<=", "value": 300, "unit": "s", "rationale": "the setup session must self-terminate by 5 minutes" },
+        { "key": "session_timeout_seconds", "op": "between", "value": [290, 310], "unit": "s", "rationale": "the setup session must self-terminate AROUND the 300 s policy; a bounded 290-310 s window rejects an immediate portal death (a bare <=300 would pass even if the portal died at 1 s) as well as a session that overruns 5 minutes" },
         { "key": "ap_dns_http_after_completion", "op": "==", "value": "gone", "unit": "", "rationale": "AP + DNS + HTTP must be fully torn down after provisioning" }
       ],
       "evidence": [
@@ -170,13 +171,16 @@
       "environment": "supermini-diag",
       "image": "supermini-diag/firmware-merged.bin",
       "procedure": [
-        "Flash supermini-diag/firmware-merged.bin (SAME commit) purely to MEASURE; the released default remains supermini",
-        "Run a representative load with the sprite path (sprite=1) throughout; collect the diag: fetch_ms / render_us lines",
-        "Record minimum free heap, minimum largest-free-block, render p95/max, and any resets/panics"
+        "Flash supermini-diag/firmware-merged.bin (SAME commit) purely to MEASURE; the released default remains supermini. Flash with the pinned tool: $py=\"$env:USERPROFILE\\.platformio\\penv\\Scripts\\python.exe\"; $esptool=\"$env:USERPROFILE\\.platformio\\packages\\tool-esptoolpy\\esptool.py\"; & $py $esptool --chip esp32c3 --port <COMx> write_flash 0x0 supermini-diag/firmware-merged.bin",
+        "Run a representative load with the sprite path (sprite=1) throughout for at least 6 hours; collect the diag: fetch_ms / render_us and heap lines",
+        "Record minimum free heap, minimum largest-free-block, render p95/max, and any resets/panics",
+        "Sample free heap LIKE-FOR-LIKE at the SAME point of the fetch cycle (immediately post-fetch) across the whole run, and compute the steady-state drift between the first and last post-fetch samples (leak detection on the diagnostic image, since the default supermini emits no heap metrics)"
       ],
       "thresholds": [
-        { "key": "min_free_heap_bytes", "op": ">=", "value": 40000, "unit": "bytes", "rationale": "Conservative floor. The ESP32-C3 has ~400 KB SRAM but the single 240x240 RGB565 sprite framebuffer (115200 B) plus the WiFiClientSecure TLS working set consume a large share; >=40 KB free leaves clear headroom for a TLS record + JSON decode frame." },
+        { "key": "diag_observation_hours", "op": ">=", "value": 6, "unit": "h", "rationale": "a MEANINGFUL long-term diagnostic observation (>= 6 h) is required to detect a slow heap leak; a few-minute sample cannot." },
+        { "key": "min_free_heap_bytes", "op": ">=", "value": 40000, "unit": "bytes", "rationale": "Conservative floor. The project/PlatformIO application RAM budget is 327,680 bytes (320 KiB) of usable DRAM (the partition/heap ceiling this firmware links against), NOT the full ~400 KB die SRAM. The single 240x240 RGB565 sprite framebuffer (115200 B) plus the WiFiClientSecure TLS working set consume a large share of that 320 KiB; >=40 KB free leaves clear headroom for a TLS record + JSON decode frame." },
         { "key": "min_largest_free_block_bytes", "op": ">=", "value": 20000, "unit": "bytes", "rationale": "Fragmentation floor: a single TLS record buffer (~16 KB) must remain allocatable; 20 KB is a conservative largest-free-block floor." },
+        { "key": "steady_state_heap_drift_bytes", "op": "<=", "value": 4096, "unit": "bytes", "rationale": "Tighter steady-state leak ceiling than the resets soak. Compare LIKE-FOR-LIKE post-fetch heap samples between the start and end of the >=6 h run; a device with no dynamic runway cache and one framebuffer should drift <= 4096 B." },
         { "key": "render_p95_us", "op": "<=", "value": 150000, "unit": "us", "rationale": "One framebuffer pushed once per frame over 40 MHz SPI has a ~23 ms transfer floor (115200 B x 8 / 40e6); 150 ms p95 leaves generous drawing headroom while catching runaway redraws." },
         { "key": "render_max_us", "op": "<=", "value": 250000, "unit": "us", "rationale": "Worst-case single frame bound (includes runway overlay compositing); 250 ms catches pathological frames without asserting an unmeasured tight bound." },
         { "key": "sprite_mode", "op": "==", "value": "1", "unit": "", "rationale": "measurement must be taken with the double-buffered sprite path (sprite=1) that the release uses" },
@@ -185,6 +189,7 @@
       "evidence": [
         { "name": "diag/serial-diag-load.log", "description": "serial diag: lines over the representative load" },
         { "name": "diag/heap-summary.txt", "description": "min free heap + min largest-free-block summary" },
+        { "name": "diag/heap-trend.csv", "description": "long-term (>= 6 h) heap-over-time trend with like-for-like post-fetch samples for steady-state drift" },
         { "name": "diag/render-histogram.txt", "description": "render_us p95/max histogram" }
       ]
     },
@@ -197,19 +202,22 @@
       "environment": "supermini",
       "image": "supermini/firmware-merged.bin",
       "procedure": [
-        "Exercise the device against real airspace with enough successful responses to observe > 64 source aircraft if available",
-        "Confirm nearest-64 bounded behaviour, no crash, and correct stale expiry",
-        "If > 64 source aircraft cannot be observed, mark this item BLOCKED (not pass)"
+        "The device FetchResult.aircraft_count is the RETAINED count (capped at the nearest 64), so > 64 SOURCE aircraft are NOT observable from the device itself. Run a CONCURRENT operator-side HTTPS query to the EXACT provider request the firmware issues (/api/v3/lat/%.6f/lon/%.6f/dist/%.1f): curl.exe --tlsv1.2 --fail --silent --show-error \"https://opendata.adsb.fi/api/v3/lat/<lat.6f>/lon/<lon.6f>/dist/<dist.1f>\" -o dense/provider-response.json",
+        "Preserve the RAW provider JSON response and count the number of valid source aircraft objects it returns; require >= 65 to actually exercise the > 64 bound",
+        "On the device, confirm the retained count is bounded (<= 64), nearest-64 behaviour, no crash, and correct stale expiry under the churn",
+        "If >= 65 source objects cannot be observed in the raw provider response, mark this item BLOCKED (not pass)"
       ],
       "thresholds": [
-        { "key": "source_aircraft_observed", "op": ">=", "value": 65, "unit": "aircraft", "rationale": "must exercise the > 64 nearest-64 bound (else mark blocked)" },
+        { "key": "source_aircraft_observed", "op": ">=", "value": 65, "unit": "aircraft", "rationale": "counted from the RAW concurrent operator-side provider response (NOT the device retained count, which is capped at 64) so the > 64 nearest-64 bound is genuinely exercised; else mark blocked" },
+        { "key": "device_retained_count_max", "op": "<=", "value": 64, "unit": "aircraft", "rationale": "the device retains/renders at most the nearest 64 (FetchResult.aircraft_count is bounded at 64 even under > 64 source)" },
         { "key": "nearest64_bound_respected", "op": "==", "value": "yes", "unit": "", "rationale": "only the nearest 64 are retained/rendered" },
         { "key": "crash_observed", "op": "==", "value": "no", "unit": "", "rationale": "no crash under dense load" },
         { "key": "stale_expiry_correct", "op": "==", "value": "yes", "unit": "", "rationale": "stale targets expire correctly under churn" }
       ],
       "evidence": [
-        { "name": "dense/serial-dense.log", "description": "serial log under dense airspace" },
-        { "name": "dense/source-count.txt", "description": "observed source-aircraft count" }
+        { "name": "dense/serial-dense.log", "description": "serial log under dense airspace (device retained count/bounded behaviour)" },
+        { "name": "dense/provider-response.json", "description": "raw concurrent operator-side provider response (source aircraft)" },
+        { "name": "dense/provider-count.txt", "description": "count of valid source aircraft objects in the raw provider response (>= 65)" }
       ]
     },
     {
@@ -221,23 +229,21 @@
       "environment": "supermini",
       "image": "supermini/firmware-merged.bin",
       "procedure": [
-        "Run the default image for >= 48 hours of continuous operation",
+        "Run the default supermini image for >= 48 hours of continuous operation",
         "Confirm zero watchdog/panic/brownout resets and no unexpected reboot",
-        "Confirm bounded heap drift and Wi-Fi/API recovery after a controlled outage",
-        "Confirm data goes stale by 15 s and targets are hidden/offline by 60 s"
+        "Confirm Wi-Fi/API recovery after a controlled outage (the default supermini image emits NO heap metrics; long-term heap-trend/steady-state drift is measured on supermini-diag in item 6)",
+        "Confirm data goes stale AT ~15 s (bounded 15-17 s) and targets are hidden/offline AT ~60 s (bounded 60-62 s)"
       ],
       "thresholds": [
         { "key": "soak_hours", "op": ">=", "value": 48, "unit": "h", "rationale": "48-hour continuous soak" },
         { "key": "watchdog_panic_brownout_resets", "op": "==", "value": 0, "unit": "events", "rationale": "no watchdog/panic/brownout resets" },
         { "key": "unexpected_reboots", "op": "==", "value": 0, "unit": "events", "rationale": "no unexpected reboot" },
-        { "key": "max_heap_drift_bytes", "op": "<=", "value": 20000, "unit": "bytes", "rationale": "bounded heap drift over 48 h (leak detection); 20 KB is a conservative drift ceiling for a device with no dynamic runway cache and a single framebuffer" },
         { "key": "wifi_api_recovery", "op": "==", "value": "yes", "unit": "", "rationale": "Wi-Fi/API recovers after a controlled outage" },
-        { "key": "stale_within_seconds", "op": "<=", "value": 15, "unit": "s", "rationale": "Live->Stale at the configured 15 s threshold" },
-        { "key": "targets_hidden_within_seconds", "op": "<=", "value": 60, "unit": "s", "rationale": "targets hidden/offline at the configured 60 s threshold" }
+        { "key": "stale_within_seconds", "op": "between", "value": [15, 17], "unit": "s", "rationale": "Live->Stale AT the configured 15 s threshold; the bounded 15-17 s window allows loop-scheduling tolerance but REJECTS an early transition that a bare <=15 would wrongly accept" },
+        { "key": "targets_hidden_within_seconds", "op": "between", "value": [60, 62], "unit": "s", "rationale": "targets hidden/offline AT the configured 60 s threshold; the bounded 60-62 s window allows loop-scheduling tolerance but REJECTS an early hide that a bare <=60 would wrongly accept" }
       ],
       "evidence": [
         { "name": "soak/serial-48h.log", "description": "48 h serial capture" },
-        { "name": "soak/heap-trend.csv", "description": "heap-over-time trend" },
         { "name": "soak/outage-recovery.log", "description": "controlled outage + recovery" }
       ]
     },
@@ -311,10 +317,17 @@
       "thresholds": [
         { "key": "boundary_trials_each", "op": ">=", "value": 3, "unit": "trials", "rationale": "repeated trials near each boundary" },
         { "key": "false_erase_count", "op": "==", "value": 0, "unit": "events", "rationale": "a single continuous hold (or any near-boundary trial) must never erase" },
-        { "key": "ignored_below_ms", "op": "==", "value": 40, "unit": "ms", "rationale": "tap_min_ms boundary" },
-        { "key": "arm_min_ms", "op": "==", "value": 8000, "unit": "ms", "rationale": "arm_ms boundary" },
-        { "key": "confirm_start_window_ms", "op": "==", "value": 10000, "unit": "ms", "rationale": "confirm_window_ms" },
-        { "key": "confirm_hold_min_ms", "op": "==", "value": 3000, "unit": "ms", "rationale": "confirm_hold_ms" }
+        { "key": "ignored_below_ms", "op": "==", "value": 40, "unit": "ms", "rationale": "tap_min_ms boundary constant" },
+        { "key": "arm_min_ms", "op": "==", "value": 8000, "unit": "ms", "rationale": "arm_ms boundary constant" },
+        { "key": "confirm_start_window_ms", "op": "==", "value": 10000, "unit": "ms", "rationale": "confirm_window_ms constant" },
+        { "key": "confirm_hold_min_ms", "op": "==", "value": 3000, "unit": "ms", "rationale": "confirm_hold_ms constant" },
+        { "key": "ignored_below_40ms_observed", "op": "==", "value": "yes", "unit": "", "rationale": "a < 40 ms press is OBSERVED to be ignored (not merely the documented constant)" },
+        { "key": "tap_40_999ms_observed", "op": "==", "value": "yes", "unit": "", "rationale": "a 40-999 ms press is OBSERVED to register as Tap" },
+        { "key": "deadband_1000_1999ms_observed", "op": "==", "value": "yes", "unit": "", "rationale": "a 1000-1999 ms press is OBSERVED to fall in the dead band (no action)" },
+        { "key": "configure_2000_7999ms_observed", "op": "==", "value": "yes", "unit": "", "rationale": "a 2000-7999 ms press is OBSERVED to Configure on release" },
+        { "key": "arm_only_at_8000ms_observed", "op": "==", "value": "yes", "unit": "", "rationale": ">= 8000 ms is OBSERVED to ONLY arm; the SAME continuous hold NEVER erases" },
+        { "key": "confirm_start_within_10000ms_observed", "op": "==", "value": "yes", "unit": "", "rationale": "the confirm second press is OBSERVED to be required to START within 10000 ms of release" },
+        { "key": "confirm_hold_min_3000ms_observed", "op": "==", "value": "yes", "unit": "", "rationale": "erase is OBSERVED to occur only when the confirm press is held >= 3000 ms" }
       ],
       "evidence": [
         { "name": "button/serial-boundaries.log", "description": "serial log of boundary classifications" },
@@ -336,7 +349,8 @@
       ],
       "thresholds": [
         { "key": "min_3v3_millivolts", "op": ">=", "value": 3000, "unit": "mV", "rationale": "Conservative floor. 3V3 nominal is 3300 mV; the ESP32-C3 brownout detector trips around 2.43-3.0 V. Requiring the measured minimum under load to stay >= 3000 mV flags a marginal supply. LABEL the probe point and measurement bandwidth (a scope min, not a multimeter average)." },
-        { "key": "interruption_trials", "op": ">=", "value": 10, "unit": "trials", "rationale": "enough interruption trials across commit and erase transactions to exercise the durable marker" },
+        { "key": "commit_interruption_trials", "op": ">=", "value": 5, "unit": "trials", "rationale": "at least 5 controlled power interruptions DURING a credential commit; kept SEPARATE from erase so an aggregate count can never let one path be skipped" },
+        { "key": "erase_interruption_trials", "op": ">=", "value": 5, "unit": "trials", "rationale": "at least 5 controlled power interruptions DURING an erase transaction; kept SEPARATE from commit" },
         { "key": "false_success_count", "op": "==", "value": 0, "unit": "events", "rationale": "a power loss mid-transaction must never be reported as a successful commit/erase" },
         { "key": "fail_closed_recovery_correct", "op": "==", "value": "yes", "unit": "", "rationale": "the NVS transaction marker must recover fail-closed on the next boot" }
       ],

@@ -135,9 +135,13 @@ HOW TO USE
      procedure, commands, thresholds, and evidence filenames.
   2. Drop each required evidence file at the path shown in hardware-results.json
      (relative to this hardware-evidence/ directory).
-  3. Fill in each item's threshold 'measured' values and 'operator' fields, and
-     set 'status' to 'pass' ONLY when every threshold is met with real evidence.
-  4. Run:  .\scripts\verify-hardware-evidence.ps1 -Path release/$commit
+  3. For each evidence entry, record the file's byte 'size' and full lowercase
+     'sha256' (the verifier re-hashes the file and binds it cryptographically;
+     the old editable 'present' boolean is gone).
+  4. Fill in each item's threshold 'measured' values and 'operator' fields
+     (name + ISO date YYYY-MM-DD are REQUIRED for a mandatory pass), and set
+     'status' to 'pass' ONLY when every threshold is met with real evidence.
+  5. Run:  .\scripts\verify-hardware-evidence.ps1 -Path release/$commit
      (add -Gate worker-promotion to evaluate the separate 72 h worker gate).
 
 This template contains NO passing evidence. The DEFAULT release image is

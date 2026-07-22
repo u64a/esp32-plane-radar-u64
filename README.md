@@ -924,16 +924,21 @@ pio run -t merge -e supermini
 
 Flash + verify the default merged image (put the board in download mode: hold
 **BOOT**, tap **RESET**), or use a Web-Serial flasher such as
-[esptool-js](https://espressif.github.io/esptool-js/) at offset **0x0**:
+[esptool-js](https://espressif.github.io/esptool-js/) at offset **0x0**. Use the
+**pinned** PlatformIO Python + `esptool.py` and pass the device serial port
+explicitly (`<COMx>`, e.g. `COM5`):
 
 ```powershell
-esptool.py --chip esp32c3 write_flash 0x0 release/<sha>/supermini/firmware-merged.bin
-esptool.py --chip esp32c3 verify_flash 0x0 release/<sha>/supermini/firmware-merged.bin
+$py = "$env:USERPROFILE\.platformio\penv\Scripts\python.exe"
+$esptool = "$env:USERPROFILE\.platformio\packages\tool-esptoolpy\esptool.py"
+& $py $esptool --chip esp32c3 --port <COMx> erase_flash
+& $py $esptool --chip esp32c3 --port <COMx> --baud 921600 write_flash --flash_mode keep --flash_freq 80m --flash_size 4MB 0x0 release/<sha>/supermini/firmware-merged.bin
+& $py $esptool --chip esp32c3 --port <COMx> verify_flash 0x0 release/<sha>/supermini/firmware-merged.bin
 ```
 
-The former Unix `scripts/merge-firmware.sh` helper (which wrote a single
-`release/plane-radar-merged.bin`) has been **retired** in favour of this
-Windows/local pipeline.
+The former Unix `scripts/merge-firmware.sh` helper (which existed in earlier
+phases and wrote a single `release/plane-radar-merged.bin`) has been **retired**
+in favour of this Windows/local pipeline.
 
 ## Phase 12 local release pipeline and hardware handoff
 
@@ -948,28 +953,35 @@ Release artifacts stay under the git-ignored `release/` directory.
 
 Fail-closed: the build aborts **before** building or publishing unless PlatformIO
 is exactly **6.1.19**; git `HEAD` exists with a clean tracked/index worktree, **no
-untracked files**, and **no git remote**; the output path resolves strictly inside
-`release/`; and every required source gate is green — `scripts/native-test.ps1`
-(**606/41**, which also runs the airport + egress gates), plus
-`check-native-test-access`, CA, provisioning, worker, and diagnostics policy gates.
+untracked files**, and **no git remote**; the publish path is always exactly
+`release/<full-git-sha>/` (there is **no** output-root override); and every required
+source gate is green — `scripts/native-test.ps1` (**606/41**, which also runs the
+airport + egress gates), plus `check-native-test-access`, CA, provisioning, worker,
+and diagnostics policy gates. There are **no certification bypasses** (no
+`-SkipSourceGates`/`-SkipBuild`/`-AllowDirtyWorktree`): every published package is
+**certified**. Iterate with direct `pio run` commands instead.
 
-It then deletes `.pio` once and freshly builds **and merges** exactly the five
-firmware envs (`supermini`, `supermini-worker`, `supermini-quiet`,
+It then deletes `.pio` once (reparse-point-safe) and freshly builds **and merges**
+exactly the five firmware envs (`supermini`, `supermini-worker`, `supermini-quiet`,
 `supermini-diag`, `supermini-worker-diag`), enforces the **exact** approved
 resource/file sizes (see [Build variants](#build-variants-phase-10) and
-[Memory budget](#memory-budget)), runs the current-head ELF/binary proofs, and
-only if **every** invariant passes stages and publishes the package to
-`release/<full-git-sha>/`. It refuses to overwrite an existing release unless
-`-Force` (which replaces only that exact validated path).
+[Memory budget](#memory-budget)), **verifies and records the OBSERVED installed
+toolchain/library versions** (PlatformIO platform, `framework-arduinoespressif32`,
+RISC-V toolchain, `esptool`, LovyanGFX, ArduinoJson) and fails on any drift from the
+pins, runs the current-head ELF/binary proofs, and only if **every** invariant
+passes stages and publishes the package to `release/<full-git-sha>/`. It refuses to
+overwrite an existing release unless `-Force` (which replaces only that exact
+validated path, reparse-point-safe).
 
 Output tree:
 
 ```
 release/<full-git-sha>/
   manifest.json          schema/commit/branch/UTC, local-only state, PlatformIO/
-                         platform/framework/toolchain/dependency pins, airport
-                         source commit, per-env options + RAM/flash/file sizes,
-                         SHA-256 of every file, proof + gate/test summary, and the
+                         platform/framework/toolchain/dependency pins PLUS the
+                         OBSERVED installed versions, airport source commit, per-env
+                         options + RAM/flash/file sizes, SHA-256 of every file,
+                         certification + proof + gate/test summary, and the
                          default-artifact identity (worker images are eval-only)
   CHECKSUMS.sha256       sorted "<sha256>  <path>" over manifest + all files
                          (except CHECKSUMS itself)
@@ -984,9 +996,12 @@ release/<full-git-sha>/
 ```
 
 The **only** default release image is **`supermini/firmware-merged.bin`**; the
-worker images are clearly marked **evaluation-only**. All files are LF / UTF-8
-without BOM. This package binds the **exact current-head binaries only** — it does
-**not** claim raw byte equivalence to any Phase 10/11 artifact.
+worker images are clearly marked **evaluation-only**. The **generated text
+metadata/logs** (`manifest.json`, `CHECKSUMS.sha256`, `binary-proof.json`/`.txt`,
+`build.log`, `merge.log`, `nm-symbols.txt`) are written **LF / UTF-8 without BOM**;
+the firmware `*.bin`/`*.elf`/`*.map` artifacts remain **binary** (byte-exact, never
+line-ending normalized). This package binds the **exact current-head binaries
+only** — it does **not** claim raw byte equivalence to any Phase 10/11 artifact.
 
 ### Current-head ELF/binary proofs
 
@@ -1025,24 +1040,43 @@ Re-verifies an existing package **without rebuilding**:
 .\scripts\verify-release.ps1 -SelfTest        # isolated tamper self-test
 ```
 
-It checks: safe path under `release/`; manifest↔directory commit binding (and, by
-default, that the commit matches the current `HEAD` — `-AllowStaleHead` validates
-an archived local package); every manifest artifact size + SHA-256; every
-`CHECKSUMS` line recomputed with no missing/extra/duplicate/traversal paths; the
-binary proof overall + every invariant pass; the default-artifact identity/role;
-and the approved exact resource policy. `-SelfTest` builds a synthetic package in
-an isolated temp fixture and proves the verifier accepts a well-formed package and
-rejects an artifact-byte change, a manifest-commit change, a corrupted checksum, a
-false proof, and traversal/duplicate/missing checksum entries. Works under Windows
-PowerShell 5.1 and pwsh 7.
+It **rejects by default** unless the package is a fully **certified**, clean,
+local-only, gate-green build whose manifest / CHECKSUMS / proof are mutually
+consistent. It checks: safe path under `release/`; manifest↔directory commit
+binding (and, by default, that the commit matches the current `HEAD` —
+`-AllowStaleHead` validates an archived but still-**certified** local package);
+`build.certified` + `clean_build`; `git.tracked_clean`, zero untracked files, and
+`local_only.no_remote`; the source gates are the **exact** duplicate-free policy
+set and every status is `passed` (with `gates_run` and a policy-consistent
+native-test summary); the pins **and the OBSERVED installed toolchain/library
+versions** both equal policy; every manifest artifact size + SHA-256; the artifact
+keys are **exactly** the per-env copied files + `binary-proof.json`/`.txt` (no
+unlisted extras / missing); every `CHECKSUMS` line recomputed with no
+missing/extra/duplicate and no traversal/absolute/ADS/unsafe path; the
+environments are the exact policy set with matching role/eval/options/resources;
+the default-artifact identity/role/size/hash; and the binary proof **re-derived
+from the packaged `firmware.elf`/`firmware.bin` with the pinned `nm`** — every
+declared invariant, total, category, and the manifest `proof_summary` must match
+the re-derivation (self-declared status is never trusted; there is no
+skip-recompute switch). `-SelfTest` builds a synthetic package in an isolated temp
+fixture and proves the verifier accepts a well-formed package and rejects a
+**31-case** tamper matrix (artifact byte, manifest commit, checksum corruption,
+`certified=false`, `clean_build=false`, dirty/untracked worktree, configured
+remote, skipped/missing/duplicate gate, `gates_run=false`, inconsistent native-test
+summary, expected/observed pin mismatch, env-option mismatch, default-size
+mismatch, unlisted extra file (even re-checksummed), wired extra file with an
+unexpected name, missing artifact file, forged/trimmed/contradictory proof, and
+traversal/duplicate/missing/ADS checksum entries). Works under Windows PowerShell
+5.1 and pwsh 7.
 
 ### Executable hardware handoff
 
 `scripts/hardware-acceptance-policy.json` is a strict, executable checklist split
 into **DEFAULT RELEASE** (items 1–8, 10–12) and a separate **WORKER PROMOTION**
-gate (item 9, a 72 h `supermini-worker-diag` soak). Each item has exact commands,
-numeric pass/fail thresholds, and exact evidence filenames, and binds evidence to
-the flashed image SHA.
+gate (item 9, a 72 h `supermini-worker-diag` soak). Each item has exact commands
+(flash/erase/verify via the **pinned** PlatformIO Python + `esptool.py` with an
+explicit `--port <COMx>`), numeric pass/fail thresholds, and exact evidence
+filenames, and binds evidence to the flashed image SHA.
 
 ```powershell
 # Create a PENDING evidence template bound to the exact flashed default image:
@@ -1051,25 +1085,42 @@ the flashed image SHA.
 # After an operator completes real-hardware evidence, verify a gate:
 .\scripts\verify-hardware-evidence.ps1 -Path release/<sha>                       # default release
 .\scripts\verify-hardware-evidence.ps1 -Path release/<sha> -Gate worker-promotion
-.\scripts\verify-hardware-evidence.ps1 -SelfTest                                 # isolated self-test
+.\scripts\verify-hardware-evidence.ps1 -SelfTest                                 # isolated self-test (21 cases)
 ```
 
-`initialize-hardware-evidence.ps1` first re-verifies the release, then writes
-`release/<sha>/hardware-evidence/hardware-results.json` (every item `pending`, with
-thresholds, expected evidence filenames, and operator fields) plus the empty
-evidence subdirectories — it **never** fabricates passing evidence, and the
-evidence lives under the ignored release package (never committed).
-`verify-hardware-evidence.ps1` re-verifies the release, requires the results to
-bind to the exact default merged image SHA/size/commit, and requires every
-mandatory item `pass` with all required non-empty evidence and every numeric value
-at/above/below its threshold (it fails on `pending`/`blocked`/`waived`). It only
-**reports** worker-promotion readiness — it never promotes the worker; the default
-artifact always remains `supermini`.
+`initialize-hardware-evidence.ps1` first re-verifies the (certified) release, then
+writes `release/<sha>/hardware-evidence/hardware-results.json` (every item
+`pending`, with thresholds, expected evidence filenames each scaffolded
+`size=null`/`sha256=""`, and operator fields) plus the empty evidence
+subdirectories — it **never** fabricates passing evidence, and the evidence lives
+under the ignored release package (never committed).
+`verify-hardware-evidence.ps1` re-verifies the release, validates the results
+`schema`/`schema_version`/`policy_ref`, requires the item set to be **exactly** the
+policy items (no missing/extra/duplicate), binds the top-level **and each item** to
+their exact flashed image path/size/SHA-256/gate/order/environment, requires each
+item's thresholds and evidence names to match policy exactly (the operator may edit
+only `measured`), and — for every mandatory item — requires `status=pass`, a
+non-empty operator name + ISO date, and each evidence file present, non-empty, with
+its recorded `size` + lowercase `sha256` **re-hashed and matched** (cryptographic
+binding; the old editable `present` flag is gone). It fails on
+`pending`/`blocked`/`waived`, only **reports** worker-promotion readiness, and never
+promotes the worker; the default artifact always remains `supermini`. The
+self-test exercises 21 cases (wrong image SHA/size/path/environment,
+duplicate/extra item, forged evidence hash/size, missing operator, non-ISO date,
+ADS/traversal evidence path, pending status, threshold + bounded-`between` failures,
+weakened/missing threshold, empty/missing evidence).
 
 Item 6 measures memory/performance on the `supermini-diag` build of the **same
-commit**, but the released default remains `supermini`. Thresholds are conservative
-and justified in the policy from the ESP32-C3 one-framebuffer design (240×240
-RGB565 sprite ≈ 115 KB, ~23 ms SPI transfer floor at 40 MHz) rather than any
+commit** (the default `supermini` emits no heap metrics), including the long-term
+(≥ 6 h) heap-trend / steady-state drift (≤ 4096 B on like-for-like post-fetch
+samples); the released default remains `supermini`. The separate 48 h default-image
+soak (item 8) covers resets/recovery and the **bounded** stale (15–17 s) / offline
+(60–62 s) transitions. Dense airspace (item 7) uses a **concurrent operator-side
+HTTPS query** to the exact `/api/v3/lat/%.6f/lon/%.6f/dist/%.1f` provider request to
+observe ≥ 65 source objects (the device retained count is capped at 64). Thresholds
+are conservative and justified in the policy from the ESP32-C3 one-framebuffer
+design (240×240 RGB565 sprite ≈ 115 KB against the 327,680-byte / 320 KiB
+application RAM budget, ~23 ms SPI transfer floor at 40 MHz) rather than any
 measured claim.
 
 ### Headless goldens vs hardware-only panel proof

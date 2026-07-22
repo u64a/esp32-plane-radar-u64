@@ -76,8 +76,20 @@ function Invoke-VerifierSelfTest {
     if ($condition) { $script:selfTestPass++; Write-Host "  [ok] $label" -ForegroundColor Green }
     else { $script:selfTestFail++; Write-Host "  [FAIL] $label" -ForegroundColor Red }
   }
+  $proofStub = { param($pkg, $pol) Get-FixtureProofInvariants -EnvName 'supermini' }
   function Run-Verify([string]$dir, [string]$policyPath) {
-    return Test-ReleasePackage -PackagePath $dir -PolicyPath $policyPath -RequireUnderReleaseRoot $false -RequireHeadMatch $true -ExpectedHeadCommit $commit -Quiet
+    return Test-ReleasePackage -PackagePath $dir -PolicyPath $policyPath -RequireUnderReleaseRoot $false -RequireHeadMatch $true -ExpectedHeadCommit $commit -ProofRecomputer $proofStub -Quiet
+  }
+  # Re-write CHECKSUMS after a manifest/proof edit so the intended NEW check is the
+  # one that fails (not merely a checksum mismatch).
+  function Rechecksum([string]$dir) { Write-PackageChecksums -PackageDir $dir }
+  function Edit-Manifest([string]$dir, [scriptblock]$mut) {
+    $mp = Join-Path $dir 'manifest.json'; $man = Get-Content -Raw $mp | ConvertFrom-Json
+    & $mut $man; Write-JsonFileLf $mp $man; Rechecksum $dir
+  }
+  function Edit-Proof([string]$dir, [scriptblock]$mut) {
+    $pp = Join-Path $dir 'binary-proof.json'; $obj = Get-Content -Raw $pp | ConvertFrom-Json
+    & $mut $obj; Write-JsonFileLf $pp $obj; Rechecksum $dir
   }
   try {
     # -- Baseline: a well-formed fixture MUST verify. --------------------------
@@ -176,6 +188,119 @@ function Invoke-VerifierSelfTest {
       Write-JsonFileLf $mp $man2; Write-PackageChecksums -PackageDir $dir
     }
     Expect "rejects manifest resource != policy" (-not (Run-Verify $d $polPath).Ok)
+
+    # ---- Certification tamper matrix (Phase 12 fail-closed) -----------------
+
+    # 9. Non-certified build (build.certified=false).
+    $d = New-Tampered 'tamper-uncertified' { param($dir) Edit-Manifest $dir { param($m) $m.build.certified = $false } }
+    Expect "rejects build.certified=false" (-not (Run-Verify $d $polPath).Ok)
+
+    # 10. clean_build=false.
+    $d = New-Tampered 'tamper-dirty-build' { param($dir) Edit-Manifest $dir { param($m) $m.build.clean_build = $false } }
+    Expect "rejects build.clean_build=false" (-not (Run-Verify $d $polPath).Ok)
+
+    # 11. Dirty tracked worktree.
+    $d = New-Tampered 'tamper-tracked-dirty' { param($dir) Edit-Manifest $dir { param($m) $m.git.tracked_clean = $false } }
+    Expect "rejects git.tracked_clean=false" (-not (Run-Verify $d $polPath).Ok)
+
+    # 12. Untracked files present.
+    $d = New-Tampered 'tamper-untracked' { param($dir) Edit-Manifest $dir { param($m) $m.git.untracked_files = 3 } }
+    Expect "rejects git.untracked_files>0" (-not (Run-Verify $d $polPath).Ok)
+
+    # 13. Remote configured (not local-only).
+    $d = New-Tampered 'tamper-remote' { param($dir) Edit-Manifest $dir { param($m) $m.local_only.no_remote = $false } }
+    Expect "rejects local_only.no_remote=false" (-not (Run-Verify $d $polPath).Ok)
+
+    # 14. Gate status skipped.
+    $d = New-Tampered 'tamper-gate-skipped' { param($dir) Edit-Manifest $dir { param($m) $m.gates[0].status = 'skipped' } }
+    Expect "rejects a skipped source gate" (-not (Run-Verify $d $polPath).Ok)
+
+    # 15. Missing gate (drop one from the required set).
+    $d = New-Tampered 'tamper-gate-missing' { param($dir) Edit-Manifest $dir { param($m) $m.gates = @($m.gates[0]) } }
+    Expect "rejects a missing source gate" (-not (Run-Verify $d $polPath).Ok)
+
+    # 16. Duplicate gate.
+    $d = New-Tampered 'tamper-gate-duplicate' { param($dir) Edit-Manifest $dir { param($m) $m.gates = @($m.gates[0], $m.gates[0], $m.gates[1]) } }
+    Expect "rejects a duplicate source gate" (-not (Run-Verify $d $polPath).Ok)
+
+    # 17. gates_run=false.
+    $d = New-Tampered 'tamper-gates-not-run' { param($dir) Edit-Manifest $dir { param($m) $m.tests.gates_run = $false } }
+    Expect "rejects tests.gates_run=false" (-not (Run-Verify $d $polPath).Ok)
+
+    # 18. native-test summary inconsistent with policy.
+    $d = New-Tampered 'tamper-native-summary' { param($dir) Edit-Manifest $dir { param($m) $m.tests.native_test = 'tampered summary' } }
+    Expect "rejects inconsistent native-test summary" (-not (Run-Verify $d $polPath).Ok)
+
+    # 19. Expected pin mismatch (framework version altered).
+    $d = New-Tampered 'tamper-pin-expected' { param($dir) Edit-Manifest $dir { param($m) $m.pins.framework_arduinoespressif32 = 'WRONG' } }
+    Expect "rejects expected pin mismatch" (-not (Run-Verify $d $polPath).Ok)
+
+    # 20. Observed pin mismatch (installed toolchain version altered).
+    $d = New-Tampered 'tamper-pin-observed' { param($dir) Edit-Manifest $dir { param($m) $m.pins.observed.tool_esptoolpy = 'WRONG' } }
+    Expect "rejects observed pin mismatch" (-not (Run-Verify $d $polPath).Ok)
+
+    # 21. Environment option mismatch (log_level flipped).
+    $d = New-Tampered 'tamper-env-option' { param($dir) Edit-Manifest $dir { param($m) $m.environments[0].options.log_level = 0 } }
+    Expect "rejects env option mismatch" (-not (Run-Verify $d $polPath).Ok)
+
+    # 22. Default artifact size mismatch (size no longer binds artifact entry).
+    $d = New-Tampered 'tamper-default-size' { param($dir) Edit-Manifest $dir { param($m) $m.default_artifact.size = 999999 } }
+    Expect "rejects default artifact size mismatch" (-not (Run-Verify $d $polPath).Ok)
+
+    # 23. Unlisted extra file, CHECKSUMS RECOMPUTED to cover it (manifest NOT updated).
+    $d = New-Tampered 'tamper-extra-checksummed' {
+      param($dir)
+      [System.IO.File]::WriteAllBytes((Join-Path $dir 'supermini\rogue.bin'), [byte[]](1..16))
+      Rechecksum $dir   # covers the rogue file, but it is still not a manifest artifact
+    }
+    Expect "rejects unlisted extra file (even re-checksummed)" (-not (Run-Verify $d $polPath).Ok)
+
+    # 24. Extra file fully wired into artifacts + CHECKSUMS (wrong copied-artifact name).
+    $d = New-Tampered 'tamper-extra-wired' {
+      param($dir)
+      [System.IO.File]::WriteAllBytes((Join-Path $dir 'supermini\rogue.bin'), [byte[]](1..16))
+      $art = New-PackageArtifactsMap -PackageDir $dir -ExcludeRel @('manifest.json', 'CHECKSUMS.sha256')
+      Edit-Manifest $dir { param($m) $m.artifacts = $art }
+    }
+    Expect "rejects wired extra file (unexpected artifact name)" (-not (Run-Verify $d $polPath).Ok)
+
+    # 25. Manifest-listed artifact whose file is missing.
+    $d = New-Tampered 'tamper-artifact-missing-file' {
+      param($dir)
+      Remove-Item -LiteralPath (Join-Path $dir 'supermini\firmware.map') -Force
+      Rechecksum $dir
+    }
+    Expect "rejects manifest artifact with missing file" (-not (Run-Verify $d $polPath).Ok)
+
+    # 26. Forged proof: an invariant status flipped to 'fail' (overall left 'pass').
+    $d = New-Tampered 'tamper-proof-forged-status' { param($dir) Edit-Proof $dir { param($p) $p.invariants[0].status = 'fail' } }
+    Expect "rejects forged invariant status" (-not (Run-Verify $d $polPath).Ok)
+
+    # 27. Forged proof: an invariant observed value altered (contradicts re-derivation).
+    $d = New-Tampered 'tamper-proof-forged-observed' { param($dir) Edit-Proof $dir { param($p) $p.invariants[0].observed = 'tampered' } }
+    Expect "rejects forged invariant observed" (-not (Run-Verify $d $polPath).Ok)
+
+    # 28. Trimmed proof: an invariant removed and totals lowered to match.
+    $d = New-Tampered 'tamper-proof-trimmed' {
+      param($dir)
+      Edit-Proof $dir { param($p) $p.invariants = @($p.invariants[0]); $p.total = 1; $p.passed = 1 }
+    }
+    Expect "rejects trimmed proof invariant set" (-not (Run-Verify $d $polPath).Ok)
+
+    # 29. Contradictory proof totals (overall 'pass' but declared failed>0).
+    $d = New-Tampered 'tamper-proof-contradictory' {
+      param($dir)
+      Edit-Proof $dir { param($p) $p.passed = 1; $p.failed = 1 }
+    }
+    Expect "rejects contradictory proof totals" (-not (Run-Verify $d $polPath).Ok)
+
+    # 30. ADS / colon path smuggled into CHECKSUMS.
+    $d = New-Tampered 'tamper-ads-checksum' {
+      param($dir)
+      $cp = Join-Path $dir 'CHECKSUMS.sha256'
+      Add-Content -LiteralPath $cp -Value (("{0}  {1}" -f ('a' * 64), 'supermini/firmware.bin:evil'))
+    }
+    Expect "rejects ADS/colon CHECKSUMS path" (-not (Run-Verify $d $polPath).Ok)
   }
   finally {
     if (Test-Path $fixtureRoot) { Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue }
