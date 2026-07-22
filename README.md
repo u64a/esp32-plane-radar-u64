@@ -957,32 +957,39 @@ untracked files**, and **no git remote**; the publish path is always exactly
 `release/<full-git-sha>/` (there is **no** output-root override); and every required
 source gate is green — `scripts/native-test.ps1` (**606/41**, which also runs the
 airport + egress gates), plus `check-native-test-access`, CA, provisioning, worker,
-and diagnostics policy gates. There are **no certification bypasses** (no
-`-SkipSourceGates`/`-SkipBuild`/`-AllowDirtyWorktree`): every published package is
-**certified**. Iterate with direct `pio run` commands instead.
+and diagnostics policy gates. The certification policy is the **tracked git-blob**
+`release-policy.json` at `HEAD` (not the working tree); its SHA-256 is recorded in
+the manifest as `policy_sha256`. There are **no certification bypasses** (no
+`-SkipSourceGates`/`-SkipBuild`/`-AllowDirtyWorktree`/`-PolicyPath`): every
+published package is **certified**. Iterate with direct `pio run` commands instead.
 
 It then deletes `.pio` once (reparse-point-safe) and freshly builds **and merges**
 exactly the five firmware envs (`supermini`, `supermini-worker`, `supermini-quiet`,
 `supermini-diag`, `supermini-worker-diag`), enforces the **exact** approved
-resource/file sizes (see [Build variants](#build-variants-phase-10) and
-[Memory budget](#memory-budget)), **verifies and records the OBSERVED installed
+resource/file sizes **and the exact policy SHA-256** of each env's `firmware.bin`
+and shipped `firmware-merged.bin` (see [Build variants](#build-variants-phase-10)
+and [Memory budget](#memory-budget)), **verifies and records the OBSERVED installed
 toolchain/library versions** (PlatformIO platform, `framework-arduinoespressif32`,
 RISC-V toolchain, `esptool`, LovyanGFX, ArduinoJson) and fails on any drift from the
-pins, runs the current-head ELF/binary proofs, and only if **every** invariant
-passes stages and publishes the package to `release/<full-git-sha>/`. It refuses to
-overwrite an existing release unless `-Force` (which replaces only that exact
-validated path, reparse-point-safe).
+pins, runs the current-head ELF/binary proofs (symbol/logging **and** the
+re-derived merged-layout invariants), and only if **every** invariant passes stages
+and publishes the package to `release/<full-git-sha>/`. **Immediately before
+staging** it re-runs the Git source-gate and requires the same commit/branch, a
+clean tracked worktree, zero untracked files, and no remote (closing the
+source-gate/build TOCTOU); a failed stage/publish cleans only its exact validated
+`.stage-*` directory. It refuses to overwrite an existing release unless `-Force`
+(which replaces only that exact validated path, reparse-point-safe).
 
 Output tree:
 
 ```
 release/<full-git-sha>/
-  manifest.json          schema/commit/branch/UTC, local-only state, PlatformIO/
-                         platform/framework/toolchain/dependency pins PLUS the
-                         OBSERVED installed versions, airport source commit, per-env
-                         options + RAM/flash/file sizes, SHA-256 of every file,
-                         certification + proof + gate/test summary, and the
-                         default-artifact identity (worker images are eval-only)
+  manifest.json          schema/commit/branch/UTC, local-only state, tracked-policy
+                         SHA-256, PlatformIO/platform/framework/toolchain/dependency
+                         pins PLUS the OBSERVED installed versions, airport source
+                         commit, per-env options + RAM/flash/file sizes, SHA-256 of
+                         every file, certification + proof + gate/test summary, and
+                         the default-artifact identity (worker images are eval-only)
   CHECKSUMS.sha256       sorted "<sha256>  <path>" over manifest + all files
                          (except CHECKSUMS itself)
   binary-proof.json      machine-readable proof (every invariant, pass/fail)
@@ -1005,9 +1012,12 @@ only** — it does **not** claim raw byte equivalence to any Phase 10/11 artifac
 
 ### Current-head ELF/binary proofs
 
-Using the pinned PlatformIO RISC-V `nm` and binary-safe byte searching, the build
-proves and records (pass/fail) for every env, aborting before publishing on any
-failure:
+The per-environment proof spec is defined **once** in `scripts/release-common.ps1`
+(`Get-ProofSpec` / `Get-BinaryProofInvariants` / `Get-MergedLayoutInvariants`) and
+is re-derived **byte-for-byte identically** by `build-release` (at build time) and
+`verify-release` (from the packaged binaries). Using the pinned PlatformIO RISC-V
+`nm` and binary-safe byte searching, the build proves and records (pass/fail) for
+every env, aborting before publishing on any failure:
 
 - the default `supermini` links **zero** worker/integration symbols (`workerTask`,
   `s_worker_stack`, `s_worker_tcb`, `s_request_q`, `s_result_q`, `workerCancel`),
@@ -1028,8 +1038,27 @@ failure:
   appears in every build's portal HTML and is deliberately not used as an
   indicator).
 
-A compact `nm-symbols.txt` (the relevant demangled symbols) is saved per env for
-later audit.
+**Exact-SHA anchoring of the shipped image (Phase 12 final).** Self-consistent
+manifest hashes are *not* an anchor, so the shipped/flashed **`firmware-merged.bin`**
+(and `firmware.bin`) of every env is bound to **tracked policy**. `release-policy.json`
+records the exact approved SHA-256 of each env's `firmware.bin` and
+`firmware-merged.bin` (`environments[].sha256`) plus a `merged_layout` block, and the
+build **and** verify re-derive **directly from the shipped merged bytes** (never
+`merge.log` text):
+
+- each merged image's component regions — **bootloader @ 0x0**, **partitions @ 0x8000**,
+  **boot_app0 @ 0xe000** — match their fixed offset/size and exact SHA-256 (identical
+  across all five envs);
+- the region at **app_offset (0x10000)** is **byte-for-byte** equal to that env's
+  `firmware.bin`, and the merged length equals `0x10000 + firmware.bin length`;
+- every gap between a component end and the next offset is entirely **0xFF**;
+- the packaged `firmware.bin`/`firmware-merged.bin` equal the exact policy SHA-256.
+
+A same-length all-zero (or app-/bootloader-region-swapped) merged image — even with
+the manifest, nested artifact maps, `default_artifact`, and `CHECKSUMS` all
+consistently updated — is therefore **rejected** on the exact policy SHA and/or the
+re-derived merged-layout invariants. A compact `nm-symbols.txt` (the relevant
+demangled symbols) is saved per env for later audit.
 
 ### Verify a release (`scripts/verify-release.ps1`)
 
@@ -1042,32 +1071,50 @@ Re-verifies an existing package **without rebuilding**:
 
 It **rejects by default** unless the package is a fully **certified**, clean,
 local-only, gate-green build whose manifest / CHECKSUMS / proof are mutually
-consistent. It checks: safe path under `release/`; manifest↔directory commit
-binding (and, by default, that the commit matches the current `HEAD` —
-`-AllowStaleHead` validates an archived but still-**certified** local package);
+consistent. The **certification policy is bound to Git**: `release-policy.json`
+(and, for the hardware handoff, `hardware-acceptance-policy.json`) is loaded from
+the **exact commit blob** the package was built at (`git show <commit>:…`), never
+the editable working tree, and the manifest records a `policy_sha256` that must
+equal the SHA-256 of those exact git-blob bytes — a dirty/attacker-modified
+working-tree policy cannot influence certification, and there is **no**
+`-PolicyPath` override. It checks: safe path under `release/` (and no
+symlink/junction/reparse point on the release root or anywhere in the package
+subtree); manifest↔directory commit binding (and, by default, that the commit
+matches the current `HEAD` — `-AllowStaleHead` validates an archived but
+still-**certified** local package, using the policy **at the package commit**);
 `build.certified` + `clean_build`; `git.tracked_clean`, zero untracked files, and
 `local_only.no_remote`; the source gates are the **exact** duplicate-free policy
 set and every status is `passed` (with `gates_run` and a policy-consistent
-native-test summary); the pins **and the OBSERVED installed toolchain/library
-versions** both equal policy; every manifest artifact size + SHA-256; the artifact
-keys are **exactly** the per-env copied files + `binary-proof.json`/`.txt` (no
-unlisted extras / missing); every `CHECKSUMS` line recomputed with no
-missing/extra/duplicate and no traversal/absolute/ADS/unsafe path; the
-environments are the exact policy set with matching role/eval/options/resources;
+native-test summary); **every** declared pin (core + verified banner string /
+platform / framework / framework package / toolchain / esptool / **board** /
+**mcu** / **flash_size** / **app_offset** / dependencies) **and the OBSERVED
+installed toolchain/library versions** both equal policy; every manifest artifact
+size + SHA-256 **and env ownership**; the **exact policy SHA-256** of each env's
+`firmware.bin` and shipped `firmware-merged.bin`; the artifact keys are **exactly**
+the per-env copied files + `binary-proof.json`/`.txt` (no unlisted extras /
+missing); every `CHECKSUMS` line recomputed with no missing/extra/duplicate and no
+traversal/absolute/ADS/unsafe path; the environments are the **exact duplicate-free**
+policy set with matching role/eval/options/resources, and each env's **nested
+artifact map** is an exact copy of the flat map (a forged nested hash is rejected);
 the default-artifact identity/role/size/hash; and the binary proof **re-derived
-from the packaged `firmware.elf`/`firmware.bin` with the pinned `nm`** — every
-declared invariant, total, category, and the manifest `proof_summary` must match
-the re-derivation (self-declared status is never trusted; there is no
-skip-recompute switch). `-SelfTest` builds a synthetic package in an isolated temp
-fixture and proves the verifier accepts a well-formed package and rejects a
-**31-case** tamper matrix (artifact byte, manifest commit, checksum corruption,
-`certified=false`, `clean_build=false`, dirty/untracked worktree, configured
-remote, skipped/missing/duplicate gate, `gates_run=false`, inconsistent native-test
-summary, expected/observed pin mismatch, env-option mismatch, default-size
-mismatch, unlisted extra file (even re-checksummed), wired extra file with an
-unexpected name, missing artifact file, forged/trimmed/contradictory proof, and
-traversal/duplicate/missing/ADS checksum entries). Works under Windows PowerShell
-5.1 and pwsh 7.
+from the packaged `firmware.elf`/`firmware.bin`/`firmware-merged.bin` with the
+pinned `nm`** (including the merged-layout invariants) — every declared invariant,
+total, category, and the manifest `proof_summary` must match the re-derivation
+(self-declared status is never trusted; there is no skip-recompute switch).
+`-SelfTest` builds a synthetic package in an isolated temp fixture (whose merged
+image has a real component/gap/app layout) and proves the verifier accepts a
+well-formed package and rejects a **43-case** tamper matrix: artifact byte,
+manifest commit, checksum corruption, `certified=false`, `clean_build=false`,
+dirty/untracked worktree, configured remote, skipped/missing/duplicate gate,
+`gates_run=false`, inconsistent native-test summary, expected/observed pin
+mismatch, env-option mismatch, default-size mismatch, unlisted/wired extra file,
+missing artifact file, forged/trimmed/contradictory proof,
+traversal/duplicate/missing/ADS checksum entries, **same-length all-zero merged**,
+**app-region and bootloader-region merged mismatches** (each fully re-sealed),
+wrong **board/mcu/app_offset/framework** pins, **duplicate environment**, **forged
+nested artifact hash**, wrong flat-artifact **owner**, tampered
+**`policy_sha256`**, and a **reparse-point (junction)** planted inside the package.
+Works under Windows PowerShell 5.1 and pwsh 7.
 
 ### Executable hardware handoff
 
@@ -1085,7 +1132,7 @@ filenames, and binds evidence to the flashed image SHA.
 # After an operator completes real-hardware evidence, verify a gate:
 .\scripts\verify-hardware-evidence.ps1 -Path release/<sha>                       # default release
 .\scripts\verify-hardware-evidence.ps1 -Path release/<sha> -Gate worker-promotion
-.\scripts\verify-hardware-evidence.ps1 -SelfTest                                 # isolated self-test (21 cases)
+.\scripts\verify-hardware-evidence.ps1 -SelfTest                                 # isolated self-test (24 cases)
 ```
 
 `initialize-hardware-evidence.ps1` first re-verifies the (certified) release, then
@@ -1093,22 +1140,31 @@ writes `release/<sha>/hardware-evidence/hardware-results.json` (every item
 `pending`, with thresholds, expected evidence filenames each scaffolded
 `size=null`/`sha256=""`, and operator fields) plus the empty evidence
 subdirectories — it **never** fabricates passing evidence, and the evidence lives
-under the ignored release package (never committed).
-`verify-hardware-evidence.ps1` re-verifies the release, validates the results
-`schema`/`schema_version`/`policy_ref`, requires the item set to be **exactly** the
-policy items (no missing/extra/duplicate), binds the top-level **and each item** to
-their exact flashed image path/size/SHA-256/gate/order/environment, requires each
-item's thresholds and evidence names to match policy exactly (the operator may edit
-only `measured`), and — for every mandatory item — requires `status=pass`, a
-non-empty operator name + ISO date, and each evidence file present, non-empty, with
-its recorded `size` + lowercase `sha256` **re-hashed and matched** (cryptographic
-binding; the old editable `present` flag is gone). It fails on
-`pending`/`blocked`/`waived`, only **reports** worker-promotion readiness, and never
-promotes the worker; the default artifact always remains `supermini`. The
-self-test exercises 21 cases (wrong image SHA/size/path/environment,
-duplicate/extra item, forged evidence hash/size, missing operator, non-ISO date,
-ADS/traversal evidence path, pending status, threshold + bounded-`between` failures,
-weakened/missing threshold, empty/missing evidence).
+under the ignored release package (never committed). Both scripts load the
+`hardware-acceptance-policy.json` (and `release-policy.json`) from the **tracked git
+commit blob** of the package — there is **no** `-HardwarePolicyPath`/`-PolicyPath`
+override — and bind the exact hardware-policy SHA-256 into the results
+(`policy_sha256`), which the verifier re-checks; they also reject a
+symlink/junction/reparse point on the release root, the evidence root, any
+ancestor, or anywhere under the evidence tree.
+`verify-hardware-evidence.ps1` re-verifies the release, validates the authoritative
+policy `schema`/`schema_version` and the results
+`schema`/`schema_version`/`policy_ref`/`policy_sha256`, requires the item set to be
+**exactly** the policy items (no missing/extra/duplicate), binds the top-level
+**and each item** to their exact flashed image path/size/SHA-256/gate/order/
+environment, requires each item's thresholds and evidence names to match policy
+exactly (the operator may edit only `measured`), and — for every mandatory item —
+requires `status=pass`, a non-empty operator name + a **real** ISO calendar date
+(`yyyy-MM-dd` parsed invariantly, so `2026-99-99`/`2026-02-30` are rejected), and
+each evidence file present, non-empty, with its recorded `size` + lowercase
+`sha256` **re-hashed and matched** (cryptographic binding; the old editable
+`present` flag is gone). It fails on `pending`/`blocked`/`waived`, only **reports**
+worker-promotion readiness, and never promotes the worker; the default artifact
+always remains `supermini`. The self-test exercises 24 cases (wrong image
+SHA/size/path/environment, duplicate/extra item, forged evidence hash/size, missing
+operator, non-ISO **and impossible-calendar** dates, ADS/traversal evidence path,
+pending status, threshold + bounded-`between` failures, weakened/missing threshold,
+empty/missing evidence, forged `policy_sha256`).
 
 Item 6 measures memory/performance on the `supermini-diag` build of the **same
 commit** (the default `supermini` emits no heap metrics), including the long-term

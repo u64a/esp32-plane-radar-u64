@@ -30,9 +30,6 @@
 
 .PARAMETER SelfTest
   Run the isolated tamper self-test instead of verifying a real package.
-
-.PARAMETER PolicyPath
-  Override the approved policy file (default: scripts/release-policy.json).
 #>
 [CmdletBinding(DefaultParameterSetName = 'Verify')]
 param(
@@ -41,8 +38,7 @@ param(
   [Parameter(ParameterSetName = 'Verify')]
   [switch]$AllowStaleHead,
   [Parameter(ParameterSetName = 'SelfTest')]
-  [switch]$SelfTest,
-  [string]$PolicyPath
+  [switch]$SelfTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,7 +47,10 @@ Set-Location -LiteralPath $repoRoot
 [Environment]::CurrentDirectory = $repoRoot
 . "$PSScriptRoot\release-common.ps1"
 
-if (-not $PolicyPath) { $PolicyPath = Join-Path $PSScriptRoot 'release-policy.json' }
+# The certification policy is ALWAYS the tracked git-blob release-policy.json at
+# the package's commit (loaded in the entry point below). There is NO public
+# working-tree/custom policy override; the only policy injection is the isolated
+# self-test fixture seam inside Test-ReleasePackage.
 
 # ===========================================================================
 # Test-ReleasePackage + New-MinimalReleasePackage are provided by
@@ -76,13 +75,40 @@ function Invoke-VerifierSelfTest {
     if ($condition) { $script:selfTestPass++; Write-Host "  [ok] $label" -ForegroundColor Green }
     else { $script:selfTestFail++; Write-Host "  [FAIL] $label" -ForegroundColor Red }
   }
-  $proofStub = { param($pkg, $pol) Get-FixtureProofInvariants -EnvName 'supermini' }
+  $proofStub = {
+    param($pkg, $pol)
+    $inv = @(Get-FixtureProofInvariants -EnvName 'supermini')
+    $merged = Join-Path $pkg 'supermini\firmware-merged.bin'
+    $fw = Join-Path $pkg 'supermini\firmware.bin'
+    $inv += @(Get-MergedLayoutInvariants -Policy $pol -Name 'supermini' -MergedPath $merged -FirmwarePath $fw)
+    return $inv
+  }
   function Run-Verify([string]$dir, [string]$policyPath) {
     return Test-ReleasePackage -PackagePath $dir -PolicyPath $policyPath -RequireUnderReleaseRoot $false -RequireHeadMatch $true -ExpectedHeadCommit $commit -ProofRecomputer $proofStub -Quiet
   }
   # Re-write CHECKSUMS after a manifest/proof edit so the intended NEW check is the
   # one that fails (not merely a checksum mismatch).
   function Rechecksum([string]$dir) { Write-PackageChecksums -PackageDir $dir }
+  # Re-derive the flat artifacts map, nested env artifacts, and default_artifact
+  # size/SHA from the ACTUAL files, then rewrite manifest + CHECKSUMS. This is the
+  # "consistent reseal" a hostile actor performs after swapping merged bytes -- so
+  # ONLY the tracked-policy SHA anchor / merged-layout re-derivation can catch it.
+  function Reseal([string]$dir) {
+    $mp = Join-Path $dir 'manifest.json'
+    $man = Get-Content -Raw $mp | ConvertFrom-Json
+    $art = New-PackageArtifactsMap -PackageDir $dir -ExcludeRel @('manifest.json', 'CHECKSUMS.sha256')
+    $man.artifacts = $art
+    foreach ($e in $man.environments) {
+      $nm = [string]$e.name
+      $nested = [ordered]@{}
+      foreach ($rel in $art.Keys) { if ($rel.StartsWith("$nm/")) { $nested[$rel.Substring($nm.Length + 1)] = $art[$rel] } }
+      $e.artifacts = $nested
+    }
+    $defRel2 = [string]$man.default_artifact.relative_path
+    if ($art.Contains($defRel2)) { $man.default_artifact.size = $art[$defRel2].size; $man.default_artifact.sha256 = $art[$defRel2].sha256 }
+    Write-JsonFileLf $mp $man
+    Write-PackageChecksums -PackageDir $dir
+  }
   function Edit-Manifest([string]$dir, [scriptblock]$mut) {
     $mp = Join-Path $dir 'manifest.json'; $man = Get-Content -Raw $mp | ConvertFrom-Json
     & $mut $man; Write-JsonFileLf $mp $man; Rechecksum $dir
@@ -301,6 +327,99 @@ function Invoke-VerifierSelfTest {
       Add-Content -LiteralPath $cp -Value (("{0}  {1}" -f ('a' * 64), 'supermini/firmware.bin:evil'))
     }
     Expect "rejects ADS/colon CHECKSUMS path" (-not (Run-Verify $d $polPath).Ok)
+
+    # ---- Phase 12 FINAL: hostile merged-image swaps (coordinator repro) ------
+    # Each swaps the SHIPPED firmware-merged.bin bytes then CONSISTENTLY reseals
+    # manifest (flat + nested + default) and CHECKSUMS; only the tracked exact
+    # policy SHA anchor and/or the re-derived merged-layout invariants catch them.
+
+    # 31. Same-length ALL-ZERO default merged, fully resealed.
+    $d = New-Tampered 'tamper-merged-zero' {
+      param($dir)
+      $p = Join-Path $dir 'supermini\firmware-merged.bin'
+      $len = [int](Get-Item $p).Length
+      [System.IO.File]::WriteAllBytes($p, (New-Object byte[] $len))
+      Reseal $dir
+    }
+    Expect "rejects same-length all-zero merged (resealed)" (-not (Run-Verify $d $polPath).Ok)
+
+    # 32. App-region byte mismatch (merged app != firmware.bin), resealed.
+    $d = New-Tampered 'tamper-merged-app' {
+      param($dir)
+      $p = Join-Path $dir 'supermini\firmware-merged.bin'
+      $b = [System.IO.File]::ReadAllBytes($p)
+      $b[$b.Length - 1] = [byte](($b[$b.Length - 1] + 1) % 256)   # last byte is in the app region
+      [System.IO.File]::WriteAllBytes($p, $b)
+      Reseal $dir
+    }
+    Expect "rejects merged app-region mismatch (resealed)" (-not (Run-Verify $d $polPath).Ok)
+
+    # 33. Bootloader-region byte mismatch (offset 0), resealed.
+    $d = New-Tampered 'tamper-merged-bootloader' {
+      param($dir)
+      $p = Join-Path $dir 'supermini\firmware-merged.bin'
+      $b = [System.IO.File]::ReadAllBytes($p)
+      $b[0] = [byte](($b[0] + 1) % 256)                          # byte 0 is in the bootloader region
+      [System.IO.File]::WriteAllBytes($p, $b)
+      Reseal $dir
+    }
+    Expect "rejects merged bootloader-region mismatch (resealed)" (-not (Run-Verify $d $polPath).Ok)
+
+    # ---- Manifest closure: pin / env / nested / owner (coordinator repro) -----
+
+    # 34. Wrong board pin (coordinator: pins.board='attacker-board').
+    $d = New-Tampered 'tamper-pin-board' { param($dir) Edit-Manifest $dir { param($m) $m.pins.board = 'attacker-board' } }
+    Expect "rejects attacker board pin" (-not (Run-Verify $d $polPath).Ok)
+
+    # 35. Wrong mcu pin.
+    $d = New-Tampered 'tamper-pin-mcu' { param($dir) Edit-Manifest $dir { param($m) $m.pins.mcu = 'esp32-wrong' } }
+    Expect "rejects wrong mcu pin" (-not (Run-Verify $d $polPath).Ok)
+
+    # 36. Wrong app_offset pin.
+    $d = New-Tampered 'tamper-pin-appoffset' { param($dir) Edit-Manifest $dir { param($m) $m.pins.app_offset = '0x20000' } }
+    Expect "rejects wrong app_offset pin" (-not (Run-Verify $d $polPath).Ok)
+
+    # 37. Wrong framework pin.
+    $d = New-Tampered 'tamper-pin-framework' { param($dir) Edit-Manifest $dir { param($m) $m.pins.framework = 'espidf' } }
+    Expect "rejects wrong framework pin" (-not (Run-Verify $d $polPath).Ok)
+
+    # 38. Duplicate environment entry (coordinator repro).
+    $d = New-Tampered 'tamper-env-duplicate' { param($dir) Edit-Manifest $dir { param($m) $m.environments = @($m.environments + $m.environments[0]) } }
+    Expect "rejects duplicate environment entry" (-not (Run-Verify $d $polPath).Ok)
+
+    # 39. Forged nested env-artifact hash (coordinator repro: nested merged SHA).
+    $d = New-Tampered 'tamper-nested-artifact' { param($dir) Edit-Manifest $dir { param($m) $m.environments[0].artifacts.'firmware-merged.bin'.sha256 = ('0' * 64) } }
+    Expect "rejects forged nested artifact hash" (-not (Run-Verify $d $polPath).Ok)
+
+    # 40. Wrong flat-artifact env owner.
+    $d = New-Tampered 'tamper-artifact-owner' { param($dir) Edit-Manifest $dir { param($m) $m.artifacts.'supermini/firmware.bin'.env = 'supermini-worker' } }
+    Expect "rejects wrong flat artifact owner" (-not (Run-Verify $d $polPath).Ok)
+
+    # 41. Tampered manifest.policy_sha256 (tracked-git policy binding broken).
+    $d = New-Tampered 'tamper-policy-sha' { param($dir) Edit-Manifest $dir { param($m) $m.policy_sha256 = ('0' * 64) } }
+    Expect "rejects tampered manifest.policy_sha256" (-not (Run-Verify $d $polPath).Ok)
+
+    # 42. Reparse point (junction) planted inside the package. Junctions need no
+    #     admin; if creation is unavailable we assert the helper's fail-closed
+    #     behaviour instead of claiming coverage we could not exercise.
+    $script:junctionMade = $false
+    $d = New-Tampered 'tamper-reparse-junction' {
+      param($dir)
+      $tgt = Join-Path $dir '.rp-target'; New-Item -ItemType Directory -Path $tgt -Force | Out-Null
+      $link = Join-Path $dir 'supermini\evil-junction'
+      try { New-Item -ItemType Junction -Path $link -Target $tgt -ErrorAction Stop | Out-Null; $script:junctionMade = $true }
+      catch { $script:junctionMade = $false }
+    }
+    if ($script:junctionMade) {
+      Expect "rejects reparse-point (junction) inside package" (-not (Run-Verify $d $polPath).Ok)
+    } else {
+      # Fail-closed helper behaviour without real symlink privileges: a genuinely
+      # missing path is 'not a reparse point', and Get-ContainedReparsePoints on a
+      # normal tree returns none. (Documented skip: no junction creation here.)
+      Write-Host "  [skip] junction creation unavailable; asserting helper fail-closed contract" -ForegroundColor DarkYellow
+      Expect "reparse helper: missing path is not a reparse point" (-not (Test-IsReparsePoint (Join-Path $fixtureRoot 'no-such-path')))
+      Expect "reparse helper: clean tree has no reparse points" (@(Get-ContainedReparsePoints $base).Count -eq 0)
+    }
   }
   finally {
     if (Test-Path $fixtureRoot) { Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue }
@@ -327,8 +446,21 @@ if (-not [System.IO.Path]::IsPathRooted($pkg)) { $pkg = Join-Path $repoRoot $Pat
 $pkg = Get-FullPathSafe $pkg
 
 $git = Get-RepoGitState $repoRoot
+
+# Reparse-point defence for the release root and the chain down to the package
+# (a junction on release/ could redirect the whole verification).
+$rootReparse = Find-ReparsePointInChain -Base $repoRoot -Full $pkg
+if ($rootReparse) { throw "Refusing to verify: a symlink/junction/reparse point is present on the path chain: $rootReparse" }
+
+# Bind the certification policy to the EXACT git commit the package was built at
+# (its 40-hex directory leaf). Never the editable working tree.
+$pkgCommit = Split-Path $pkg -Leaf
+if (-not (Test-Sha1Hex $pkgCommit)) { throw "Package directory leaf '$pkgCommit' is not a 40-hex commit; cannot bind tracked policy." }
+$gp = Get-GitPolicy -RepoRoot $repoRoot -Commit $pkgCommit -RelPath 'scripts/release-policy.json'
+
 Write-Host "=== Verifying $pkg ===" -ForegroundColor Cyan
-$result = Test-ReleasePackage -PackagePath $pkg -PolicyPath $PolicyPath -ReleaseRoot $releaseRoot `
+Write-Host "  policy: scripts/release-policy.json@$($pkgCommit.Substring(0,7)) sha256=$($gp.Sha256)"
+$result = Test-ReleasePackage -PackagePath $pkg -Policy $gp.Object -PolicySha256 $gp.Sha256 -ReleaseRoot $releaseRoot `
   -RequireUnderReleaseRoot $true -RequireHeadMatch (-not $AllowStaleHead) -ExpectedHeadCommit $git.Commit
 
 Write-Host ""

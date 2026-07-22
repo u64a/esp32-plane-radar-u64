@@ -90,38 +90,69 @@
       "role": "default-release",
       "evaluation_only": false,
       "options": { "worker": false, "diagnostics": false, "log_level": 2 },
-      "resources": { "ram": 65044, "flash": 1143278, "firmware_bin": 1198160, "merged_bin": 1263696 }
+      "resources": { "ram": 65044, "flash": 1143278, "firmware_bin": 1198160, "merged_bin": 1263696 },
+      "sha256": {
+        "firmware_bin": "7c1c4f8cd6e7db372650b90566cd88c44e347b3c865279e11bbdbcf891b27e54",
+        "merged_bin": "de89ae766da78dfc0f826ca0bcbb606bdeb325403c75a42722c0a4669da564f6"
+      }
     },
     {
       "name": "supermini-worker",
       "role": "evaluation",
       "evaluation_only": true,
       "options": { "worker": true, "diagnostics": false, "log_level": 2 },
-      "resources": { "ram": 73924, "flash": 1146152, "firmware_bin": 1202224, "merged_bin": 1267760 }
+      "resources": { "ram": 73924, "flash": 1146152, "firmware_bin": 1202224, "merged_bin": 1267760 },
+      "sha256": {
+        "firmware_bin": "c8c520874fa521a33e7c2905f08e55c1641595572cc905656af9fcc07d733ecb",
+        "merged_bin": "bac799ac8bbab5c101c16be5746d111217d0525f1a693d8fdb35c1bc7735f7ed"
+      }
     },
     {
       "name": "supermini-quiet",
       "role": "evaluation",
       "evaluation_only": true,
       "options": { "worker": false, "diagnostics": false, "log_level": 0 },
-      "resources": { "ram": 64916, "flash": 1138158, "firmware_bin": 1192256, "merged_bin": 1257792 }
+      "resources": { "ram": 64916, "flash": 1138158, "firmware_bin": 1192256, "merged_bin": 1257792 },
+      "sha256": {
+        "firmware_bin": "ca3732261212acb3db5767caca6406f003e060bf69ac5d8bbbd8ddd630ff6deb",
+        "merged_bin": "b2ae4ff5305372ebbe3a49cf8f943c10d12250f4cd3707679ed91473da9a521d"
+      }
     },
     {
       "name": "supermini-diag",
       "role": "evaluation",
       "evaluation_only": true,
       "options": { "worker": false, "diagnostics": true, "log_level": 2 },
-      "resources": { "ram": 65052, "flash": 1143892, "firmware_bin": 1198880, "merged_bin": 1264416 }
+      "resources": { "ram": 65052, "flash": 1143892, "firmware_bin": 1198880, "merged_bin": 1264416 },
+      "sha256": {
+        "firmware_bin": "fc3cc930e2fe76e74684a5d65cf93c0578868bf6ada4d777a9a22aa01f114f7b",
+        "merged_bin": "966528479df4a839b78b308f67c8ef84480760a90bf34646cf64df1a8be0ab70"
+      }
     },
     {
       "name": "supermini-worker-diag",
       "role": "evaluation",
       "evaluation_only": true,
       "options": { "worker": true, "diagnostics": true, "log_level": 2 },
-      "resources": { "ram": 73948, "flash": 1146920, "firmware_bin": 1203120, "merged_bin": 1268656 }
+      "resources": { "ram": 73948, "flash": 1146920, "firmware_bin": 1203120, "merged_bin": 1268656 },
+      "sha256": {
+        "firmware_bin": "07c56487a1a1a66eb99f66ed7b9f787c391ffe4d0638a8ed8a5b87ee425220f8",
+        "merged_bin": "03fbc96d321b7904367f600b651e1555d0238c5cc82e9147a5421220a9868165"
+      }
     }
   ],
   "resource_tolerance_bytes": 0,
+  "merged_layout": {
+    "description": "Byte-exact layout of every env's firmware-merged.bin (the SHIPPED/flashed image). build-release and verify-release re-derive these invariants directly from the packaged merged bytes (binary-safe) and NEVER trust merge.log text. The three components below are board/framework artifacts and are byte-identical across all five envs; the app region is byte-for-byte equal to that env's firmware.bin.",
+    "app_offset": 65536,
+    "gap_fill_byte": 255,
+    "components": [
+      { "name": "bootloader", "offset": 0,     "size": 13200, "sha256": "b800a76c85c19db0bf5e40331d11736feae2c783d70d36f4d2b6fd8bda0ec32e" },
+      { "name": "partitions", "offset": 32768, "size": 3072,  "sha256": "aaae2888c5a6a348004b5b436f47abb25ae32e72d9003902955a998eda723edd" },
+      { "name": "boot_app0",  "offset": 57344, "size": 8192,  "sha256": "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0" }
+    ],
+    "note": "app_offset 65536 = 0x10000; bootloader 0x0, partitions 0x8000, boot_app0 0xe000. merged length MUST equal app_offset + firmware.bin length; the region at app_offset MUST equal firmware.bin byte-for-byte; every gap between a component end and the next offset MUST be gap_fill_byte (0xFF)."
+  },
   "copied_artifacts": [
     "firmware.bin",
     "firmware-merged.bin",
@@ -131,5 +162,5 @@
     "merge.log",
     "nm-symbols.txt"
   ],
-  "proof_invariants_note": "The per-environment binary invariants proven by build-release are defined by scripts/build-release.ps1 (Part B). They bind the EXACT current-head binaries only and do not claim raw equivalence to any prior phase."
+  "proof_invariants_note": "The per-environment binary proof spec (worker/diag/heap symbol + logging-string invariants AND the firmware-merged.bin layout invariants: component SHA-256 at fixed offsets, app-region byte-equality to firmware.bin, exact merged length, and 0xFF gap fill) is centrally defined in scripts/release-common.ps1 (Get-ProofSpec / Get-BinaryProofInvariants) and re-derived byte-for-byte identically by build-release and verify-release. It binds the EXACT current-head binaries only and does not claim raw equivalence to any prior phase. The exact firmware.bin / firmware-merged.bin SHA-256 anchors (environments[].sha256) and merged_layout are the tracked external anchors: the shipped merged image is bound to tracked policy + the app, not to self-consistent manifest hashes."
 }

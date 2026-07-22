@@ -28,9 +28,6 @@
 
 .PARAMETER SelfTest
   Run the isolated tamper self-test (never writes under release/).
-
-.PARAMETER PolicyPath / -HardwarePolicyPath
-  Override the release / hardware acceptance policy files.
 #>
 [CmdletBinding(DefaultParameterSetName = 'Verify')]
 param(
@@ -42,9 +39,7 @@ param(
   [Parameter(ParameterSetName = 'Verify')]
   [switch]$AllowStaleHead,
   [Parameter(ParameterSetName = 'SelfTest')]
-  [switch]$SelfTest,
-  [string]$PolicyPath,
-  [string]$HardwarePolicyPath
+  [switch]$SelfTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,8 +48,9 @@ Set-Location -LiteralPath $repoRoot
 [Environment]::CurrentDirectory = $repoRoot
 . "$PSScriptRoot\release-common.ps1"
 
-if (-not $PolicyPath) { $PolicyPath = Join-Path $PSScriptRoot 'release-policy.json' }
-if (-not $HardwarePolicyPath) { $HardwarePolicyPath = Join-Path $PSScriptRoot 'hardware-acceptance-policy.json' }
+# The release + hardware acceptance policies are ALWAYS the tracked git-blob files
+# at the package commit (loaded in the entry point). There is NO public working-
+# tree override; the only injection is the isolated self-test fixture seam.
 
 # ===========================================================================
 # Self-test: isolated fixture proving accept-then-reject behaviour.
@@ -95,6 +91,7 @@ function New-CompleteHardwareFixture {
   $hwPolicyPath = Join-Path $Root 'hw-policy.json'
   Write-JsonFileLf $hwPolicyPath $hwPolicy
   $hwPolicyObj = Read-JsonFile $hwPolicyPath
+  $hwPolicySha = Get-Sha256Hex $hwPolicyPath
 
   # Evidence dir + non-empty evidence files.
   $evidenceDir = Join-Path $Root 'evidence'
@@ -105,7 +102,7 @@ function New-CompleteHardwareFixture {
 
   # COMPLETE passing results: start from the scaffold, then fill in pass values.
   $results = New-HardwareResultsScaffold -Policy $hwPolicyObj -Commit $Commit -DefaultRel $defaultRel `
-    -DefaultEnv 'supermini' -ImageSha $maps.Sha -ImageSize $maps.Size -GeneratedUtc '2026-01-01T00:00:00Z'
+    -DefaultEnv 'supermini' -ImageSha $maps.Sha -ImageSize $maps.Size -GeneratedUtc '2026-01-01T00:00:00Z' -PolicySha256 $hwPolicySha
   foreach ($item in $results.items) {
     $item.status = 'pass'
     $item.operator.name = 'selftest'; $item.operator.date = '2026-01-01'
@@ -126,6 +123,7 @@ function New-CompleteHardwareFixture {
   return [pscustomobject]@{
     EvidenceDir = $evidenceDir; ResultsPath = $resultsPath; Policy = $hwPolicyObj
     ImageSha = $maps.Sha; ImageSize = $maps.Size; Commit = $Commit; DefaultRel = $defaultRel
+    HwPolicySha = $hwPolicySha
   }
 }
 
@@ -141,7 +139,7 @@ function Invoke-HardwareSelfTest {
   function Run-Hw($ctx) {
     return Test-HardwareEvidence -EvidenceDir $ctx.EvidenceDir -ResultsPath $ctx.ResultsPath -Policy $ctx.Policy `
       -ImageSha $ctx.ImageSha -ImageSize $ctx.ImageSize -ExpectedCommit $ctx.Commit -ExpectedEnv 'supermini' `
-      -ExpectedDefaultRel $ctx.DefaultRel -Gate 'default-release' -Quiet
+      -ExpectedDefaultRel $ctx.DefaultRel -Gate 'default-release' -HardwarePolicySha256 $ctx.HwPolicySha -Quiet
   }
   try {
     $base = Join-Path $fixtureRoot 'base'
@@ -156,6 +154,7 @@ function Invoke-HardwareSelfTest {
       $ctx2 = [pscustomobject]@{
         EvidenceDir = Join-Path $dir 'evidence'; ResultsPath = Join-Path $dir 'evidence\hardware-results.json'
         Policy = $ctx.Policy; ImageSha = $ctx.ImageSha; ImageSize = $ctx.ImageSize; Commit = $ctx.Commit; DefaultRel = $ctx.DefaultRel
+        HwPolicySha = $ctx.HwPolicySha
       }
       & $mutate $ctx2.ResultsPath (Join-Path $dir 'evidence')
       return $ctx2
@@ -338,6 +337,33 @@ function Invoke-HardwareSelfTest {
       Write-JsonFileLf $rp $o
     }
     Expect "rejects between-op measured above range" (-not (Run-Hw $t).Ok)
+
+    # 21. IMPOSSIBLE calendar date that passes a bare regex (E1): 2026-99-99.
+    $t = New-TamperCtx 'impossible-date' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      $o.items[0].operator.date = '2026-99-99'
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects impossible calendar date (2026-99-99)" (-not (Run-Hw $t).Ok)
+
+    # 22. Impossible day-of-month (real regex form, non-existent date): 2026-02-30.
+    $t = New-TamperCtx 'impossible-day' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      $o.items[0].operator.date = '2026-02-30'
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects impossible day-of-month (2026-02-30)" (-not (Run-Hw $t).Ok)
+
+    # 23. Forged results.policy_sha256 (tracked-git hardware-policy binding broken).
+    $t = New-TamperCtx 'forged-policy-sha' {
+      param($rp, $ev)
+      $o = Get-Content -Raw $rp | ConvertFrom-Json
+      $o.policy_sha256 = ('0' * 64)
+      Write-JsonFileLf $rp $o
+    }
+    Expect "rejects forged results.policy_sha256" (-not (Run-Hw $t).Ok)
   }
   finally {
     if (Test-Path $fixtureRoot) { Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue }
@@ -360,10 +386,21 @@ $pkg = $Path
 if (-not [System.IO.Path]::IsPathRooted($pkg)) { $pkg = Join-Path $repoRoot $Path }
 $pkg = Get-FullPathSafe $pkg
 
-# -- 1. Re-verify the release package ---------------------------------------
+# Reparse-point defence for the release root and the chain down to the package.
+$rootReparse = Find-ReparsePointInChain -Base $repoRoot -Full $pkg
+if ($rootReparse) { throw "Refusing to verify: a symlink/junction/reparse point is present on the path chain: $rootReparse" }
+
+# -- 1. Re-verify the release package (policy bound to the package git commit)
 $git = Get-RepoGitState $repoRoot
+$pkgCommit = Split-Path $pkg -Leaf
+if (-not (Test-Sha1Hex $pkgCommit)) { throw "Package directory leaf '$pkgCommit' is not a 40-hex commit; cannot bind tracked policy." }
+$gp = Get-GitPolicy -RepoRoot $repoRoot -Commit $pkgCommit -RelPath 'scripts/release-policy.json'
+$ghw = Get-GitPolicy -RepoRoot $repoRoot -Commit $pkgCommit -RelPath 'scripts/hardware-acceptance-policy.json'
+$policy = $gp.Object
+$hwPolicy = $ghw.Object
+
 Write-Host "=== Re-verifying release $pkg ===" -ForegroundColor Cyan
-$verify = Test-ReleasePackage -PackagePath $pkg -PolicyPath $PolicyPath -ReleaseRoot $releaseRoot `
+$verify = Test-ReleasePackage -PackagePath $pkg -Policy $policy -PolicySha256 $gp.Sha256 -ReleaseRoot $releaseRoot `
   -RequireUnderReleaseRoot $true -RequireHeadMatch (-not $AllowStaleHead) -ExpectedHeadCommit $git.Commit -Quiet
 if (-not $verify.Ok) {
   Write-Host "Release verification FAILED; refusing to verify hardware evidence:" -ForegroundColor Red
@@ -372,10 +409,8 @@ if (-not $verify.Ok) {
 }
 Write-Host "  release verified ($($verify.Checks.Count) checks)."
 
-# -- 2. Load manifest bindings + policies -----------------------------------
+# -- 2. Load manifest bindings ----------------------------------------------
 $manifest = Read-JsonFile (Join-Path $pkg 'manifest.json')
-$policy = Read-JsonFile $PolicyPath
-$hwPolicy = Read-JsonFile $HardwarePolicyPath
 $maps = Get-ManifestImageMaps $manifest
 $defaultRel = $policy.default_artifact.relative_path
 $defaultEnv = $policy.default_artifact.environment
@@ -391,7 +426,7 @@ if (-not (Test-Path $resultsPath)) {
 Write-Host "=== Hardware acceptance ($Gate) ===" -ForegroundColor Cyan
 $result = Test-HardwareEvidence -EvidenceDir $evidenceDir -ResultsPath $resultsPath -Policy $hwPolicy `
   -ImageSha $maps.Sha -ImageSize $maps.Size -ExpectedCommit $commit -ExpectedEnv $defaultEnv `
-  -ExpectedDefaultRel $defaultRel -Gate $Gate
+  -ExpectedDefaultRel $defaultRel -Gate $Gate -HardwarePolicySha256 $ghw.Sha256 -ReparseBase $pkg
 
 Write-Host ""
 if ($result.Ok) {

@@ -25,21 +25,13 @@
 
 .PARAMETER AllowStaleHead
   Permit a release whose commit does not match the current HEAD (archived package).
-
-.PARAMETER PolicyPath
-  Override the release policy (default scripts/release-policy.json).
-
-.PARAMETER HardwarePolicyPath
-  Override the hardware acceptance policy (default scripts/hardware-acceptance-policy.json).
 #>
 [CmdletBinding()]
 param(
   [Parameter(Mandatory, Position = 0)]
   [string]$Path,
   [switch]$Force,
-  [switch]$AllowStaleHead,
-  [string]$PolicyPath,
-  [string]$HardwarePolicyPath
+  [switch]$AllowStaleHead
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,8 +40,8 @@ Set-Location -LiteralPath $repoRoot
 [Environment]::CurrentDirectory = $repoRoot
 . "$PSScriptRoot\release-common.ps1"
 
-if (-not $PolicyPath) { $PolicyPath = Join-Path $PSScriptRoot 'release-policy.json' }
-if (-not $HardwarePolicyPath) { $HardwarePolicyPath = Join-Path $PSScriptRoot 'hardware-acceptance-policy.json' }
+# The release + hardware acceptance policies are ALWAYS the tracked git-blob files
+# at the package commit (loaded below). There is NO public working-tree override.
 
 # -- Resolve + re-verify the release package --------------------------------
 $releaseRoot = Get-FullPathSafe (Join-Path $repoRoot 'release')
@@ -57,9 +49,20 @@ $pkg = $Path
 if (-not [System.IO.Path]::IsPathRooted($pkg)) { $pkg = Join-Path $repoRoot $Path }
 $pkg = Get-FullPathSafe $pkg
 
+# Reparse-point defence for the release root and the chain down to the package.
+$rootReparse = Find-ReparsePointInChain -Base $repoRoot -Full $pkg
+if ($rootReparse) { throw "Refusing to initialize: a symlink/junction/reparse point is present on the path chain: $rootReparse" }
+
 $git = Get-RepoGitState $repoRoot
+$pkgCommit = Split-Path $pkg -Leaf
+if (-not (Test-Sha1Hex $pkgCommit)) { throw "Package directory leaf '$pkgCommit' is not a 40-hex commit; cannot bind tracked policy." }
+$gp = Get-GitPolicy -RepoRoot $repoRoot -Commit $pkgCommit -RelPath 'scripts/release-policy.json'
+$ghw = Get-GitPolicy -RepoRoot $repoRoot -Commit $pkgCommit -RelPath 'scripts/hardware-acceptance-policy.json'
+$policy = $gp.Object
+$hwPolicy = $ghw.Object
+
 Write-Host "=== Re-verifying release $pkg ===" -ForegroundColor Cyan
-$verify = Test-ReleasePackage -PackagePath $pkg -PolicyPath $PolicyPath -ReleaseRoot $releaseRoot `
+$verify = Test-ReleasePackage -PackagePath $pkg -Policy $policy -PolicySha256 $gp.Sha256 -ReleaseRoot $releaseRoot `
   -RequireUnderReleaseRoot $true -RequireHeadMatch (-not $AllowStaleHead) -ExpectedHeadCommit $git.Commit -Quiet
 if (-not $verify.Ok) {
   Write-Host "Release verification FAILED; refusing to initialize hardware evidence:" -ForegroundColor Red
@@ -70,8 +73,6 @@ Write-Host "  release verified ($($verify.Checks.Count) checks)."
 
 # -- Bind to the exact default image ----------------------------------------
 $manifest = Read-JsonFile (Join-Path $pkg 'manifest.json')
-$policy = Read-JsonFile $PolicyPath
-$hwPolicy = Read-JsonFile $HardwarePolicyPath
 $maps = Get-ManifestImageMaps $manifest
 $defaultRel = $policy.default_artifact.relative_path
 $defaultEnv = $policy.default_artifact.environment
@@ -88,6 +89,14 @@ foreach ($pi in $hwPolicy.items) {
 # -- Evidence dir + refuse overwrite ----------------------------------------
 $evidenceDir = Join-Path $pkg 'hardware-evidence'
 if (-not (Test-PathInside -Base $pkg -Candidate $evidenceDir)) { throw "evidence dir escaped the release package." }
+# Reparse-point defence: refuse a junction/symlink evidence root or reparse
+# points anywhere under an existing evidence dir.
+$evReparse = Find-ReparsePointInChain -Base $pkg -Full $evidenceDir
+if ($evReparse) { throw "Refusing: a symlink/junction/reparse point is present on the evidence path chain: $evReparse" }
+if (Test-Path -LiteralPath $evidenceDir) {
+  $evUnder = @(Get-ContainedReparsePoints $evidenceDir)
+  if ($evUnder.Count -gt 0) { throw ("Refusing: reparse point(s) under the evidence dir: " + [string]::Join('; ', @($evUnder | Select-Object -First 3))) }
+}
 $resultsPath = Join-Path $evidenceDir 'hardware-results.json'
 if ((Test-Path $resultsPath) -and -not $Force) {
   throw "hardware-results.json already exists at $resultsPath. Re-run with -Force to regenerate the template (evidence files are preserved)."
@@ -97,7 +106,7 @@ New-Item -ItemType Directory -Path $evidenceDir -Force | Out-Null
 # -- Build the pending scaffold + evidence subdirectories --------------------
 $generatedUtc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
 $scaffold = New-HardwareResultsScaffold -Policy $hwPolicy -Commit $commit -DefaultRel $defaultRel `
-  -DefaultEnv $defaultEnv -ImageSha $maps.Sha -ImageSize $maps.Size -GeneratedUtc $generatedUtc
+  -DefaultEnv $defaultEnv -ImageSha $maps.Sha -ImageSize $maps.Size -GeneratedUtc $generatedUtc -PolicySha256 $ghw.Sha256
 
 # Create the (empty) evidence subdirectories referenced by the policy so the
 # operator has a deterministic place to drop each file. No fake evidence files.

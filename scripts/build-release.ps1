@@ -52,10 +52,17 @@ function Write-Step([string]$Message) { Write-Host "`n=== $Message ===" -Foregro
 function Write-Ok([string]$Message)   { Write-Host "  OK: $Message" }
 
 # ===========================================================================
-# 0. Load the tracked release policy (single source of truth).
+# 0. Load the tracked release policy from the EXACT git HEAD commit blob (never
+#    the editable working tree) and record its SHA-256. A dirty working-tree
+#    policy must NOT influence certification.
 # ===========================================================================
-$policyPath = Join-Path $PSScriptRoot 'release-policy.json'
-$policy = Read-JsonFile $policyPath
+$git = Get-RepoGitState $repoRoot
+if (-not (Test-GitCommitPresent -RepoRoot $repoRoot -Commit $git.Commit)) {
+  throw "HEAD commit $($git.Commit) is not present as a git object; cannot load tracked policy."
+}
+$gp = Get-GitPolicy -RepoRoot $repoRoot -Commit $git.Commit -RelPath 'scripts/release-policy.json'
+$policy = $gp.Object
+$policySha = $gp.Sha256
 $envNames = @($policy.environments | ForEach-Object { $_.name })
 
 # ===========================================================================
@@ -78,7 +85,6 @@ Write-Ok "PlatformIO $($policy.pins.platformio_core)"
 # ===========================================================================
 # 2. Git: HEAD exists, clean tracked+index, no untracked, no remote (ALWAYS).
 # ===========================================================================
-$git = Get-RepoGitState $repoRoot
 if ($git.HasRemote) {
   throw "A git remote is configured ($($git.RemoteCount)); this repository must stay local-only. Aborting."
 }
@@ -89,6 +95,7 @@ if ($git.UntrackedCount -gt 0) {
   throw "Untracked files are present (release must build from a pristine worktree):`n$($git.UntrackedLines -join "`n")"
 }
 Write-Ok "git HEAD $($git.ShortCommit) on '$($git.Branch)': clean, no untracked, no remote"
+Write-Ok "policy: scripts/release-policy.json@$($git.ShortCommit) sha256=$policySha"
 
 # ===========================================================================
 # 3. Resolve + validate the publish target (ALWAYS <repo>/release/<40-hex sha>).
@@ -96,6 +103,11 @@ Write-Ok "git HEAD $($git.ShortCommit) on '$($git.Branch)': clean, no untracked,
 $releaseRoot = Get-FullPathSafe (Join-Path $repoRoot $policy.local_only.release_root_relative)
 if (-not (Test-PathInside -Base $repoRoot -Candidate $releaseRoot -AllowEqual)) {
   throw "Release root '$releaseRoot' is not inside the repository."
+}
+# Reparse-point defence: refuse if the release root is itself a junction/symlink
+# (a planted reparse could redirect staging/publish outside the tree).
+if ((Test-Path $releaseRoot) -and (Test-IsReparsePoint $releaseRoot)) {
+  throw "Release root '$releaseRoot' is a symlink/junction/reparse point; refusing to publish."
 }
 $sha = $git.Commit
 if (-not (Test-Sha1Hex $sha)) { throw "HEAD commit is not a 40-hex sha: $sha" }
@@ -193,11 +205,26 @@ foreach ($envPolicy in $policy.environments) {
   Assert-Size 'firmware.bin' $firmwareBinSize $exp.firmware_bin
   Assert-Size 'firmware-merged.bin' $mergedBinSize $exp.merged_bin
 
+  # Exact policy SHA-256 anchor: the built firmware.bin AND the SHIPPED
+  # firmware-merged.bin must equal the tracked policy hashes for this env.
+  $polSha = Get-PsObjectProperty $envPolicy 'sha256'
+  if ($null -eq $polSha) { throw "[$name] policy has no sha256 anchor (firmware_bin/merged_bin)." }
+  $expFwSha = [string](Get-PsObjectProperty $polSha 'firmware_bin')
+  $expMgSha = [string](Get-PsObjectProperty $polSha 'merged_bin')
+  $actFwSha = Get-Sha256Hex $firmwareBin
+  $actMgSha = Get-Sha256Hex $mergedBin
+  if (-not ((Test-Sha256Hex $expFwSha) -and ($actFwSha -eq $expFwSha))) {
+    throw "[$name] firmware.bin SHA-256 mismatch: expected $expFwSha, got $actFwSha."
+  }
+  if (-not ((Test-Sha256Hex $expMgSha) -and ($actMgSha -eq $expMgSha))) {
+    throw "[$name] firmware-merged.bin SHA-256 mismatch: expected $expMgSha, got $actMgSha."
+  }
+
   $buildInfo[$name].ram = $ram
   $buildInfo[$name].flash = $flash
   $buildInfo[$name].firmwareBinSize = [int64]$firmwareBinSize
   $buildInfo[$name].mergedBinSize = [int64]$mergedBinSize
-  Write-Ok "$name sizes exact: bin=$firmwareBinSize merged=$mergedBinSize"
+  Write-Ok "$name sizes+SHA exact: bin=$firmwareBinSize merged=$mergedBinSize"
 }
 
 # ===========================================================================
@@ -228,13 +255,14 @@ Write-Ok "LovyanGFX=$($observed.dependencies['lovyan03/LovyanGFX']) ArduinoJson=
 #    Any failing invariant aborts BEFORE staging/publishing.
 # ===========================================================================
 Write-Step "Current-head ELF/binary proofs"
-$envElf = @{}; $envBin = @{}
+$envElf = @{}; $envBin = @{}; $envMerged = @{}
 foreach ($name in $envNames) {
   $bd = $buildInfo[$name].buildDir
   $envElf[$name] = Join-Path $bd 'firmware.elf'
   $envBin[$name] = Join-Path $bd 'firmware.bin'
+  $envMerged[$name] = Join-Path $bd 'firmware-merged.bin'
 }
-$proofResult = Get-BinaryProofInvariants -Policy $policy -EnvElf $envElf -EnvBin $envBin -NmPath $nmTool
+$proofResult = Get-BinaryProofInvariants -Policy $policy -EnvElf $envElf -EnvBin $envBin -EnvMerged $envMerged -NmPath $nmTool
 $invariants = @($proofResult.Invariants)
 $nmEvidence = $proofResult.NmEvidence
 $failed = @($invariants | Where-Object { $_.status -ne 'pass' })
@@ -248,13 +276,27 @@ if ($failed.Count -gt 0) {
 
 # ===========================================================================
 # 10. Stage the package (under release/, then atomically publish).
+#     Re-run the git source-gate IMMEDIATELY before staging to close the
+#     source-gate/build TOCTOU window (a gate/tool could have mutated source or
+#     the worktree after the initial check).
 # ===========================================================================
 Write-Step "Stage release package"
+$git2 = Get-RepoGitState $repoRoot
+if (($git2.Commit -ne $sha) -or ($git2.Branch -ne $git.Branch) -or $git2.HasRemote -or $git2.TrackedDirty -or ($git2.UntrackedCount -gt 0)) {
+  throw ("Git state changed after gates/build (source-gate/build TOCTOU): now commit=$($git2.ShortCommit) branch='$($git2.Branch)' remote=$($git2.HasRemote) tracked_dirty=$($git2.TrackedDirty) untracked=$($git2.UntrackedCount); expected commit=$($git.ShortCommit) branch='$($git.Branch)' clean/no-remote. Aborting before publishing.")
+}
+Write-Ok "git state re-confirmed unchanged ($($git2.ShortCommit) on '$($git2.Branch)')"
+
 $generatedUtc = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
 $stageLeaf = ".stage-$sha-$([System.IO.Path]::GetRandomFileName())"
 $stageDir = Get-FullPathSafe (Join-Path $releaseRoot $stageLeaf)
 if (-not (Test-PathInside -Base $releaseRoot -Candidate $stageDir)) { throw "staging path escaped release root" }
-Remove-TreeSafe -Path $stageDir -AllowedBase $releaseRoot
+
+# A failed stage/write/publish must leave NO staging debris: the finally cleans
+# ONLY this exact validated .stage-* directory (reparse-point-safe).
+$published = $false
+try {
+Remove-TreeSafe -Path $stageDir -AllowedBase $releaseRoot -RequireLeaf $stageLeaf
 New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
 
 foreach ($name in $envNames) {
@@ -345,6 +387,7 @@ $manifest = [ordered]@{
   generatedUtc  = $generatedUtc
   git           = [ordered]@{ commit = $sha; short = $git.ShortCommit; branch = $git.Branch; tracked_clean = (-not $git.TrackedDirty); untracked_files = $git.UntrackedCount }
   local_only    = [ordered]@{ no_remote = (-not $git.HasRemote); release_path = "release/$sha" }
+  policy_sha256 = $policySha
   pins          = [ordered]@{
     platformio_core              = $policy.pins.platformio_core
     platformio_core_verified     = ("$pioVersion".Trim())
@@ -403,7 +446,21 @@ if (Test-Path $targetChild) {
   Write-Ok "removed prior release/$sha (--Force)"
 }
 Move-Item -LiteralPath $stageDir -Destination $targetChild
+$published = $true
 Write-Ok "published release/$sha"
+}
+finally {
+  # Any failure before the atomic publish must clean ONLY this exact .stage-*
+  # directory -- never leave ignored staging debris under release/.
+  if (-not $published -and (Test-Path -LiteralPath $stageDir)) {
+    try {
+      Remove-TreeSafe -Path $stageDir -AllowedBase $releaseRoot -RequireLeaf $stageLeaf
+      Write-Host "  cleaned staging debris: $stageLeaf"
+    } catch {
+      Write-Host "  WARNING: could not clean staging dir '$stageLeaf': $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+  }
+}
 
 # ===========================================================================
 # 13. Summary.

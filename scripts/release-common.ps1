@@ -48,6 +48,38 @@ function Test-PathInside {
   return $c.StartsWith($b + $sep, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Find-ReparsePointInChain {
+  # Return the OUTERMOST existing reparse point (junction/symlink) on the path
+  # chain from $Base (inclusive) down to $Full (inclusive), or $null if none.
+  # Lexical containment (Test-PathInside) is NOT enough on Windows: any level of
+  # the chain could be a junction/symlink that redirects the real target. Both
+  # paths are resolved lexically first; $Full is expected to be inside/equal $Base.
+  # FAIL-CLOSED: Test-IsReparsePoint throws if an existing level cannot be inspected.
+  [OutputType([string])]
+  param([Parameter(Mandatory)][string]$Base, [Parameter(Mandatory)][string]$Full)
+  $baseFull = (Get-FullPathSafe $Base).TrimEnd('\', '/')
+  $full = (Get-FullPathSafe $Full).TrimEnd('\', '/')
+  $levels = New-Object System.Collections.Generic.List[string]
+  $cur = $full
+  while ($true) {
+    $levels.Add($cur)
+    if ($cur.Equals($baseFull, [System.StringComparison]::OrdinalIgnoreCase)) { break }
+    $parent = Split-Path $cur -Parent
+    if ([string]::IsNullOrEmpty($parent)) { break }
+    $parent = $parent.TrimEnd('\', '/')
+    if ($parent.Equals($cur, [System.StringComparison]::OrdinalIgnoreCase)) { break }
+    if (-not (Test-PathInside -Base $baseFull -Candidate $parent -AllowEqual)) { break }
+    $cur = $parent
+  }
+  for ($i = $levels.Count - 1; $i -ge 0; $i--) {
+    $p = $levels[$i]
+    if (Test-Path -LiteralPath $p) {
+      if (Test-IsReparsePoint $p) { return $p }
+    }
+  }
+  return $null
+}
+
 function Test-Sha1Hex {
   [OutputType([bool])]
   param([string]$Value)
@@ -62,15 +94,34 @@ function Test-Sha256Hex {
   return [bool]([regex]::IsMatch($Value, '^[0-9a-f]{64}$'))
 }
 
+function Test-IsoCalendarDate {
+  # True iff $Value is a REAL calendar date in strict yyyy-MM-dd form (invariant
+  # culture, no style adjustment). Rejects malformed strings (e.g. 01/02/2026) AND
+  # impossible dates (e.g. 2026-99-99, 2026-02-30) that a regex-only check accepts.
+  [OutputType([bool])]
+  param([string]$Value)
+  if ($null -eq $Value) { return $false }
+  if (-not [regex]::IsMatch($Value, '^\d{4}-\d{2}-\d{2}$')) { return $false }
+  $dt = [datetime]::MinValue
+  return [datetime]::TryParseExact($Value, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$dt)
+}
+
 # ---------------------------------------------------------------------------
 # Reparse-point-safe recursive deletion (Windows junction/symlink defence)
 # ---------------------------------------------------------------------------
 
 function Test-IsReparsePoint {
   # True if $Path is a Windows reparse point (directory junction or symlink).
+  # FAIL-CLOSED: a genuinely non-existent path is simply "not a reparse point"
+  # (false), but an EXISTING path that cannot be inspected THROWS -- we must never
+  # silently treat an un-inspectable path as safe before a recursive delete.
   [OutputType([bool])]
   param([Parameter(Mandatory)][string]$Path)
-  try { $it = Get-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { return $false }
+  $it = $null
+  try { $it = Get-Item -LiteralPath $Path -Force -ErrorAction Stop }
+  catch [System.Management.Automation.ItemNotFoundException] { return $false }
+  catch { throw "Cannot inspect path for reparse-point check (failing closed): $Path -- $($_.Exception.Message)" }
+  if ($null -eq $it) { throw "Cannot inspect path for reparse-point check (failing closed): $Path" }
   return (($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint)
 }
 
@@ -78,6 +129,9 @@ function Get-ContainedReparsePoints {
   # Enumerate every reparse point (junction/symlink) at or under $Root WITHOUT ever
   # descending THROUGH one (we only read attributes and never follow a reparse
   # target). Returns the full paths of any reparse points found.
+  # FAIL-CLOSED: if any directory under $Root cannot be enumerated we THROW rather
+  # than silently continuing -- an un-enumerable directory could hide a junction
+  # that would redirect a subsequent recursive delete.
   [OutputType([string[]])]
   param([Parameter(Mandatory)][string]$Root)
   $hits = New-Object System.Collections.Generic.List[string]
@@ -86,8 +140,9 @@ function Get-ContainedReparsePoints {
   if (Test-Path -LiteralPath $Root -PathType Container) { $stack.Push((Get-FullPathSafe $Root)) }
   while ($stack.Count -gt 0) {
     $dir = $stack.Pop()
-    $children = @()
-    try { $children = Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop } catch { continue }
+    $children = $null
+    try { $children = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop) }
+    catch { throw "Cannot enumerate directory for reparse-point check (failing closed): $dir -- $($_.Exception.Message)" }
     foreach ($c in $children) {
       $isReparse = (($c.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint)
       if ($isReparse) { $hits.Add((Get-FullPathSafe $c.FullName)); continue }  # never descend into it
@@ -257,6 +312,80 @@ function Get-RepoGitState {
     TrackedLines   = $tracked
     UntrackedLines = $untracked
   }
+}
+
+# ---------------------------------------------------------------------------
+# Tracked-git policy authority (the ONLY certification source of truth)
+#
+# Policy is loaded from an EXACT git commit blob (`git show <commit>:<path>`),
+# NEVER the editable working tree, so a dirty/attacker-modified working-tree
+# policy cannot influence certification. The SHA-256 recorded in the manifest /
+# hardware results is computed over these exact git-blob bytes and re-checked at
+# verify time.
+# ---------------------------------------------------------------------------
+
+function Test-GitCommitPresent {
+  # True iff $Commit resolves to a commit object in the local repo.
+  [OutputType([bool])]
+  param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][string]$Commit)
+  if (-not (Test-Sha1Hex $Commit)) { return $false }
+  $r = Invoke-GitRaw -RepoRoot $RepoRoot -GitArgs @('cat-file', '-e', ($Commit + '^{commit}'))
+  return ($r.ExitCode -eq 0)
+}
+
+function Get-GitShowBytes {
+  # Byte-exact content of a tracked file at an EXACT commit. Captures raw stdout
+  # bytes (no newline/encoding mangling) so the SHA-256 is stable across shells and
+  # unaffected by core.autocrlf working-tree smudging. Throws (fail-closed) on any
+  # non-zero git exit (missing commit/path).
+  [OutputType([byte[]])]
+  param(
+    [Parameter(Mandatory)][string]$RepoRoot,
+    [Parameter(Mandatory)][string]$Commit,
+    [Parameter(Mandatory)][string]$RelPath
+  )
+  if (-not (Test-Sha1Hex $Commit)) { throw "Get-GitShowBytes: '$Commit' is not a 40-hex commit." }
+  # RelPath is an internal, fixed policy path (never operator-derived); still reject
+  # anything outside a conservative safe charset to be defensive.
+  if ($RelPath -notmatch '^[A-Za-z0-9_./-]+$') { throw "Get-GitShowBytes: unsafe rel path '$RelPath'." }
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = 'git'
+  $psi.Arguments = ('-C "{0}" --no-pager show {1}:{2}' -f $RepoRoot, $Commit, $RelPath)
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $proc = [System.Diagnostics.Process]::Start($psi)
+  $ms = New-Object System.IO.MemoryStream
+  try {
+    $proc.StandardOutput.BaseStream.CopyTo($ms)
+    $errText = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+  } finally { }
+  if ($proc.ExitCode -ne 0) { throw "git show ${Commit}:${RelPath} failed (exit $($proc.ExitCode)) in ${RepoRoot}: $errText" }
+  return $ms.ToArray()
+}
+
+function Get-GitPolicy {
+  # Load a tracked policy JSON from an EXACT git commit. Returns
+  # @{ Object=<parsed>; Sha256=<lowercase hex over the exact git-blob bytes> }.
+  # The hash binds the EXACT bytes used for certification.
+  [OutputType([hashtable])]
+  param(
+    [Parameter(Mandatory)][string]$RepoRoot,
+    [Parameter(Mandatory)][string]$Commit,
+    [Parameter(Mandatory)][string]$RelPath
+  )
+  if (-not (Test-GitCommitPresent -RepoRoot $RepoRoot -Commit $Commit)) {
+    throw "Commit $Commit is not present in the local repository; cannot load tracked policy '$RelPath' (fail-closed)."
+  }
+  $bytes = Get-GitShowBytes -RepoRoot $RepoRoot -Commit $Commit -RelPath $RelPath
+  $sha = Get-Sha256HexOfBytes $bytes
+  $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+  if ($text.Length -gt 0 -and [int]$text[0] -eq 0xFEFF) { $text = $text.Substring(1) }
+  $obj = $null
+  try { $obj = $text | ConvertFrom-Json } catch { throw "Tracked policy '$RelPath'@$Commit is not valid JSON: $($_.Exception.Message)" }
+  return @{ Object = $obj; Sha256 = $sha }
 }
 
 # ---------------------------------------------------------------------------
@@ -635,6 +764,89 @@ function Get-EnvProofFlags {
 
 function ConvertTo-ProofYesNo { param([bool]$b) if ($b) { return 'present' } else { return 'absent' } }
 
+function Get-MergedLayoutInvariants {
+  # Re-derive the firmware-merged.bin layout invariants for ONE environment
+  # DIRECTLY from the packaged bytes (binary-safe; NEVER trusts merge.log text):
+  #   * exact policy SHA-256 anchor for firmware.bin AND firmware-merged.bin
+  #     (the shipped image is bound to TRACKED policy, not self-consistent hashes);
+  #   * merged length == app_offset + firmware.bin length;
+  #   * each policy component region SHA-256 matches at its fixed offset;
+  #   * every gap between a component end and the next offset is gap_fill_byte;
+  #   * the app region (merged[app_offset..]) is byte-for-byte firmware.bin.
+  [OutputType([object[]])]
+  param(
+    [Parameter(Mandatory)]$Policy,
+    [Parameter(Mandatory)][string]$Name,
+    [Parameter(Mandatory)][string]$MergedPath,
+    [Parameter(Mandatory)][string]$FirmwarePath
+  )
+  $ml = Get-PsObjectProperty $Policy 'merged_layout'
+  if ($null -eq $ml) { throw "policy has no merged_layout section." }
+  $appOffset = [int64](Get-PsObjectProperty $ml 'app_offset')
+  $fill = [byte]([int](Get-PsObjectProperty $ml 'gap_fill_byte'))
+  $envPolicy = $Policy.environments | Where-Object { $_.name -eq $Name } | Select-Object -First 1
+  if ($null -eq $envPolicy) { throw "environment '$Name' not in policy." }
+  $envSha = Get-PsObjectProperty $envPolicy 'sha256'
+
+  $merged = [System.IO.File]::ReadAllBytes($MergedPath)
+  $app = [System.IO.File]::ReadAllBytes($FirmwarePath)
+  $inv = New-Object System.Collections.Generic.List[object]
+
+  # -- Exact policy SHA-256 anchors (external anchor) -------------------------
+  $fwSha = Get-Sha256HexOfBytes $app
+  $mgSha = Get-Sha256HexOfBytes $merged
+  $expFw = ''; if ($envSha) { $expFw = [string](Get-PsObjectProperty $envSha 'firmware_bin') }
+  $expMg = ''; if ($envSha) { $expMg = [string](Get-PsObjectProperty $envSha 'merged_bin') }
+  $inv.Add((New-InvariantResult -Id "image-sha/$Name/firmware.bin" -Category 'image-sha' -Environment $Name `
+    -Description 'firmware.bin exact policy SHA-256 anchor' -Expectation $expFw -Observed $fwSha -Pass (($expFw.Length -eq 64) -and ($fwSha -eq $expFw))))
+  $inv.Add((New-InvariantResult -Id "image-sha/$Name/firmware-merged.bin" -Category 'image-sha' -Environment $Name `
+    -Description 'firmware-merged.bin exact policy SHA-256 anchor (the SHIPPED image)' -Expectation $expMg -Observed $mgSha -Pass (($expMg.Length -eq 64) -and ($mgSha -eq $expMg))))
+
+  # -- merged length == app_offset + firmware.bin length ----------------------
+  $expLen = $appOffset + [int64]$app.Length
+  $inv.Add((New-InvariantResult -Id "merged-length/$Name" -Category 'merged-layout' -Environment $Name `
+    -Description 'merged length == app_offset + firmware.bin length' -Expectation "$expLen" -Observed "$($merged.Length)" -Pass ([int64]$merged.Length -eq $expLen)))
+
+  # -- Component regions + gaps (sorted by offset) ----------------------------
+  $sorted = @(@($ml.components) | Sort-Object { [int64]$_.offset })
+  for ($i = 0; $i -lt $sorted.Count; $i++) {
+    $c = $sorted[$i]
+    $off = [int64]$c.offset; $sz = [int64]$c.size; $expSha = [string]$c.sha256
+    $regionOk = $false; $obs = 'out-of-range'
+    if (($off + $sz) -le [int64]$merged.Length -and $off -ge 0) {
+      $seg = New-Object byte[] $sz
+      [Array]::Copy($merged, $off, $seg, 0, $sz)
+      $obs = Get-Sha256HexOfBytes $seg
+      $regionOk = (($expSha.Length -eq 64) -and ($obs -eq $expSha))
+    }
+    $inv.Add((New-InvariantResult -Id "merged-comp/$Name/$($c.name)" -Category 'merged-layout' -Environment $Name `
+      -Description "merged component '$($c.name)' region SHA-256 at offset $off (size $sz)" -Expectation $expSha -Observed $obs -Pass $regionOk))
+    $nextOff = $appOffset
+    if ($i -lt ($sorted.Count - 1)) { $nextOff = [int64]$sorted[$i + 1].offset }
+    $gapStart = $off + $sz
+    $gapBad = -1
+    if ($gapStart -ge 0 -and $nextOff -ge $gapStart -and $nextOff -le [int64]$merged.Length) {
+      $gapBad = 0
+      for ($j = $gapStart; $j -lt $nextOff; $j++) { if ($merged[$j] -ne $fill) { $gapBad++ } }
+    }
+    $gapObs = 'out-of-range'; if ($gapBad -ge 0) { $gapObs = "$gapBad non-fill byte(s)" }
+    $inv.Add((New-InvariantResult -Id "merged-gap/$Name/$($c.name)" -Category 'merged-layout' -Environment $Name `
+      -Description ("gap [{0}..{1}) after '{2}' is all 0x{3}" -f $gapStart, $nextOff, $c.name, $fill.ToString('X2')) -Expectation 'all-fill' -Observed $gapObs -Pass ($gapBad -eq 0)))
+  }
+
+  # -- App region byte-for-byte equal to firmware.bin -------------------------
+  $appOk = $false; $appObs = 'length-mismatch'
+  if (($appOffset + [int64]$app.Length) -eq [int64]$merged.Length -and $appOffset -ge 0) {
+    $appOk = $true
+    for ($k = 0; $k -lt $app.Length; $k++) { if ($merged[$appOffset + $k] -ne $app[$k]) { $appOk = $false; break } }
+    if ($appOk) { $appObs = 'equal' } else { $appObs = 'byte-mismatch' }
+  }
+  $inv.Add((New-InvariantResult -Id "merged-app/$Name" -Category 'merged-layout' -Environment $Name `
+    -Description 'merged app region (at app_offset) is byte-for-byte firmware.bin' -Expectation 'equal' -Observed $appObs -Pass $appOk))
+
+  return [object[]]$inv.ToArray()
+}
+
 function Get-BinaryProofInvariants {
   # Derive the full per-environment invariant set (and the compact nm evidence)
   # from the ELF + firmware.bin of every policy environment, using the pinned nm.
@@ -646,6 +858,7 @@ function Get-BinaryProofInvariants {
     [Parameter(Mandatory)]$Policy,
     [Parameter(Mandatory)][hashtable]$EnvElf,
     [Parameter(Mandatory)][hashtable]$EnvBin,
+    [Parameter(Mandatory)][hashtable]$EnvMerged,
     [Parameter(Mandatory)][string]$NmPath
   )
   $spec = Get-ProofSpec
@@ -655,6 +868,7 @@ function Get-BinaryProofInvariants {
     $name = $envPolicy.name
     if (-not $EnvElf.ContainsKey($name)) { throw "missing ELF path for env '$name'." }
     if (-not $EnvBin.ContainsKey($name)) { throw "missing firmware.bin path for env '$name'." }
+    if (-not $EnvMerged.ContainsKey($name)) { throw "missing firmware-merged.bin path for env '$name'." }
     $flags = Get-EnvProofFlags $Policy $name
     $nmLines = Get-NmLines -NmPath $NmPath -ElfPath $EnvElf[$name]
     $nmEvidence[$name] = Select-NmEvidenceLines -NmLines $nmLines -Tokens $spec.EvidenceTokens
@@ -711,6 +925,12 @@ function Get-BinaryProofInvariants {
     $invariants.Add((New-InvariantResult -Id "quiet-log-baseline/$name" -Category 'quiet-log-baseline' -Environment $name `
       -Description "Plain 'Plane Radar' substring (portal HTML; present in every build, incl. quiet -- proves why plain substring is NOT a logging indicator)" `
       -Expectation 'present' -Observed (ConvertTo-ProofYesNo $planePresent) -Pass ($planePresent)))
+
+    # Merged-layout + exact-SHA anchors, re-derived from the packaged firmware.bin
+    # and the SHIPPED firmware-merged.bin (binary-safe; never trusts merge.log).
+    foreach ($mlInv in @(Get-MergedLayoutInvariants -Policy $Policy -Name $name -MergedPath $EnvMerged[$name] -FirmwarePath $EnvBin[$name])) {
+      $invariants.Add($mlInv)
+    }
   }
   return @{ Invariants = $invariants.ToArray(); NmEvidence = $nmEvidence }
 }
@@ -755,16 +975,18 @@ function Get-PackageDerivedInvariants {
   [OutputType([object[]])]
   param([Parameter(Mandatory)][string]$PackageDir, [Parameter(Mandatory)]$Policy)
   $nmTool = Resolve-RiscvTool $Policy.toolchain_tools.nm
-  $envElf = @{}; $envBin = @{}
+  $envElf = @{}; $envBin = @{}; $envMerged = @{}
   foreach ($envPolicy in $Policy.environments) {
     $name = $envPolicy.name
     $elf = Join-Path (Join-Path $PackageDir $name) 'firmware.elf'
     $bin = Join-Path (Join-Path $PackageDir $name) 'firmware.bin'
+    $merged = Join-Path (Join-Path $PackageDir $name) 'firmware-merged.bin'
     if (-not (Test-Path -LiteralPath $elf)) { throw "packaged firmware.elf missing for '$name': $elf" }
     if (-not (Test-Path -LiteralPath $bin)) { throw "packaged firmware.bin missing for '$name': $bin" }
-    $envElf[$name] = $elf; $envBin[$name] = $bin
+    if (-not (Test-Path -LiteralPath $merged)) { throw "packaged firmware-merged.bin missing for '$name': $merged" }
+    $envElf[$name] = $elf; $envBin[$name] = $bin; $envMerged[$name] = $merged
   }
-  return (Get-BinaryProofInvariants -Policy $Policy -EnvElf $envElf -EnvBin $envBin -NmPath $nmTool).Invariants
+  return (Get-BinaryProofInvariants -Policy $Policy -EnvElf $envElf -EnvBin $envBin -EnvMerged $envMerged -NmPath $nmTool).Invariants
 }
 
 # ---------------------------------------------------------------------------
@@ -906,7 +1128,9 @@ function Test-ReleasePackage {
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)][string]$PackagePath,
-    [Parameter(Mandatory)][string]$PolicyPath,
+    [string]$PolicyPath,
+    $Policy,
+    [string]$PolicySha256,
     [string]$ReleaseRoot,
     [bool]$RequireUnderReleaseRoot = $true,
     [bool]$RequireHeadMatch = $true,
@@ -934,7 +1158,16 @@ function Test-ReleasePackage {
     return $true
   }
 
-  $policy = Read-JsonFile $PolicyPath
+  # Policy is supplied EITHER pre-parsed (production: loaded from the tracked git
+  # commit blob, with its exact-bytes SHA-256) OR via -PolicyPath (isolated self-
+  # test fixtures ONLY). There is no public working-tree policy override.
+  if ($null -eq $Policy) {
+    if (-not $PolicyPath) { throw "Test-ReleasePackage requires -Policy (git-loaded) or -PolicyPath (self-test)." }
+    $policy = Read-JsonFile $PolicyPath
+    if (-not $PolicySha256) { $PolicySha256 = Get-Sha256HexOfBytes ([System.IO.File]::ReadAllBytes($PolicyPath)) }
+  } else {
+    $policy = $Policy
+  }
 
   # -- 1. Path safety ---------------------------------------------------------
   $pkgFull = Get-FullPathSafe $PackagePath
@@ -947,6 +1180,17 @@ function Test-ReleasePackage {
     $insideRelease = Test-PathInside -Base $ReleaseRoot -Candidate $pkgFull
     Add-Check 'path-under-release-root' $insideRelease "package must live strictly inside $ReleaseRoot"
     Add-Check 'path-leaf-is-sha' (Test-Sha1Hex $leaf) "package directory leaf must be a 40-hex commit (got '$leaf')"
+  }
+
+  # Reparse-point defence (fail-closed): lexical containment is NOT enough on
+  # Windows. Reject if the package root -- or ANY file/dir under it -- is a
+  # junction/symlink/reparse point (which could redirect reads outside the tree).
+  $reparseErr = $null; $reparseHit = @()
+  try { $reparseHit = @(Get-ContainedReparsePoints $pkgFull) } catch { $reparseErr = $_.Exception.Message }
+  if ($reparseErr) {
+    Add-Check 'package-no-reparse' $false "reparse-point inspection failed (fail-closed): $reparseErr"
+  } else {
+    Add-Check 'package-no-reparse' ($reparseHit.Count -eq 0) ("package root/subtree must not be or contain a symlink/junction/reparse point: " + [string]::Join('; ', @($reparseHit | Select-Object -First 3)))
   }
 
   # -- 2. Required files + load manifest/proof --------------------------------
@@ -967,6 +1211,15 @@ function Test-ReleasePackage {
   Add-Check 'manifest-schema-version' ([int](Get-PsObjectProperty $manifest 'schemaVersion') -eq 1) "manifest schemaVersion must be 1"
   Add-Check 'proof-schema' (([string](Get-PsObjectProperty $proof 'schema')) -eq 'plane-radar/binary-proof') "unexpected binary-proof schema"
   Add-Check 'proof-schema-version' ([int](Get-PsObjectProperty $proof 'schemaVersion') -eq 1) "binary-proof schemaVersion must be 1"
+
+  # -- 2b. Tracked-git policy binding: manifest.policy_sha256 must equal the -----
+  # SHA-256 of the EXACT git-blob release-policy.json bytes used for verification.
+  $manPolicySha = [string](Get-PsObjectProperty $manifest 'policy_sha256')
+  if ($PolicySha256) {
+    Add-Check 'manifest-policy-sha' ((Test-Sha256Hex $manPolicySha) -and ($manPolicySha -eq $PolicySha256)) "manifest.policy_sha256 must equal the SHA-256 of the tracked git-blob release-policy.json used ($PolicySha256)"
+  } else {
+    Add-Check 'manifest-policy-sha' (Test-Sha256Hex $manPolicySha) "manifest.policy_sha256 must be a 64-hex SHA-256"
+  }
 
   # -- 3. Commit / path binding ----------------------------------------------
   $manifestCommit = [string](Get-PsObjectProperty (Get-PsObjectProperty $manifest 'git') 'commit')
@@ -1018,14 +1271,18 @@ function Test-ReleasePackage {
   $pins = Get-PsObjectProperty $manifest 'pins'
   $expPins = $policy.pins
   $pinExpectedOk = $true
-  foreach ($fld in @('platformio_core', 'platform', 'framework_arduinoespressif32', 'toolchain_riscv32_esp', 'tool_esptoolpy')) {
+  foreach ($fld in @('platformio_core', 'platform', 'framework', 'framework_arduinoespressif32', 'toolchain_riscv32_esp', 'tool_esptoolpy', 'board', 'mcu', 'flash_size', 'app_offset')) {
     if (([string](Get-PsObjectProperty $pins $fld)) -ne ([string](Get-PsObjectProperty $expPins $fld))) { $pinExpectedOk = $false }
   }
+  # platformio_core_verified is the EXACT `pio --version` banner string proven at
+  # build time; it must match "PlatformIO Core, version <pin>" exactly.
+  $expPioVerified = "PlatformIO Core, version " + [string]$expPins.platformio_core
+  if (([string](Get-PsObjectProperty $pins 'platformio_core_verified')) -ne $expPioVerified) { $pinExpectedOk = $false }
   $manDeps = Get-PsObjectProperty $pins 'dependencies'
   foreach ($dp in $expPins.dependencies.PSObject.Properties) {
     if (([string](Get-PsObjectProperty $manDeps $dp.Name)) -ne [string]$dp.Value) { $pinExpectedOk = $false }
   }
-  Add-Check 'pins-expected-match-policy' $pinExpectedOk "manifest expected pins (incl. dependencies) must equal policy pins"
+  Add-Check 'pins-expected-match-policy' $pinExpectedOk "manifest expected pins (core/verified banner/platform/framework/framework-pkg/toolchain/esptool/board/mcu/flash_size/app_offset + dependencies) must equal policy pins"
 
   $obs = Get-PsObjectProperty $pins 'observed'
   $obsOk = ($null -ne $obs)
@@ -1057,9 +1314,13 @@ function Test-ReleasePackage {
     if (-not (Test-Path $file)) { $artifactBad++; Add-Check "artifact-exists/$rel" $false "missing artifact file"; continue }
     $sizeOk = ((Get-Item $file).Length -eq [int64]$p.Value.size)
     $hashOk = ((Get-Sha256Hex $file) -eq [string]$p.Value.sha256)
-    if (-not ($sizeOk -and $hashOk)) { $artifactBad++ }
+    # env ownership: '<env>/...' belongs to <env>; root proof files own env ''.
+    $expOwner = ''
+    if ($rel.Contains('/')) { $expOwner = $rel.Split('/')[0] }
+    $ownerOk = (([string](Get-PsObjectProperty $p.Value 'env')) -eq $expOwner)
+    if (-not ($sizeOk -and $hashOk -and $ownerOk)) { $artifactBad++ }
   }
-  Add-Check 'manifest-artifacts' ($artifactBad -eq 0) "$artifactBad artifact(s) failed size/hash/path validation"
+  Add-Check 'manifest-artifacts' ($artifactBad -eq 0) "$artifactBad artifact(s) failed size/hash/path/owner validation"
 
   # Exact key set: EXACTLY the per-env copied artifacts + binary-proof.json/txt,
   # AND exactly the actual package files (excluding manifest/CHECKSUMS + the
@@ -1099,12 +1360,15 @@ function Test-ReleasePackage {
     Add-Check 'default-artifact-in-artifacts' $false "default artifact '$defRel' not in artifacts map"
   }
 
-  # -- 10. Environments: exact set + role/eval/options/resources == policy ----
+  # -- 10. Environments: exact duplicate-free set + role/eval/options/resources
+  #        + exact policy SHA-256 anchors + nested-artifact consistency ---------
+  $manifestEnvArray = @(Get-PsObjectProperty $manifest 'environments')
+  $manifestEnvNames = @($manifestEnvArray | ForEach-Object { [string](Get-PsObjectProperty $_ 'name') })
+  $envDupFree = ($manifestEnvNames.Count -eq (@($manifestEnvNames | Select-Object -Unique).Count))
   $envByName = @{}
-  foreach ($e in @(Get-PsObjectProperty $manifest 'environments')) { $envByName[[string](Get-PsObjectProperty $e 'name')] = $e }
+  foreach ($e in $manifestEnvArray) { $envByName[[string](Get-PsObjectProperty $e 'name')] = $e }
   $policyEnvNames = @($policy.environments | ForEach-Object { [string]$_.name })
-  $manifestEnvNames = @($envByName.Keys)
-  Add-Check 'env-exact-set' (Test-SetsEqual $policyEnvNames $manifestEnvNames) "manifest environments must be the exact set of policy environments (no extra/missing)"
+  Add-Check 'env-exact-set' ($envDupFree -and ($manifestEnvNames.Count -eq $policyEnvNames.Count) -and (Test-SetsEqual $policyEnvNames $manifestEnvNames)) "manifest environments must be the EXACT duplicate-free set of policy environments (no extra/missing/duplicate)"
   foreach ($envPolicy in $policy.environments) {
     $name = $envPolicy.name
     if (-not $envByName.ContainsKey($name)) { Add-Check "env/$name" $false "environment missing from manifest"; continue }
@@ -1121,6 +1385,38 @@ function Test-ReleasePackage {
     $consistent = ($binArt -and $mergedArt -and ([int64]$binArt.Value.size -eq [int64](Get-PsObjectProperty $res 'firmware_bin')) -and ([int64]$mergedArt.Value.size -eq [int64](Get-PsObjectProperty $res 'merged_bin')))
     Add-Check "resource-policy/$name" ($okBin -and $okMerged -and $okRam -and $okFlash -and $consistent) `
       "resources must equal policy (ram=$($exp.ram),flash=$($exp.flash),bin=$($exp.firmware_bin),merged=$($exp.merged_bin)) and match copied artifacts"
+
+    # EXACT policy SHA-256 anchor: the packaged firmware.bin AND the SHIPPED
+    # firmware-merged.bin must equal the tracked policy hashes (external anchor,
+    # NOT manifest self-consistency). This reads firmware-merged.bin directly.
+    $polSha = Get-PsObjectProperty $envPolicy 'sha256'
+    $expFwSha = ''; $expMgSha = ''
+    if ($polSha) { $expFwSha = [string](Get-PsObjectProperty $polSha 'firmware_bin'); $expMgSha = [string](Get-PsObjectProperty $polSha 'merged_bin') }
+    $binFile = Join-Path $pkgFull "$name\firmware.bin"
+    $mergedFile = Join-Path $pkgFull "$name\firmware-merged.bin"
+    $fwShaOk = ((Test-Path $binFile) -and ($expFwSha.Length -eq 64) -and ((Get-Sha256Hex $binFile) -eq $expFwSha))
+    $mgShaOk = ((Test-Path $mergedFile) -and ($expMgSha.Length -eq 64) -and ((Get-Sha256Hex $mergedFile) -eq $expMgSha))
+    Add-Check "image-sha-policy/$name" ($fwShaOk -and $mgShaOk) "packaged firmware.bin and firmware-merged.bin must equal the EXACT policy SHA-256 anchors"
+
+    # Nested environment.artifacts: exact copied_artifacts set whose size/SHA/env
+    # equal the flat artifact map entry for '<env>/<name>'. A forged nested hash
+    # MUST fail here.
+    $nested = Get-PsObjectProperty $me 'artifacts'
+    $nestedProps = @(); if ($nested) { $nestedProps = @($nested.PSObject.Properties) }
+    $nestedNames = @($nestedProps | ForEach-Object { $_.Name })
+    $nestedDupFree = ($nestedNames.Count -eq (@($nestedNames | Select-Object -Unique).Count))
+    $nestedSetOk = ($nestedDupFree -and (Test-SetsEqual @($policy.copied_artifacts) $nestedNames))
+    $nestedConsistent = $nestedSetOk
+    foreach ($np in $nestedProps) {
+      $flatKey = "$name/$($np.Name)"
+      $flatProp = $artifacts.PSObject.Properties[$flatKey]
+      if (-not $flatProp) { $nestedConsistent = $false; continue }
+      if (([int64](Get-PsObjectProperty $np.Value 'size')) -ne [int64]$flatProp.Value.size) { $nestedConsistent = $false }
+      if (([string](Get-PsObjectProperty $np.Value 'sha256')) -ne [string]$flatProp.Value.sha256) { $nestedConsistent = $false }
+      if (([string](Get-PsObjectProperty $np.Value 'env')) -ne $name) { $nestedConsistent = $false }
+    }
+    Add-Check "env-nested-artifacts/$name" ($nestedSetOk -and $nestedConsistent) "nested environment.artifacts must be the exact copied_artifacts set with size/SHA/env equal to the flat artifact map (no forged nested hash)"
+
     Add-Check "env-role/$name" (([string](Get-PsObjectProperty $me 'role')) -eq [string]$envPolicy.role) "role must be '$($envPolicy.role)'"
     Add-Check "env-eval/$name" (([bool](Get-PsObjectProperty $me 'evaluation_only')) -eq [bool]$envPolicy.evaluation_only) "evaluation_only must be $([bool]$envPolicy.evaluation_only)"
     $mo = Get-PsObjectProperty $me 'options'; $po = $envPolicy.options
@@ -1244,8 +1540,10 @@ function New-MinimalReleasePackage {
   # Build a SMALL but fully CERTIFICATION-CONFORMANT release package in $Dir for
   # self-tests ONLY (never touches real firmware, never writes under release/).
   # It satisfies every strict Test-ReleasePackage check when paired with the
-  # ProofRecomputer stub (Get-FixtureProofInvariants). The fixture policy is
-  # written OUTSIDE the package directory so it does not pollute the artifact set.
+  # merged-layout-aware ProofRecomputer stub. The fixture merged image has a REAL
+  # (tiny) component/gap/app layout so the merged-layout proof exercises real code.
+  # The fixture policy is written OUTSIDE the package directory so it does not
+  # pollute the artifact set.
   [OutputType([hashtable])]
   param(
     [Parameter(Mandatory)][string]$Dir,
@@ -1257,8 +1555,26 @@ function New-MinimalReleasePackage {
   New-Item -ItemType Directory -Path $envDir -Force | Out-Null
 
   $copied = @('firmware.bin', 'firmware-merged.bin', 'firmware.elf', 'firmware.map', 'build.log', 'merge.log', 'nm-symbols.txt')
-  $binBytes = [byte[]](1..64)
-  $mergedBytes = [byte[]](65..200)
+
+  # -- Realistic tiny merged layout ------------------------------------------
+  #   bootloader@0(8) | gap(8) | partitions@16(8) | gap(8) | boot_app0@32(8) |
+  #   gap(8) | app@48(32).  merged length = app_offset(48) + firmware.bin(32) = 80.
+  $fillByte = [byte]255
+  $binBytes = [byte[]](1..32)                       # firmware.bin (the app)
+  $compBoot = [byte[]](100..107)
+  $compPart = [byte[]](110..117)
+  $compApp0 = [byte[]](120..127)
+  $appOffset = 48
+  $mergedList = New-Object System.Collections.Generic.List[byte]
+  $mergedList.AddRange($compBoot)
+  for ($i = 0; $i -lt 8; $i++) { $mergedList.Add($fillByte) }
+  $mergedList.AddRange($compPart)
+  for ($i = 0; $i -lt 8; $i++) { $mergedList.Add($fillByte) }
+  $mergedList.AddRange($compApp0)
+  for ($i = 0; $i -lt 8; $i++) { $mergedList.Add($fillByte) }
+  $mergedList.AddRange($binBytes)
+  $mergedBytes = $mergedList.ToArray()
+
   [System.IO.File]::WriteAllBytes((Join-Path $envDir 'firmware.bin'), $binBytes)
   [System.IO.File]::WriteAllBytes((Join-Path $envDir 'firmware-merged.bin'), $mergedBytes)
   Write-TextFileLf (Join-Path $envDir 'firmware.elf') "fake-elf"
@@ -1269,12 +1585,21 @@ function New-MinimalReleasePackage {
 
   $defRel = "$EnvName/firmware-merged.bin"
   $deps = [ordered]@{ 'lovyan03/LovyanGFX' = '9.9.9'; 'bblanchon/ArduinoJson' = '8.8.8' }
+  $fwSha = Get-Sha256HexOfBytes $binBytes
+  $mgSha = Get-Sha256HexOfBytes $mergedBytes
+  $pinsCommon = [ordered]@{
+    platformio_core = '0.0.0'; platform = 'fxplatform@1.2.3'; framework = 'arduino'
+    framework_arduinoespressif32 = 'fx-fw'; toolchain_riscv32_esp = 'fx-tc'; tool_esptoolpy = 'fx-esptool'
+    board = 'fxboard'; mcu = 'fxmcu'; flash_size = '4MB'; app_offset = '0x10000'
+    dependencies = $deps
+  }
   $fxPolicy = [ordered]@{
     schema = 'plane-radar/release-policy'; schema_version = 1
     local_only = [ordered]@{ require_no_git_remote = $true; release_root_relative = 'release' }
     pins = [ordered]@{
       platformio_core = '0.0.0'; platform = 'fxplatform@1.2.3'; framework = 'arduino'
       framework_arduinoespressif32 = 'fx-fw'; toolchain_riscv32_esp = 'fx-tc'; tool_esptoolpy = 'fx-esptool'
+      board = 'fxboard'; mcu = 'fxmcu'; flash_size = '4MB'; app_offset = '0x10000'
       dependencies = $deps
     }
     airport_data = [ordered]@{ source_commit = 'fxairportcommit0000000000000000000000000' }
@@ -1284,17 +1609,30 @@ function New-MinimalReleasePackage {
       [ordered]@{ id = 'fx-gate-b'; script = 'scripts/fx-b.ps1'; summary = 'fb'; args = @() }
     )
     tests = [ordered]@{ native_test_summary = 'fixture native summary' }
+    merged_layout = [ordered]@{
+      app_offset = $appOffset; gap_fill_byte = 255
+      components = @(
+        [ordered]@{ name = 'bootloader'; offset = 0;  size = 8; sha256 = (Get-Sha256HexOfBytes $compBoot) },
+        [ordered]@{ name = 'partitions'; offset = 16; size = 8; sha256 = (Get-Sha256HexOfBytes $compPart) },
+        [ordered]@{ name = 'boot_app0';  offset = 32; size = 8; sha256 = (Get-Sha256HexOfBytes $compApp0) }
+      )
+    }
     copied_artifacts = $copied
     environments = @([ordered]@{
         name = $EnvName; role = 'default-release'; evaluation_only = $false
         options = [ordered]@{ worker = $false; diagnostics = $false; log_level = 2 }
         resources = [ordered]@{ ram = 1; flash = 2; firmware_bin = $binBytes.Length; merged_bin = $mergedBytes.Length }
+        sha256 = [ordered]@{ firmware_bin = $fwSha; merged_bin = $mgSha }
       })
   }
   $policyPath = (Get-FullPathSafe $Dir).TrimEnd('\', '/') + '-policy.json'
   Write-JsonFileLf $policyPath $fxPolicy
+  $policySha = Get-Sha256Hex $policyPath
+  $fxPolicyObj = Read-JsonFile $policyPath
 
-  $fxInvariants = Get-FixtureProofInvariants -EnvName $EnvName
+  $fxInvariants = @(Get-FixtureProofInvariants -EnvName $EnvName)
+  $fxInvariants += @(Get-MergedLayoutInvariants -Policy $fxPolicyObj -Name $EnvName `
+    -MergedPath (Join-Path $envDir 'firmware-merged.bin') -FirmwarePath (Join-Path $envDir 'firmware.bin'))
   $proof = [ordered]@{
     schema = 'plane-radar/binary-proof'; schemaVersion = 1; commit = $Commit
     overall = 'pass'; total = $fxInvariants.Count; passed = $fxInvariants.Count; failed = 0
@@ -1306,13 +1644,20 @@ function New-MinimalReleasePackage {
 
   $artifactsMap = New-PackageArtifactsMap -PackageDir $Dir
   $mergedSha = $artifactsMap[$defRel].sha256
+  $nestedArtifacts = [ordered]@{}
+  foreach ($rel in $artifactsMap.Keys) {
+    if ($rel.StartsWith("$EnvName/")) { $nestedArtifacts[$rel.Substring($EnvName.Length + 1)] = $artifactsMap[$rel] }
+  }
   $manifest = [ordered]@{
     schema = 'plane-radar/release-manifest'; schemaVersion = 1
     git = [ordered]@{ commit = $Commit; short = $Commit.Substring(0, 7); branch = 'fixture'; tracked_clean = $true; untracked_files = 0 }
     local_only = [ordered]@{ no_remote = $true; release_path = "release/$Commit" }
+    policy_sha256 = $policySha
     pins = [ordered]@{
-      platformio_core = '0.0.0'; platform = 'fxplatform@1.2.3'; framework = 'arduino'
+      platformio_core = '0.0.0'; platformio_core_verified = 'PlatformIO Core, version 0.0.0'
+      platform = 'fxplatform@1.2.3'; framework = 'arduino'
       framework_arduinoespressif32 = 'fx-fw'; toolchain_riscv32_esp = 'fx-tc'; tool_esptoolpy = 'fx-esptool'
+      board = 'fxboard'; mcu = 'fxmcu'; flash_size = '4MB'; app_offset = '0x10000'
       dependencies = $deps
       observed = [ordered]@{
         platform_version = '1.2.3'; framework_arduinoespressif32 = 'fx-fw'
@@ -1332,6 +1677,7 @@ function New-MinimalReleasePackage {
         name = $EnvName; role = 'default-release'; evaluation_only = $false
         options = [ordered]@{ worker = $false; diagnostics = $false; log_level = 2 }
         resources = [ordered]@{ ram = 1; flash = 2; firmware_bin = $binBytes.Length; merged_bin = $mergedBytes.Length }
+        artifacts = $nestedArtifacts
       })
     artifacts = $artifactsMap
   }
@@ -1340,6 +1686,7 @@ function New-MinimalReleasePackage {
 
   return @{
     PolicyPath  = $policyPath
+    PolicySha256 = $policySha
     DefaultRel  = $defRel
     ImageSize   = [int64]$mergedBytes.Length
     ImageSha256 = $mergedSha
@@ -1378,7 +1725,8 @@ function New-HardwareResultsScaffold {
     [Parameter(Mandatory)][string]$DefaultEnv,
     [Parameter(Mandatory)][hashtable]$ImageSha,
     [Parameter(Mandatory)][hashtable]$ImageSize,
-    [Parameter(Mandatory)][string]$GeneratedUtc
+    [Parameter(Mandatory)][string]$GeneratedUtc,
+    [string]$PolicySha256 = ''
   )
   $items = New-Object System.Collections.Generic.List[object]
   foreach ($pi in $Policy.items) {
@@ -1421,6 +1769,7 @@ function New-HardwareResultsScaffold {
     schema_version = 1
     generated_utc  = $GeneratedUtc
     policy_ref     = 'scripts/hardware-acceptance-policy.json'
+    policy_sha256  = $PolicySha256
     binding        = [ordered]@{
       commit        = $Commit
       environment   = $DefaultEnv
@@ -1494,6 +1843,8 @@ function Test-HardwareEvidence {
     [Parameter(Mandatory)][string]$ExpectedEnv,
     [Parameter(Mandatory)][string]$ExpectedDefaultRel,
     [string]$Gate = 'default-release',
+    [string]$HardwarePolicySha256 = '',
+    [string]$ReparseBase = '',
     [switch]$Quiet
   )
   $errors = New-Object System.Collections.Generic.List[string]
@@ -1522,10 +1873,33 @@ function Test-HardwareEvidence {
   $results = Read-JsonFile $ResultsPath
   $evDirFull = Get-FullPathSafe $EvidenceDir
 
-  # -- schema / schema_version / policy_ref -----------------------------------
+  # -- Reparse-point defence (fail-closed) ------------------------------------
+  # Reject a reparse evidence root, any reparse file/dir under it, or a reparse
+  # ANCESTOR directory between $ReparseBase (default: the evidence dir) and the
+  # evidence dir. Lexical containment alone is not enough on Windows.
+  $reBase = $ReparseBase; if (-not $reBase) { $reBase = $evDirFull }
+  $reErr = $null; $reAnc = $null; $reUnder = @()
+  try {
+    $reAnc = Find-ReparsePointInChain -Base $reBase -Full $evDirFull
+    if (Test-Path -LiteralPath $evDirFull) { $reUnder = @(Get-ContainedReparsePoints $evDirFull) }
+  } catch { $reErr = $_.Exception.Message }
+  if ($reErr) { Add-Check 'evidence-no-reparse' $false "reparse-point inspection failed (fail-closed): $reErr" }
+  else { Add-Check 'evidence-no-reparse' (($null -eq $reAnc) -and ($reUnder.Count -eq 0)) ("evidence root/subtree/ancestors must not be or contain a symlink/junction/reparse point: " + [string]::Join('; ', @(@($reAnc) + $reUnder | Where-Object { $_ } | Select-Object -First 3))) }
+
+  # -- authoritative policy schema / version (loaded from tracked git) --------
+  Add-Check 'policy-schema' (([string](Get-PsObjectProperty $Policy 'schema')) -eq 'plane-radar/hardware-acceptance-policy') "hardware policy schema must be plane-radar/hardware-acceptance-policy"
+  Add-Check 'policy-schema-version' ([int](Get-PsObjectProperty $Policy 'schema_version') -eq 1) "hardware policy schema_version must be 1"
+
+  # -- schema / schema_version / policy_ref / policy_sha256 -------------------
   Add-Check 'results-schema' (([string](Get-PsObjectProperty $results 'schema')) -eq 'plane-radar/hardware-results') "unexpected results schema"
   Add-Check 'results-schema-version' ([int](Get-PsObjectProperty $results 'schema_version') -eq 1) "results schema_version must be 1"
   Add-Check 'results-policy-ref' (([string](Get-PsObjectProperty $results 'policy_ref')) -eq 'scripts/hardware-acceptance-policy.json') "results policy_ref must be scripts/hardware-acceptance-policy.json"
+  $resPolSha = [string](Get-PsObjectProperty $results 'policy_sha256')
+  if ($HardwarePolicySha256) {
+    Add-Check 'results-policy-sha' ((Test-Sha256Hex $resPolSha) -and ($resPolSha -eq $HardwarePolicySha256)) "results.policy_sha256 must equal the SHA-256 of the tracked git-blob hardware-acceptance-policy.json used ($HardwarePolicySha256)"
+  } else {
+    Add-Check 'results-policy-sha' (Test-Sha256Hex $resPolSha) "results.policy_sha256 must be a 64-hex SHA-256"
+  }
 
   # -- top-level binding to the exact flashed default image -------------------
   $b = Get-PsObjectProperty $results 'binding'
@@ -1605,13 +1979,13 @@ function Test-HardwareEvidence {
     $status = [string](Get-PsObjectProperty $ri 'status')
     Add-Check "status/$id" ($status -eq 'pass') "status must be 'pass' (got '$status'; pending/blocked/waived/fail are NOT pass)"
 
-    # mandatory pass items require a non-empty operator name + ISO date
+    # mandatory pass items require a non-empty operator name + REAL ISO date
     if ([bool]$pi.mandatory) {
       $op = Get-PsObjectProperty $ri 'operator'
       $opName = [string](Get-PsObjectProperty $op 'name')
       $opDate = [string](Get-PsObjectProperty $op 'date')
-      $dateOk = [bool]([regex]::IsMatch($opDate, '^\d{4}-\d{2}-\d{2}$'))
-      Add-Check "operator/$id" (($opName.Trim().Length -gt 0) -and $dateOk) "mandatory pass item requires a non-empty operator name and ISO date (YYYY-MM-DD)"
+      $dateOk = Test-IsoCalendarDate $opDate
+      Add-Check "operator/$id" (($opName.Trim().Length -gt 0) -and $dateOk) "mandatory pass item requires a non-empty operator name and a REAL ISO calendar date (YYYY-MM-DD; e.g. 2026-99-99 is rejected)"
     }
 
     # evidence files: exist + non-empty + recorded size/lowercase SHA-256 match
