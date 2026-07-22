@@ -80,7 +80,8 @@ function Invoke-VerifierSelfTest {
     $inv = @(Get-FixtureProofInvariants -EnvName 'supermini')
     $merged = Join-Path $pkg 'supermini\firmware-merged.bin'
     $fw = Join-Path $pkg 'supermini\firmware.bin'
-    $inv += @(Get-MergedLayoutInvariants -Policy $pol -Name 'supermini' -MergedPath $merged -FirmwarePath $fw)
+    $elf = Join-Path $pkg 'supermini\firmware.elf'
+    $inv += @(Get-MergedLayoutInvariants -Policy $pol -Name 'supermini' -MergedPath $merged -FirmwarePath $fw -ElfPath $elf)
     return $inv
   }
   function Run-Verify([string]$dir, [string]$policyPath) {
@@ -420,6 +421,46 @@ function Invoke-VerifierSelfTest {
       Expect "reparse helper: missing path is not a reparse point" (-not (Test-IsReparsePoint (Join-Path $fixtureRoot 'no-such-path')))
       Expect "reparse helper: clean tree has no reparse points" (@(Get-ContainedReparsePoints $base).Count -eq 0)
     }
+
+    # ---- Phase 12 FINAL: ELF <-> app-image binding (coordinator repro) --------
+    # A package attacker can swap the packaged firmware.elf (the verifier re-
+    # derives the worker/diag nm proofs FROM it) and reseal manifest/CHECKSUMS,
+    # while leaving the policy-pinned firmware.bin/merged untouched. The exact ELF
+    # policy anchor AND the app-descriptor embedded-ELF-SHA binding must reject it.
+
+    # 43. Swapped firmware.elf, fully resealed (flat+nested manifest + CHECKSUMS),
+    #     firmware.bin/merged left byte-identical. MUST reject on ELF anchor +
+    #     elf-binding + proof re-derivation.
+    $d = New-Tampered 'tamper-elf-swapped-resealed' {
+      param($dir)
+      $p = Join-Path $dir 'supermini\firmware.elf'
+      [System.IO.File]::WriteAllBytes($p, [byte[]](11..90))   # different ELF bytes/length
+      Reseal $dir
+    }
+    Expect "rejects swapped firmware.elf (resealed; bin/merged unchanged)" (-not (Run-Verify $d $polPath).Ok)
+
+    # 44. Same-length firmware.elf byte flip, resealed. The new ELF digest no
+    #     longer equals the policy anchor NOR the embedded app-descriptor SHA.
+    $d = New-Tampered 'tamper-elf-byteflip-resealed' {
+      param($dir)
+      $p = Join-Path $dir 'supermini\firmware.elf'
+      $b = [System.IO.File]::ReadAllBytes($p); $b[0] = [byte](($b[0] + 1) % 256)
+      [System.IO.File]::WriteAllBytes($p, $b)
+      Reseal $dir
+    }
+    Expect "rejects firmware.elf byte flip (resealed)" (-not (Run-Verify $d $polPath).Ok)
+
+    # 45. Embedded ELF-SHA byte tamper: flip a byte of firmware.bin INSIDE the
+    #     app-descriptor ELF-SHA field (fixture offset 48), resealed. Breaks the
+    #     elf-binding AND the exact firmware.bin policy anchor.
+    $d = New-Tampered 'tamper-embedded-elf-sha' {
+      param($dir)
+      $p = Join-Path $dir 'supermini\firmware.bin'
+      $b = [System.IO.File]::ReadAllBytes($p); $b[48] = [byte](($b[48] + 1) % 256)
+      [System.IO.File]::WriteAllBytes($p, $b)
+      Reseal $dir
+    }
+    Expect "rejects embedded ELF-SHA byte tamper (resealed)" (-not (Run-Verify $d $polPath).Ok)
   }
   finally {
     if (Test-Path $fixtureRoot) { Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue }
@@ -461,7 +502,7 @@ $gp = Get-GitPolicy -RepoRoot $repoRoot -Commit $pkgCommit -RelPath 'scripts/rel
 Write-Host "=== Verifying $pkg ===" -ForegroundColor Cyan
 Write-Host "  policy: scripts/release-policy.json@$($pkgCommit.Substring(0,7)) sha256=$($gp.Sha256)"
 $result = Test-ReleasePackage -PackagePath $pkg -Policy $gp.Object -PolicySha256 $gp.Sha256 -ReleaseRoot $releaseRoot `
-  -RequireUnderReleaseRoot $true -RequireHeadMatch (-not $AllowStaleHead) -ExpectedHeadCommit $git.Commit
+  -RequireUnderReleaseRoot $true -RequireHeadMatch (-not $AllowStaleHead) -ExpectedHeadCommit $git.Commit -RepoRoot $repoRoot
 
 Write-Host ""
 if ($result.Ok) {

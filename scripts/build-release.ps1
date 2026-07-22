@@ -192,6 +192,8 @@ foreach ($envPolicy in $policy.environments) {
   if ($flashM.Success) { $flash = [int]$flashM.Groups[1].Value }
   $firmwareBinSize = (Get-Item $firmwareBin).Length
   $mergedBinSize = (Get-Item $mergedBin).Length
+  $firmwareElf = Join-Path $bd 'firmware.elf'
+  $firmwareElfSize = (Get-Item $firmwareElf).Length
 
   $exp = $envPolicy.resources
   function Assert-Size([string]$label, $actual, $expected) {
@@ -204,27 +206,48 @@ foreach ($envPolicy in $policy.environments) {
   Assert-Size 'flash' $flash $exp.flash
   Assert-Size 'firmware.bin' $firmwareBinSize $exp.firmware_bin
   Assert-Size 'firmware-merged.bin' $mergedBinSize $exp.merged_bin
+  # firmware.elf size is a deterministic (reproducible) build-metadata anchor.
+  Assert-Size 'firmware.elf' $firmwareElfSize (Get-PsObjectProperty $exp 'firmware_elf')
 
-  # Exact policy SHA-256 anchor: the built firmware.bin AND the SHIPPED
-  # firmware-merged.bin must equal the tracked policy hashes for this env.
+  # Exact policy SHA-256 anchor: the built firmware.elf, firmware.bin AND the
+  # SHIPPED firmware-merged.bin must equal the tracked policy hashes for this
+  # env; AND firmware.bin's app-descriptor embedded ELF SHA-256 must equal
+  # SHA-256(firmware.elf) so the ELF proof input is bound to the pinned image.
   $polSha = Get-PsObjectProperty $envPolicy 'sha256'
-  if ($null -eq $polSha) { throw "[$name] policy has no sha256 anchor (firmware_bin/merged_bin)." }
+  if ($null -eq $polSha) { throw "[$name] policy has no sha256 anchor (firmware_elf/firmware_bin/merged_bin)." }
   $expFwSha = [string](Get-PsObjectProperty $polSha 'firmware_bin')
   $expMgSha = [string](Get-PsObjectProperty $polSha 'merged_bin')
+  $expElfSha = [string](Get-PsObjectProperty $polSha 'firmware_elf')
   $actFwSha = Get-Sha256Hex $firmwareBin
   $actMgSha = Get-Sha256Hex $mergedBin
+  $actElfSha = Get-Sha256Hex $firmwareElf
+  if (-not ((Test-Sha256Hex $expElfSha) -and ($actElfSha -eq $expElfSha))) {
+    throw "[$name] firmware.elf SHA-256 mismatch: expected $expElfSha, got $actElfSha."
+  }
   if (-not ((Test-Sha256Hex $expFwSha) -and ($actFwSha -eq $expFwSha))) {
     throw "[$name] firmware.bin SHA-256 mismatch: expected $expFwSha, got $actFwSha."
   }
   if (-not ((Test-Sha256Hex $expMgSha) -and ($actMgSha -eq $expMgSha))) {
     throw "[$name] firmware-merged.bin SHA-256 mismatch: expected $expMgSha, got $actMgSha."
   }
+  # elf-binding: firmware.bin[app_descriptor.elf_sha256_offset] == SHA-256(elf).
+  $ad = Get-PsObjectProperty $policy 'app_descriptor'
+  $adOff = 176; $adLen = 32
+  if ($ad) { $o = Get-PsObjectProperty $ad 'elf_sha256_offset'; if ($null -ne $o) { $adOff = [int]$o }; $l = Get-PsObjectProperty $ad 'elf_sha256_length'; if ($null -ne $l) { $adLen = [int]$l } }
+  $binBytesForBind = [System.IO.File]::ReadAllBytes($firmwareBin)
+  if (($adOff -lt 0) -or (($adOff + $adLen) -gt $binBytesForBind.Length)) { throw "[$name] app-descriptor ELF-SHA offset $adOff out of range for firmware.bin." }
+  $segForBind = New-Object byte[] $adLen; [Array]::Copy($binBytesForBind, $adOff, $segForBind, 0, $adLen)
+  $embeddedElfSha = (($segForBind | ForEach-Object { $_.ToString('x2') }) -join '')
+  if ($embeddedElfSha -ne $actElfSha) {
+    throw "[$name] elf-binding failed: firmware.bin embedded ELF SHA-256 ($embeddedElfSha) != SHA-256(firmware.elf) ($actElfSha)."
+  }
 
   $buildInfo[$name].ram = $ram
   $buildInfo[$name].flash = $flash
   $buildInfo[$name].firmwareBinSize = [int64]$firmwareBinSize
   $buildInfo[$name].mergedBinSize = [int64]$mergedBinSize
-  Write-Ok "$name sizes+SHA exact: bin=$firmwareBinSize merged=$mergedBinSize"
+  $buildInfo[$name].firmwareElfSize = [int64]$firmwareElfSize
+  Write-Ok "$name sizes+SHA exact: elf=$firmwareElfSize bin=$firmwareBinSize merged=$mergedBinSize (elf-binding OK)"
 }
 
 # ===========================================================================
@@ -262,7 +285,7 @@ foreach ($name in $envNames) {
   $envBin[$name] = Join-Path $bd 'firmware.bin'
   $envMerged[$name] = Join-Path $bd 'firmware-merged.bin'
 }
-$proofResult = Get-BinaryProofInvariants -Policy $policy -EnvElf $envElf -EnvBin $envBin -EnvMerged $envMerged -NmPath $nmTool
+$proofResult = Get-BinaryProofInvariants -Policy $policy -EnvElf $envElf -EnvBin $envBin -EnvMerged $envMerged -NmPath $nmTool -RepoRoot $repoRoot
 $invariants = @($proofResult.Invariants)
 $nmEvidence = $proofResult.NmEvidence
 $failed = @($invariants | Where-Object { $_.status -ne 'pass' })
@@ -376,7 +399,7 @@ foreach ($envPolicy in $policy.environments) {
     role            = $envPolicy.role
     evaluation_only = [bool]$envPolicy.evaluation_only
     options         = [ordered]@{ worker = [bool]$envPolicy.options.worker; diagnostics = [bool]$envPolicy.options.diagnostics; log_level = [int]$envPolicy.options.log_level }
-    resources       = [ordered]@{ ram = $bi.ram; flash = $bi.flash; firmware_bin = $bi.firmwareBinSize; merged_bin = $bi.mergedBinSize }
+    resources       = [ordered]@{ ram = $bi.ram; flash = $bi.flash; firmware_bin = $bi.firmwareBinSize; merged_bin = $bi.mergedBinSize; firmware_elf = $bi.firmwareElfSize }
     artifacts       = $envArtifacts
   })
 }

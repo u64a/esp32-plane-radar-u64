@@ -544,6 +544,7 @@ the network:
 .\scripts\verify-adsb-worker-policy.ps1 -SelfTest    # proves the gate rejects 17 representative negative tamper cases, on an isolated temp copy
 .\scripts\verify-diagnostics-policy.ps1              # Phase 10: 12 diagnostics/logging source invariants
 .\scripts\verify-diagnostics-policy.ps1 -SelfTest    # proves the diagnostics gate rejects 13 representative tamper cases
+.\scripts\verify-reproducible-build-policy.ps1       # Phase 12: firmware envs strip project DWARF (build_unflags=-ggdb + -g0), native envs keep it, policy carries app_descriptor + per-env firmware_elf SHA anchors
 ```
 
 The worker policy gate proves these invariants hold in **source**; the
@@ -957,7 +958,7 @@ untracked files**, and **no git remote**; the publish path is always exactly
 `release/<full-git-sha>/` (there is **no** output-root override); and every required
 source gate is green — `scripts/native-test.ps1` (**606/41**, which also runs the
 airport + egress gates), plus `check-native-test-access`, CA, provisioning, worker,
-and diagnostics policy gates. The certification policy is the **tracked git-blob**
+diagnostics, and **reproducible-build** policy gates. The certification policy is the **tracked git-blob**
 `release-policy.json` at `HEAD` (not the working tree); its SHA-256 is recorded in
 the manifest as `policy_sha256`. There are **no certification bypasses** (no
 `-SkipSourceGates`/`-SkipBuild`/`-AllowDirtyWorktree`/`-PolicyPath`): every
@@ -966,13 +967,16 @@ published package is **certified**. Iterate with direct `pio run` commands inste
 It then deletes `.pio` once (reparse-point-safe) and freshly builds **and merges**
 exactly the five firmware envs (`supermini`, `supermini-worker`, `supermini-quiet`,
 `supermini-diag`, `supermini-worker-diag`), enforces the **exact** approved
-resource/file sizes **and the exact policy SHA-256** of each env's `firmware.bin`
-and shipped `firmware-merged.bin` (see [Build variants](#build-variants-phase-10)
+resource/file sizes **and the exact policy SHA-256** of each env's `firmware.elf`,
+`firmware.bin`, and shipped `firmware-merged.bin` (plus the `firmware.bin` ↔
+`firmware.elf` embedded-SHA **elf-binding**; see
+[Build variants](#build-variants-phase-10)
 and [Memory budget](#memory-budget)), **verifies and records the OBSERVED installed
 toolchain/library versions** (PlatformIO platform, `framework-arduinoespressif32`,
 RISC-V toolchain, `esptool`, LovyanGFX, ArduinoJson) and fails on any drift from the
-pins, runs the current-head ELF/binary proofs (symbol/logging **and** the
-re-derived merged-layout invariants), and only if **every** invariant passes stages
+pins, runs the current-head ELF/binary proofs (symbol/logging, the re-derived
+merged-layout invariants, and the elf-binding + path-independence invariants), and
+only if **every** invariant passes stages
 and publishes the package to `release/<full-git-sha>/`. **Immediately before
 staging** it re-runs the Git source-gate and requires the same commit/branch, a
 clean tracked worktree, zero untracked files, and no remote (closing the
@@ -1038,13 +1042,15 @@ every env, aborting before publishing on any failure:
   appears in every build's portal HTML and is deliberately not used as an
   indicator).
 
-**Exact-SHA anchoring of the shipped image (Phase 12 final).** Self-consistent
-manifest hashes are *not* an anchor, so the shipped/flashed **`firmware-merged.bin`**
-(and `firmware.bin`) of every env is bound to **tracked policy**. `release-policy.json`
-records the exact approved SHA-256 of each env's `firmware.bin` and
-`firmware-merged.bin` (`environments[].sha256`) plus a `merged_layout` block, and the
-build **and** verify re-derive **directly from the shipped merged bytes** (never
-`merge.log` text):
+**Exact-SHA anchoring of the shipped image + its proof ELF (Phase 12 final).**
+Self-consistent manifest hashes are *not* an anchor, so the packaged
+**`firmware.elf`** (the input the verifier re-derives the nm proofs from), the
+shipped/flashed **`firmware-merged.bin`**, and **`firmware.bin`** of every env are
+all bound to **tracked policy**. `release-policy.json` records the exact approved
+SHA-256 of each env's `firmware.elf`, `firmware.bin`, and `firmware-merged.bin`
+(`environments[].sha256`) plus its `firmware_elf` size, a `merged_layout` block,
+and an `app_descriptor` block; the build **and** verify re-derive **directly from
+the packaged bytes** (never `merge.log` text):
 
 - each merged image's component regions — **bootloader @ 0x0**, **partitions @ 0x8000**,
   **boot_app0 @ 0xe000** — match their fixed offset/size and exact SHA-256 (identical
@@ -1052,13 +1058,70 @@ build **and** verify re-derive **directly from the shipped merged bytes** (never
 - the region at **app_offset (0x10000)** is **byte-for-byte** equal to that env's
   `firmware.bin`, and the merged length equals `0x10000 + firmware.bin length`;
 - every gap between a component end and the next offset is entirely **0xFF**;
-- the packaged `firmware.bin`/`firmware-merged.bin` equal the exact policy SHA-256.
+- the packaged `firmware.elf`/`firmware.bin`/`firmware-merged.bin` equal the exact
+  policy SHA-256 anchors;
+- **`elf-binding`** — `firmware.bin`'s ESP app-descriptor embedded ELF SHA-256
+  (at `app_descriptor.elf_sha256_offset` = **0xB0**, provenance tracked in policy)
+  equals SHA-256(packaged `firmware.elf`). Because `firmware.bin` is pinned
+  byte-exact, this **binds the proof-input ELF to the app image**: a package
+  attacker who swaps `firmware.elf` and reseals `manifest.json`/`CHECKSUMS` while
+  leaving the pinned `firmware.bin` untouched is rejected (its new digest no
+  longer matches the embedded bytes *or* the policy ELF anchor);
+- **`path-independence`** — the packaged `firmware.elf` embeds **no** absolute
+  build-worktree path (neither the repo-root path in any Windows drive-case/slash
+  spelling nor the `esp32-plane-radar` project-family token), proving the build
+  did not leak its own path into DWARF.
 
-A same-length all-zero (or app-/bootloader-region-swapped) merged image — even with
+A same-length all-zero (or app-/bootloader-region-swapped) merged image, or a
+swapped/byte-flipped `firmware.elf`, or a tampered embedded ELF-SHA — even with
 the manifest, nested artifact maps, `default_artifact`, and `CHECKSUMS` all
-consistently updated — is therefore **rejected** on the exact policy SHA and/or the
-re-derived merged-layout invariants. A compact `nm-symbols.txt` (the relevant
-demangled symbols) is saved per env for later audit.
+consistently updated — is therefore **rejected** on the exact policy SHA and/or
+the re-derived merged-layout / elf-binding / path-independence invariants. A
+compact `nm-symbols.txt` (the relevant demangled symbols) is saved per env for
+later audit.
+
+### Byte-reproducible builds across worktree paths (Phase 12 final)
+
+The exact raw SHA-256 anchors above are only meaningful if the same commit +
+toolchain produces byte-identical artifacts regardless of the absolute build
+path. The Arduino framework compiles every firmware TU with `-ggdb`, which embeds
+the absolute worktree path into DWARF (`DW_AT_comp_dir` in `.debug_str`, plus an
+absolute directory entry in `.debug_line`). Those bytes are the **only** thing
+that differs between two worktrees, but they change `firmware.elf`, which cascades
+through the esptool-embedded app-descriptor ELF SHA-256 into `firmware.bin`
+(exactly 65 identity/integrity bytes: the 32-byte ELF SHA at 0xB0-0xCF plus the
+1-byte image checksum + 32-byte validation hash near the image end).
+
+`platformio.ini` therefore strips project DWARF from the five firmware envs with
+**`build_unflags = -ggdb`** + **`-g0`** (propagated to every `supermini-*` env via
+`extends` + `${env:supermini.build_flags}`; the `native*` test envs keep their
+debug info). `-fdebug-prefix-map`/`-ffile-prefix-map` were tested first but are
+unreliable on Windows/MinGW (GCC records `comp_dir` with the getcwd() spelling yet
+canonicalises other absolute paths to a lower-cased/forward-slashed spelling, so
+no single prefix-map covers every spelling). Stripping DWARF is safe because the
+binary proofs read the ELF **symbol table** (`nm .symtab`) and loadable image
+strings, **not** DWARF — every worker/diag/heap symbol and logging-string proof is
+retained; only `.debug_*` from project TUs is removed and the **loadable image is
+byte-identical** (only the embedded ELF SHA and its dependent checksum/hash
+change). Espressif's precompiled SDK archives keep their own stable
+(worktree-independent) debug paths, which do not vary across worktrees.
+
+This was **verified by building the final commit in two worktrees with materially
+different absolute path lengths** (`D:\repos\esp32-plane-radar-lambert-phase12-release`,
+50 chars, and a temporary `D:\plr-repro-worktree2`, 22 chars) and comparing all 15
+artifacts (5 envs × `firmware.elf`/`firmware.bin`/`firmware-merged.bin`) —
+**byte-identical SHA-256 in every case**. The `verify-reproducible-build-policy`
+source gate enforces the `platformio.ini` flag policy + the policy ELF anchors,
+and the `path-independence` proof invariant enforces the built output. To
+reproduce:
+
+```powershell
+git worktree add --detach D:\plr-repro-worktree2 <final-sha>
+Copy-Item .\platformio.ini D:\plr-repro-worktree2\   # if verifying pre-commit
+pushd D:\plr-repro-worktree2; pio run -e supermini; pio run -t merge -e supermini; popd
+# compare .pio\build\supermini\firmware.{elf,bin} and firmware-merged.bin SHA-256
+git worktree remove --force D:\plr-repro-worktree2
+```
 
 ### Verify a release (`scripts/verify-release.ps1`)
 
@@ -1090,7 +1153,9 @@ platform / framework / framework package / toolchain / esptool / **board** /
 **mcu** / **flash_size** / **app_offset** / dependencies) **and the OBSERVED
 installed toolchain/library versions** both equal policy; every manifest artifact
 size + SHA-256 **and env ownership**; the **exact policy SHA-256** of each env's
-`firmware.bin` and shipped `firmware-merged.bin`; the artifact keys are **exactly**
+`firmware.elf`, `firmware.bin`, and shipped `firmware-merged.bin`, plus the
+`firmware.bin` ↔ `firmware.elf` embedded-SHA **elf-binding**; the artifact keys
+are **exactly**
 the per-env copied files + `binary-proof.json`/`.txt` (no unlisted extras /
 missing); every `CHECKSUMS` line recomputed with no missing/extra/duplicate and no
 traversal/absolute/ADS/unsafe path; the environments are the **exact duplicate-free**
@@ -1098,12 +1163,14 @@ policy set with matching role/eval/options/resources, and each env's **nested
 artifact map** is an exact copy of the flat map (a forged nested hash is rejected);
 the default-artifact identity/role/size/hash; and the binary proof **re-derived
 from the packaged `firmware.elf`/`firmware.bin`/`firmware-merged.bin` with the
-pinned `nm`** (including the merged-layout invariants) — every declared invariant,
+pinned `nm`** (including the merged-layout, elf-binding, and path-independence
+invariants) — every declared invariant,
 total, category, and the manifest `proof_summary` must match the re-derivation
 (self-declared status is never trusted; there is no skip-recompute switch).
 `-SelfTest` builds a synthetic package in an isolated temp fixture (whose merged
-image has a real component/gap/app layout) and proves the verifier accepts a
-well-formed package and rejects a **43-case** tamper matrix: artifact byte,
+image has a real component/gap/app layout and a real embedded-ELF-SHA binding) and
+proves the verifier accepts a
+well-formed package and rejects a **45-case** tamper matrix: artifact byte,
 manifest commit, checksum corruption, `certified=false`, `clean_build=false`,
 dirty/untracked worktree, configured remote, skipped/missing/duplicate gate,
 `gates_run=false`, inconsistent native-test summary, expected/observed pin
@@ -1113,7 +1180,10 @@ traversal/duplicate/missing/ADS checksum entries, **same-length all-zero merged*
 **app-region and bootloader-region merged mismatches** (each fully re-sealed),
 wrong **board/mcu/app_offset/framework** pins, **duplicate environment**, **forged
 nested artifact hash**, wrong flat-artifact **owner**, tampered
-**`policy_sha256`**, and a **reparse-point (junction)** planted inside the package.
+**`policy_sha256`**, a **reparse-point (junction)** planted inside the package, and
+— Phase 12 final — a **swapped/byte-flipped `firmware.elf`** and an **embedded
+ELF-SHA byte tamper** (each fully re-sealed with `firmware.bin`/merged left
+untouched), rejected on the ELF policy anchor / `elf-binding` / re-derived proof.
 Works under Windows PowerShell 5.1 and pwsh 7.
 
 ### Executable hardware handoff

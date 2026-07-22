@@ -63,7 +63,7 @@ $hwPolicy = $ghw.Object
 
 Write-Host "=== Re-verifying release $pkg ===" -ForegroundColor Cyan
 $verify = Test-ReleasePackage -PackagePath $pkg -Policy $policy -PolicySha256 $gp.Sha256 -ReleaseRoot $releaseRoot `
-  -RequireUnderReleaseRoot $true -RequireHeadMatch (-not $AllowStaleHead) -ExpectedHeadCommit $git.Commit -Quiet
+  -RequireUnderReleaseRoot $true -RequireHeadMatch (-not $AllowStaleHead) -ExpectedHeadCommit $git.Commit -RepoRoot $repoRoot -Quiet
 if (-not $verify.Ok) {
   Write-Host "Release verification FAILED; refusing to initialize hardware evidence:" -ForegroundColor Red
   foreach ($e in $verify.Errors) { Write-Host "  - $e" -ForegroundColor Red }

@@ -681,6 +681,43 @@ function Test-HaystackContainsBytes {
   return ($Haystack.IndexOf($needleStr, [System.StringComparison]::Ordinal) -ge 0)
 }
 
+function Get-ForbiddenWorktreeNeedles {
+  # Build the byte needles that MUST NOT appear in a reproducible firmware.elf:
+  #   * every reasonable Windows spelling of the build worktree root ($RepoRoot):
+  #     as-is, lower-cased, and both with '/' instead of '\' (GCC/MinGW records
+  #     DW_AT_comp_dir with the getcwd() casing but canonicalises other absolute
+  #     paths to a lower-cased/forward-slashed spelling, so we cover all four);
+  #   * the policy project-family token (reproducibility.forbidden_elf_path_token,
+  #     e.g. 'esp32-plane-radar'), which appears ONLY inside worktree paths in
+  #     this project and never as a payload/portal string -- catching a leak from
+  #     ANY sibling worktree regardless of its exact name.
+  # Returns an array of @{ Label; Bytes } (empty spellings skipped, de-duped).
+  [OutputType([object[]])]
+  param([string]$RepoRoot = '', $Policy = $null)
+  $seen = @{}; $out = New-Object System.Collections.Generic.List[object]
+  function Add-Needle([string]$label, [string]$text) {
+    if ([string]::IsNullOrEmpty($text)) { return }
+    if ($seen.ContainsKey($text)) { return }
+    $seen[$text] = $true
+    $out.Add([pscustomobject]@{ Label = $label; Bytes = [System.Text.Encoding]::GetEncoding(28591).GetBytes($text) })
+  }
+  if ($RepoRoot) {
+    $rr = $RepoRoot.TrimEnd('\', '/')
+    Add-Needle 'repo-root' $rr
+    Add-Needle 'repo-root/lower' $rr.ToLowerInvariant()
+    Add-Needle 'repo-root/fwd' ($rr -replace '\\', '/')
+    Add-Needle 'repo-root/lower-fwd' ($rr.ToLowerInvariant() -replace '\\', '/')
+  }
+  if ($Policy) {
+    $repro = Get-PsObjectProperty $Policy 'reproducibility'
+    if ($repro) {
+      $tok = [string](Get-PsObjectProperty $repro 'forbidden_elf_path_token')
+      if ($tok) { Add-Needle 'project-family-token' $tok }
+    }
+  }
+  return [object[]]$out.ToArray()
+}
+
 # ---------------------------------------------------------------------------
 # Invariant record helpers
 # ---------------------------------------------------------------------------
@@ -767,8 +804,12 @@ function ConvertTo-ProofYesNo { param([bool]$b) if ($b) { return 'present' } els
 function Get-MergedLayoutInvariants {
   # Re-derive the firmware-merged.bin layout invariants for ONE environment
   # DIRECTLY from the packaged bytes (binary-safe; NEVER trusts merge.log text):
-  #   * exact policy SHA-256 anchor for firmware.bin AND firmware-merged.bin
-  #     (the shipped image is bound to TRACKED policy, not self-consistent hashes);
+  #   * exact policy SHA-256 anchor for firmware.elf, firmware.bin AND
+  #     firmware-merged.bin (all bound to TRACKED policy, not self-consistent
+  #     hashes);
+  #   * elf-binding: firmware.bin's embedded app-descriptor ELF SHA-256
+  #     (app_descriptor.elf_sha256_offset) equals SHA-256(firmware.elf), so the
+  #     policy-pinned app image and its proof-input ELF are bound to each other;
   #   * merged length == app_offset + firmware.bin length;
   #   * each policy component region SHA-256 matches at its fixed offset;
   #   * every gap between a component end and the next offset is gap_fill_byte;
@@ -778,7 +819,8 @@ function Get-MergedLayoutInvariants {
     [Parameter(Mandatory)]$Policy,
     [Parameter(Mandatory)][string]$Name,
     [Parameter(Mandatory)][string]$MergedPath,
-    [Parameter(Mandatory)][string]$FirmwarePath
+    [Parameter(Mandatory)][string]$FirmwarePath,
+    [Parameter(Mandatory)][string]$ElfPath
   )
   $ml = Get-PsObjectProperty $Policy 'merged_layout'
   if ($null -eq $ml) { throw "policy has no merged_layout section." }
@@ -795,12 +837,36 @@ function Get-MergedLayoutInvariants {
   # -- Exact policy SHA-256 anchors (external anchor) -------------------------
   $fwSha = Get-Sha256HexOfBytes $app
   $mgSha = Get-Sha256HexOfBytes $merged
+  $elfSha = Get-Sha256Hex $ElfPath
   $expFw = ''; if ($envSha) { $expFw = [string](Get-PsObjectProperty $envSha 'firmware_bin') }
   $expMg = ''; if ($envSha) { $expMg = [string](Get-PsObjectProperty $envSha 'merged_bin') }
+  $expElf = ''; if ($envSha) { $expElf = [string](Get-PsObjectProperty $envSha 'firmware_elf') }
+  $inv.Add((New-InvariantResult -Id "image-sha/$Name/firmware.elf" -Category 'image-sha' -Environment $Name `
+    -Description 'firmware.elf exact policy SHA-256 anchor (Git-anchored proof input)' -Expectation $expElf -Observed $elfSha -Pass (($expElf.Length -eq 64) -and ($elfSha -eq $expElf))))
   $inv.Add((New-InvariantResult -Id "image-sha/$Name/firmware.bin" -Category 'image-sha' -Environment $Name `
     -Description 'firmware.bin exact policy SHA-256 anchor' -Expectation $expFw -Observed $fwSha -Pass (($expFw.Length -eq 64) -and ($fwSha -eq $expFw))))
   $inv.Add((New-InvariantResult -Id "image-sha/$Name/firmware-merged.bin" -Category 'image-sha' -Environment $Name `
     -Description 'firmware-merged.bin exact policy SHA-256 anchor (the SHIPPED image)' -Expectation $expMg -Observed $mgSha -Pass (($expMg.Length -eq 64) -and ($mgSha -eq $expMg))))
+
+  # -- elf-binding: firmware.bin embeds SHA-256(firmware.elf) at the pinned -----
+  # app-descriptor offset. Since firmware.bin is pinned byte-exact by policy, a
+  # swapped firmware.elf whose digest no longer matches these bytes is rejected.
+  $ad = Get-PsObjectProperty $Policy 'app_descriptor'
+  $adOffset = 176; $adLen = 32
+  if ($ad) {
+    $o = Get-PsObjectProperty $ad 'elf_sha256_offset'; if ($null -ne $o) { $adOffset = [int]$o }
+    $l = Get-PsObjectProperty $ad 'elf_sha256_length'; if ($null -ne $l) { $adLen = [int]$l }
+  }
+  $embedded = 'out-of-range'
+  if (($adOffset -ge 0) -and (($adOffset + $adLen) -le $app.Length)) {
+    $seg = New-Object byte[] $adLen
+    [Array]::Copy($app, $adOffset, $seg, 0, $adLen)
+    $embedded = (($seg | ForEach-Object { $_.ToString('x2') }) -join '')
+  }
+  $bindOk = (($elfSha.Length -eq 64) -and ($embedded -eq $elfSha))
+  $inv.Add((New-InvariantResult -Id "elf-binding/$Name/embedded-app-elf-sha" -Category 'elf-binding' -Environment $Name `
+    -Description ("firmware.bin app-descriptor embedded ELF SHA-256 (offset {0}) == SHA-256(firmware.elf)" -f $adOffset) `
+    -Expectation $elfSha -Observed $embedded -Pass $bindOk))
 
   # -- merged length == app_offset + firmware.bin length ----------------------
   $expLen = $appOffset + [int64]$app.Length
@@ -859,9 +925,11 @@ function Get-BinaryProofInvariants {
     [Parameter(Mandatory)][hashtable]$EnvElf,
     [Parameter(Mandatory)][hashtable]$EnvBin,
     [Parameter(Mandatory)][hashtable]$EnvMerged,
-    [Parameter(Mandatory)][string]$NmPath
+    [Parameter(Mandatory)][string]$NmPath,
+    [string]$RepoRoot = ''
   )
   $spec = Get-ProofSpec
+  $forbidden = Get-ForbiddenWorktreeNeedles -RepoRoot $RepoRoot -Policy $Policy
   $invariants = New-Object System.Collections.Generic.List[object]
   $nmEvidence = @{}
   foreach ($envPolicy in $Policy.environments) {
@@ -926,11 +994,27 @@ function Get-BinaryProofInvariants {
       -Description "Plain 'Plane Radar' substring (portal HTML; present in every build, incl. quiet -- proves why plain substring is NOT a logging indicator)" `
       -Expectation 'present' -Observed (ConvertTo-ProofYesNo $planePresent) -Pass ($planePresent)))
 
-    # Merged-layout + exact-SHA anchors, re-derived from the packaged firmware.bin
-    # and the SHIPPED firmware-merged.bin (binary-safe; never trusts merge.log).
-    foreach ($mlInv in @(Get-MergedLayoutInvariants -Policy $Policy -Name $name -MergedPath $EnvMerged[$name] -FirmwarePath $EnvBin[$name])) {
+    # Merged-layout + exact-SHA anchors + elf-binding, re-derived from the
+    # packaged firmware.elf/firmware.bin and the SHIPPED firmware-merged.bin
+    # (binary-safe; never trusts merge.log).
+    foreach ($mlInv in @(Get-MergedLayoutInvariants -Policy $Policy -Name $name -MergedPath $EnvMerged[$name] -FirmwarePath $EnvBin[$name] -ElfPath $EnvElf[$name])) {
       $invariants.Add($mlInv)
     }
+
+    # Path-independence: the packaged firmware.elf must embed NO absolute build-
+    # worktree path (checks the ACTUAL built output, not just flags). Catches a
+    # regression that re-enabled DWARF worktree-path leakage. See policy
+    # reproducibility.elf_path_independence_note.
+    $elfHay = Get-Latin1Haystack $EnvElf[$name]
+    $leakHits = New-Object System.Collections.Generic.List[string]
+    foreach ($needle in $forbidden) {
+      if (Test-HaystackContainsBytes $elfHay $needle.Bytes) { $leakHits.Add($needle.Label) }
+    }
+    $piObs = 'absent'
+    if ($leakHits.Count -gt 0) { $piObs = "present: " + [string]::Join(', ', @($leakHits | Select-Object -First 4)) }
+    $invariants.Add((New-InvariantResult -Id "path-independence/$name" -Category 'path-independence' -Environment $name `
+      -Description 'firmware.elf embeds no absolute build-worktree path (repo-root spellings + project-family token)' `
+      -Expectation 'absent' -Observed $piObs -Pass ($leakHits.Count -eq 0)))
   }
   return @{ Invariants = $invariants.ToArray(); NmEvidence = $nmEvidence }
 }
@@ -973,7 +1057,7 @@ function Get-PackageDerivedInvariants {
   # from the PACKAGED per-env firmware.elf/firmware.bin and re-derive the exact
   # invariant set with the pinned nm. Fails closed if any binary is missing.
   [OutputType([object[]])]
-  param([Parameter(Mandatory)][string]$PackageDir, [Parameter(Mandatory)]$Policy)
+  param([Parameter(Mandatory)][string]$PackageDir, [Parameter(Mandatory)]$Policy, [string]$RepoRoot = '')
   $nmTool = Resolve-RiscvTool $Policy.toolchain_tools.nm
   $envElf = @{}; $envBin = @{}; $envMerged = @{}
   foreach ($envPolicy in $Policy.environments) {
@@ -986,7 +1070,7 @@ function Get-PackageDerivedInvariants {
     if (-not (Test-Path -LiteralPath $merged)) { throw "packaged firmware-merged.bin missing for '$name': $merged" }
     $envElf[$name] = $elf; $envBin[$name] = $bin; $envMerged[$name] = $merged
   }
-  return (Get-BinaryProofInvariants -Policy $Policy -EnvElf $envElf -EnvBin $envBin -EnvMerged $envMerged -NmPath $nmTool).Invariants
+  return (Get-BinaryProofInvariants -Policy $Policy -EnvElf $envElf -EnvBin $envBin -EnvMerged $envMerged -NmPath $nmTool -RepoRoot $RepoRoot).Invariants
 }
 
 # ---------------------------------------------------------------------------
@@ -1135,6 +1219,7 @@ function Test-ReleasePackage {
     [bool]$RequireUnderReleaseRoot = $true,
     [bool]$RequireHeadMatch = $true,
     [string]$ExpectedHeadCommit,
+    [string]$RepoRoot = '',
     [scriptblock]$ProofRecomputer,
     [switch]$Quiet
   )
@@ -1380,23 +1465,50 @@ function Test-ReleasePackage {
     $rRam = Get-PsObjectProperty $res 'ram'; $rFlash = Get-PsObjectProperty $res 'flash'
     $okRam = (($null -ne $rRam) -and ([int64]$rRam -eq [int64]$exp.ram))
     $okFlash = (($null -ne $rFlash) -and ([int64]$rFlash -eq [int64]$exp.flash))
+    # firmware.elf size is a deterministic (reproducible) build-metadata anchor.
+    $expElfSize = Get-PsObjectProperty $exp 'firmware_elf'
+    $rElf = Get-PsObjectProperty $res 'firmware_elf'
+    $okElf = (($null -ne $expElfSize) -and ($null -ne $rElf) -and ([int64]$rElf -eq [int64]$expElfSize))
     $binArt = $artifacts.PSObject.Properties["$name/firmware.bin"]
     $mergedArt = $artifacts.PSObject.Properties["$name/firmware-merged.bin"]
-    $consistent = ($binArt -and $mergedArt -and ([int64]$binArt.Value.size -eq [int64](Get-PsObjectProperty $res 'firmware_bin')) -and ([int64]$mergedArt.Value.size -eq [int64](Get-PsObjectProperty $res 'merged_bin')))
-    Add-Check "resource-policy/$name" ($okBin -and $okMerged -and $okRam -and $okFlash -and $consistent) `
-      "resources must equal policy (ram=$($exp.ram),flash=$($exp.flash),bin=$($exp.firmware_bin),merged=$($exp.merged_bin)) and match copied artifacts"
+    $elfArt = $artifacts.PSObject.Properties["$name/firmware.elf"]
+    $consistent = ($binArt -and $mergedArt -and $elfArt -and ([int64]$binArt.Value.size -eq [int64](Get-PsObjectProperty $res 'firmware_bin')) -and ([int64]$mergedArt.Value.size -eq [int64](Get-PsObjectProperty $res 'merged_bin')) -and ([int64]$elfArt.Value.size -eq [int64](Get-PsObjectProperty $res 'firmware_elf')))
+    Add-Check "resource-policy/$name" ($okBin -and $okMerged -and $okRam -and $okFlash -and $okElf -and $consistent) `
+      "resources must equal policy (ram=$($exp.ram),flash=$($exp.flash),bin=$($exp.firmware_bin),merged=$($exp.merged_bin),elf=$($exp.firmware_elf)) and match copied artifacts"
 
-    # EXACT policy SHA-256 anchor: the packaged firmware.bin AND the SHIPPED
-    # firmware-merged.bin must equal the tracked policy hashes (external anchor,
-    # NOT manifest self-consistency). This reads firmware-merged.bin directly.
+    # EXACT policy SHA-256 anchor: the packaged firmware.elf, firmware.bin AND the
+    # SHIPPED firmware-merged.bin must equal the tracked policy hashes (external
+    # anchor, NOT manifest self-consistency); AND firmware.bin's app-descriptor
+    # embedded ELF SHA-256 must equal SHA-256(packaged firmware.elf) so the ELF
+    # proof input is bound to the pinned app image. Reads the files directly.
     $polSha = Get-PsObjectProperty $envPolicy 'sha256'
-    $expFwSha = ''; $expMgSha = ''
-    if ($polSha) { $expFwSha = [string](Get-PsObjectProperty $polSha 'firmware_bin'); $expMgSha = [string](Get-PsObjectProperty $polSha 'merged_bin') }
+    $expFwSha = ''; $expMgSha = ''; $expElfSha = ''
+    if ($polSha) { $expFwSha = [string](Get-PsObjectProperty $polSha 'firmware_bin'); $expMgSha = [string](Get-PsObjectProperty $polSha 'merged_bin'); $expElfSha = [string](Get-PsObjectProperty $polSha 'firmware_elf') }
     $binFile = Join-Path $pkgFull "$name\firmware.bin"
     $mergedFile = Join-Path $pkgFull "$name\firmware-merged.bin"
+    $elfFile = Join-Path $pkgFull "$name\firmware.elf"
     $fwShaOk = ((Test-Path $binFile) -and ($expFwSha.Length -eq 64) -and ((Get-Sha256Hex $binFile) -eq $expFwSha))
     $mgShaOk = ((Test-Path $mergedFile) -and ($expMgSha.Length -eq 64) -and ((Get-Sha256Hex $mergedFile) -eq $expMgSha))
-    Add-Check "image-sha-policy/$name" ($fwShaOk -and $mgShaOk) "packaged firmware.bin and firmware-merged.bin must equal the EXACT policy SHA-256 anchors"
+    $elfShaActual = ''; if (Test-Path $elfFile) { $elfShaActual = Get-Sha256Hex $elfFile }
+    $elfShaOk = (($expElfSha.Length -eq 64) -and ($elfShaActual -eq $expElfSha))
+    Add-Check "image-sha-policy/$name" ($fwShaOk -and $mgShaOk -and $elfShaOk) "packaged firmware.elf, firmware.bin and firmware-merged.bin must equal the EXACT policy SHA-256 anchors"
+
+    # elf-binding (direct): firmware.bin app-descriptor embedded ELF SHA-256 must
+    # equal SHA-256(packaged firmware.elf). Defeats a swapped/resealed ELF whose
+    # digest no longer matches the policy-pinned app image.
+    $ad = Get-PsObjectProperty $policy 'app_descriptor'
+    $adOff = 176; $adLen = 32
+    if ($ad) { $o = Get-PsObjectProperty $ad 'elf_sha256_offset'; if ($null -ne $o) { $adOff = [int]$o }; $l = Get-PsObjectProperty $ad 'elf_sha256_length'; if ($null -ne $l) { $adLen = [int]$l } }
+    $bindOk = $false; $embHex = 'unavailable'
+    if ((Test-Path $binFile) -and ($elfShaActual.Length -eq 64)) {
+      $bb = [System.IO.File]::ReadAllBytes($binFile)
+      if (($adOff -ge 0) -and (($adOff + $adLen) -le $bb.Length)) {
+        $seg = New-Object byte[] $adLen; [Array]::Copy($bb, $adOff, $seg, 0, $adLen)
+        $embHex = (($seg | ForEach-Object { $_.ToString('x2') }) -join '')
+        $bindOk = ($embHex -eq $elfShaActual)
+      }
+    }
+    Add-Check "elf-binding-policy/$name" $bindOk "firmware.bin app-descriptor embedded ELF SHA-256 (offset $adOff) must equal SHA-256(packaged firmware.elf)"
 
     # Nested environment.artifacts: exact copied_artifacts set whose size/SHA/env
     # equal the flat artifact map entry for '<env>/<name>'. A forged nested hash
@@ -1467,7 +1579,7 @@ function Test-ReleasePackage {
   $recomputed = $null; $recomputeErr = $null
   try {
     if ($ProofRecomputer) { $recomputed = @(& $ProofRecomputer $pkgFull $policy) }
-    else { $recomputed = @(Get-PackageDerivedInvariants -PackageDir $pkgFull -Policy $policy) }
+    else { $recomputed = @(Get-PackageDerivedInvariants -PackageDir $pkgFull -Policy $policy -RepoRoot $RepoRoot) }
   } catch { $recomputeErr = $_.Exception.Message }
 
   if ($recomputeErr) {
@@ -1556,11 +1668,19 @@ function New-MinimalReleasePackage {
 
   $copied = @('firmware.bin', 'firmware-merged.bin', 'firmware.elf', 'firmware.map', 'build.log', 'merge.log', 'nm-symbols.txt')
 
-  # -- Realistic tiny merged layout ------------------------------------------
+  # -- Realistic tiny merged layout with a REAL app-descriptor ELF-SHA binding.
   #   bootloader@0(8) | gap(8) | partitions@16(8) | gap(8) | boot_app0@32(8) |
-  #   gap(8) | app@48(32).  merged length = app_offset(48) + firmware.bin(32) = 80.
+  #   gap(8) | app@48(128). merged length = app_offset(48) + firmware.bin(128).
+  #   The fixture firmware.bin embeds SHA-256(firmware.elf) at app-descriptor
+  #   offset 48 so the elf-binding proof exercises the real byte-equality logic.
   $fillByte = [byte]255
-  $binBytes = [byte[]](1..32)                       # firmware.bin (the app)
+  $elfBytes = [byte[]](200..250)                    # firmware.elf (real bytes)
+  $elfShaBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash($elfBytes)
+  $elfShaHex = (($elfShaBytes | ForEach-Object { $_.ToString('x2') }) -join '')
+  $adOffset = 48; $adLen = 32
+  $binBytes = New-Object byte[] 128                 # firmware.bin (the app)
+  for ($i = 0; $i -lt $binBytes.Length; $i++) { $binBytes[$i] = [byte](($i + 1) % 256) }
+  [Array]::Copy($elfShaBytes, 0, $binBytes, $adOffset, $adLen)   # embed ELF SHA-256
   $compBoot = [byte[]](100..107)
   $compPart = [byte[]](110..117)
   $compApp0 = [byte[]](120..127)
@@ -1577,7 +1697,7 @@ function New-MinimalReleasePackage {
 
   [System.IO.File]::WriteAllBytes((Join-Path $envDir 'firmware.bin'), $binBytes)
   [System.IO.File]::WriteAllBytes((Join-Path $envDir 'firmware-merged.bin'), $mergedBytes)
-  Write-TextFileLf (Join-Path $envDir 'firmware.elf') "fake-elf"
+  [System.IO.File]::WriteAllBytes((Join-Path $envDir 'firmware.elf'), $elfBytes)
   Write-TextFileLf (Join-Path $envDir 'firmware.map') "fake-map"
   Write-TextFileLf (Join-Path $envDir 'build.log') "fake-build"
   Write-TextFileLf (Join-Path $envDir 'merge.log') "fake-merge"
@@ -1587,6 +1707,7 @@ function New-MinimalReleasePackage {
   $deps = [ordered]@{ 'lovyan03/LovyanGFX' = '9.9.9'; 'bblanchon/ArduinoJson' = '8.8.8' }
   $fwSha = Get-Sha256HexOfBytes $binBytes
   $mgSha = Get-Sha256HexOfBytes $mergedBytes
+  $elfSha = $elfShaHex
   $pinsCommon = [ordered]@{
     platformio_core = '0.0.0'; platform = 'fxplatform@1.2.3'; framework = 'arduino'
     framework_arduinoespressif32 = 'fx-fw'; toolchain_riscv32_esp = 'fx-tc'; tool_esptoolpy = 'fx-esptool'
@@ -1617,12 +1738,14 @@ function New-MinimalReleasePackage {
         [ordered]@{ name = 'boot_app0';  offset = 32; size = 8; sha256 = (Get-Sha256HexOfBytes $compApp0) }
       )
     }
+    app_descriptor = [ordered]@{ elf_sha256_offset = $adOffset; elf_sha256_length = $adLen }
+    reproducibility = [ordered]@{ debug_policy = 'strip-dwarf-from-project'; forbidden_elf_path_token = 'fixture-never-present-token' }
     copied_artifacts = $copied
     environments = @([ordered]@{
         name = $EnvName; role = 'default-release'; evaluation_only = $false
         options = [ordered]@{ worker = $false; diagnostics = $false; log_level = 2 }
-        resources = [ordered]@{ ram = 1; flash = 2; firmware_bin = $binBytes.Length; merged_bin = $mergedBytes.Length }
-        sha256 = [ordered]@{ firmware_bin = $fwSha; merged_bin = $mgSha }
+        resources = [ordered]@{ ram = 1; flash = 2; firmware_bin = $binBytes.Length; merged_bin = $mergedBytes.Length; firmware_elf = $elfBytes.Length }
+        sha256 = [ordered]@{ firmware_elf = $elfSha; firmware_bin = $fwSha; merged_bin = $mgSha }
       })
   }
   $policyPath = (Get-FullPathSafe $Dir).TrimEnd('\', '/') + '-policy.json'
@@ -1632,7 +1755,8 @@ function New-MinimalReleasePackage {
 
   $fxInvariants = @(Get-FixtureProofInvariants -EnvName $EnvName)
   $fxInvariants += @(Get-MergedLayoutInvariants -Policy $fxPolicyObj -Name $EnvName `
-    -MergedPath (Join-Path $envDir 'firmware-merged.bin') -FirmwarePath (Join-Path $envDir 'firmware.bin'))
+    -MergedPath (Join-Path $envDir 'firmware-merged.bin') -FirmwarePath (Join-Path $envDir 'firmware.bin') `
+    -ElfPath (Join-Path $envDir 'firmware.elf'))
   $proof = [ordered]@{
     schema = 'plane-radar/binary-proof'; schemaVersion = 1; commit = $Commit
     overall = 'pass'; total = $fxInvariants.Count; passed = $fxInvariants.Count; failed = 0
@@ -1676,7 +1800,7 @@ function New-MinimalReleasePackage {
     environments = @([ordered]@{
         name = $EnvName; role = 'default-release'; evaluation_only = $false
         options = [ordered]@{ worker = $false; diagnostics = $false; log_level = 2 }
-        resources = [ordered]@{ ram = 1; flash = 2; firmware_bin = $binBytes.Length; merged_bin = $mergedBytes.Length }
+        resources = [ordered]@{ ram = 1; flash = 2; firmware_bin = $binBytes.Length; merged_bin = $mergedBytes.Length; firmware_elf = $elfBytes.Length }
         artifacts = $nestedArtifacts
       })
     artifacts = $artifactsMap

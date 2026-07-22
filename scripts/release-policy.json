@@ -82,6 +82,12 @@
       "script": "scripts/verify-diagnostics-policy.ps1",
       "summary": "12 diagnostics/logging source invariants.",
       "args": []
+    },
+    {
+      "id": "verify-reproducible-build-policy",
+      "script": "scripts/verify-reproducible-build-policy.ps1",
+      "summary": "Source reproducibility policy: firmware envs strip project DWARF (build_unflags=-ggdb + -g0), native envs keep it, and policy carries the app_descriptor + per-env firmware_elf SHA anchors that bind the ELF proof input.",
+      "args": []
     }
   ],
   "environments": [
@@ -90,10 +96,11 @@
       "role": "default-release",
       "evaluation_only": false,
       "options": { "worker": false, "diagnostics": false, "log_level": 2 },
-      "resources": { "ram": 65044, "flash": 1143278, "firmware_bin": 1198160, "merged_bin": 1263696 },
+      "resources": { "ram": 65044, "flash": 1143278, "firmware_bin": 1198160, "merged_bin": 1263696, "firmware_elf": 12274468 },
       "sha256": {
-        "firmware_bin": "7c1c4f8cd6e7db372650b90566cd88c44e347b3c865279e11bbdbcf891b27e54",
-        "merged_bin": "de89ae766da78dfc0f826ca0bcbb606bdeb325403c75a42722c0a4669da564f6"
+        "firmware_elf": "49cb41fd445f445a3f47a9dc482f9227a83f5e30e6aa188d2fa713500640f492",
+        "firmware_bin": "1c8a40092a3d72f823848e4f830762eb4934fa2bc51c0adb4da104f168b83198",
+        "merged_bin": "12fa884ce64ff417e48d5d51a077d0d901281fbbee806617b36115218d7223d9"
       }
     },
     {
@@ -101,10 +108,11 @@
       "role": "evaluation",
       "evaluation_only": true,
       "options": { "worker": true, "diagnostics": false, "log_level": 2 },
-      "resources": { "ram": 73924, "flash": 1146152, "firmware_bin": 1202224, "merged_bin": 1267760 },
+      "resources": { "ram": 73924, "flash": 1146152, "firmware_bin": 1202224, "merged_bin": 1267760, "firmware_elf": 12280996 },
       "sha256": {
-        "firmware_bin": "c8c520874fa521a33e7c2905f08e55c1641595572cc905656af9fcc07d733ecb",
-        "merged_bin": "bac799ac8bbab5c101c16be5746d111217d0525f1a693d8fdb35c1bc7735f7ed"
+        "firmware_elf": "e867bb28673d2befeb7d5ced6baa9fb2dabe74f709088866d959b7af457bb959",
+        "firmware_bin": "a7f939820028ea41edfdd1929843443b123cc4f3a6ca5cffebe012c0351bea02",
+        "merged_bin": "9a6c86f8c3543a707af87fc202f691d6e6e24c63e7b6e3d304d614d7bf6cb4a0"
       }
     },
     {
@@ -112,10 +120,11 @@
       "role": "evaluation",
       "evaluation_only": true,
       "options": { "worker": false, "diagnostics": false, "log_level": 0 },
-      "resources": { "ram": 64916, "flash": 1138158, "firmware_bin": 1192256, "merged_bin": 1257792 },
+      "resources": { "ram": 64916, "flash": 1138158, "firmware_bin": 1192256, "merged_bin": 1257792, "firmware_elf": 12265532 },
       "sha256": {
-        "firmware_bin": "ca3732261212acb3db5767caca6406f003e060bf69ac5d8bbbd8ddd630ff6deb",
-        "merged_bin": "b2ae4ff5305372ebbe3a49cf8f943c10d12250f4cd3707679ed91473da9a521d"
+        "firmware_elf": "ebf49d5e79b6d640ea37ddfb1e46d14473fe87b7874a5c7e9c2ab332fa48df13",
+        "firmware_bin": "beb8c7a2680c5a8fa5f20d5e39416451c44130d62e4f88895e6084cebf7f2527",
+        "merged_bin": "a31a034830849a57192d3de2765ed29620568e4ced6d41beeba4e1487c5e4618"
       }
     },
     {
@@ -123,10 +132,11 @@
       "role": "evaluation",
       "evaluation_only": true,
       "options": { "worker": false, "diagnostics": true, "log_level": 2 },
-      "resources": { "ram": 65052, "flash": 1143892, "firmware_bin": 1198880, "merged_bin": 1264416 },
+      "resources": { "ram": 65052, "flash": 1143892, "firmware_bin": 1198880, "merged_bin": 1264416, "firmware_elf": 12275468 },
       "sha256": {
-        "firmware_bin": "fc3cc930e2fe76e74684a5d65cf93c0578868bf6ada4d777a9a22aa01f114f7b",
-        "merged_bin": "966528479df4a839b78b308f67c8ef84480760a90bf34646cf64df1a8be0ab70"
+        "firmware_elf": "af971cd8df47b37179926adaf8b1ad27a27a1efcb27c6a327bf45f2a343d1df1",
+        "firmware_bin": "473ec6377c8c6fd7c551f07b78bfce4ed3b7e6bbf1ec29eb538ef26023cd0d06",
+        "merged_bin": "124377235d11c6adddfa04fd3d17416861010952dc76ecf07436c7b10a795644"
       }
     },
     {
@@ -134,10 +144,11 @@
       "role": "evaluation",
       "evaluation_only": true,
       "options": { "worker": true, "diagnostics": true, "log_level": 2 },
-      "resources": { "ram": 73948, "flash": 1146920, "firmware_bin": 1203120, "merged_bin": 1268656 },
+      "resources": { "ram": 73948, "flash": 1146920, "firmware_bin": 1203120, "merged_bin": 1268656, "firmware_elf": 12282196 },
       "sha256": {
-        "firmware_bin": "07c56487a1a1a66eb99f66ed7b9f787c391ffe4d0638a8ed8a5b87ee425220f8",
-        "merged_bin": "03fbc96d321b7904367f600b651e1555d0238c5cc82e9147a5421220a9868165"
+        "firmware_elf": "8cd8a43fe60b0f6d48ae736bd496d62ebe6915af77b19374591e54cc6aa3d9da",
+        "firmware_bin": "07a977a9fdcc68dcb6a86bddb81d02364127025afddff018981e28895919f867",
+        "merged_bin": "b17c2e961c5cad9dbb3ce59f30580f3aee9ca5557de5a3a2991d03318d6b5ab4"
       }
     }
   ],
@@ -153,6 +164,19 @@
     ],
     "note": "app_offset 65536 = 0x10000; bootloader 0x0, partitions 0x8000, boot_app0 0xe000. merged length MUST equal app_offset + firmware.bin length; the region at app_offset MUST equal firmware.bin byte-for-byte; every gap between a component end and the next offset MUST be gap_fill_byte (0xFF)."
   },
+  "app_descriptor": {
+    "description": "Fixed location and format of the ESP-IDF application descriptor field that embeds SHA-256(firmware.elf) into the app image, used to BIND the packaged firmware.elf to the policy-pinned firmware.bin.",
+    "elf_sha256_offset": 176,
+    "elf_sha256_length": 32,
+    "provenance": "esp_app_desc_t.app_elf_sha256 for the pinned ESP32-C3 Arduino/IDF v4.4.6 image layout: the app image starts with esp_image_header_t (24 B) + one esp_image_segment_header_t (8 B); the first segment payload at file offset 0x20 is esp_app_desc_t, whose app_elf_sha256 member sits at struct offset 0x90, i.e. ABSOLUTE image offset 0x20 + 0x90 = 0xB0 (176). esptool.py elf2image writes SHA-256 of the whole firmware.elf here; `esptool image_info --version 2` prints the same 32 bytes.",
+    "invariant": "firmware.bin[176:208] MUST equal the raw SHA-256 digest of the packaged firmware.elf for every environment (proof category 'elf-binding'). Because firmware.bin is pinned byte-exact by environments[].sha256.firmware_bin, this binds the ELF proof input to the tracked app image: a swapped firmware.elf whose digest no longer matches these bytes is rejected."
+  },
+  "reproducibility": {
+    "description": "Byte-reproducible-across-worktree-paths policy. The firmware envs are built with build_unflags=-ggdb + -g0 (see platformio.ini) so no absolute build-worktree path is embedded in DWARF; the same commit/toolchain therefore yields byte-identical firmware.elf/firmware.bin/firmware-merged.bin from any worktree path. Verified by building the final commit in two worktrees with materially different absolute path lengths and comparing all 15 (5 envs x elf/bin/merged) SHA-256 values.",
+    "debug_policy": "strip-dwarf-from-project",
+    "forbidden_elf_path_token": "esp32-plane-radar",
+    "elf_path_independence_note": "proof category 'path-independence' asserts the packaged firmware.elf embeds NO absolute path referencing the build worktree: neither the current repository-root path (any Windows drive-case / slash spelling) nor the forbidden_elf_path_token project-family substring appears in firmware.elf. Espressif's precompiled SDK archives still carry their own stable (worktree-independent) debug paths under the pinned framework package; those are permitted and do not vary across worktrees."
+  },
   "copied_artifacts": [
     "firmware.bin",
     "firmware-merged.bin",
@@ -162,5 +186,5 @@
     "merge.log",
     "nm-symbols.txt"
   ],
-  "proof_invariants_note": "The per-environment binary proof spec (worker/diag/heap symbol + logging-string invariants AND the firmware-merged.bin layout invariants: component SHA-256 at fixed offsets, app-region byte-equality to firmware.bin, exact merged length, and 0xFF gap fill) is centrally defined in scripts/release-common.ps1 (Get-ProofSpec / Get-BinaryProofInvariants) and re-derived byte-for-byte identically by build-release and verify-release. It binds the EXACT current-head binaries only and does not claim raw equivalence to any prior phase. The exact firmware.bin / firmware-merged.bin SHA-256 anchors (environments[].sha256) and merged_layout are the tracked external anchors: the shipped merged image is bound to tracked policy + the app, not to self-consistent manifest hashes."
+  "proof_invariants_note": "The per-environment binary proof spec (worker/diag/heap symbol + logging-string invariants; the firmware-merged.bin layout invariants: component SHA-256 at fixed offsets, app-region byte-equality to firmware.bin, exact merged length, and 0xFF gap fill; the exact policy SHA-256 anchors for firmware.elf/firmware.bin/firmware-merged.bin; the 'elf-binding' anchor that firmware.bin[app_descriptor.elf_sha256_offset] equals SHA-256(firmware.elf); and the 'path-independence' assertion that no build-worktree path is embedded in firmware.elf) is centrally defined in scripts/release-common.ps1 (Get-ProofSpec / Get-BinaryProofInvariants / Get-MergedLayoutInvariants) and re-derived byte-for-byte identically by build-release and verify-release. It binds the EXACT current-head binaries only and does not claim raw equivalence to any prior phase. The exact firmware.elf / firmware.bin / firmware-merged.bin SHA-256 anchors (environments[].sha256) plus app_descriptor and merged_layout are the tracked external anchors: the shipped merged image AND its proof-input ELF are bound to tracked Git policy and to each other, not to self-consistent manifest hashes."
 }
