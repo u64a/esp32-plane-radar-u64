@@ -953,6 +953,13 @@ release pipeline, creates a Sigstore-backed GitHub artifact attestation, and
 does not receive repository write permission. Only the tag-only publishing job
 receives `contents: write`.
 
+Certified Windows builds also use the policy-bound PlatformIO package root
+`D:\pio-core`. Arduino framework diagnostics embed absolute `__FILE__` strings
+in loadable firmware, so fixing this package path is required for byte-identical
+local and GitHub runner output; a different core path is rejected before build.
+The canonical default image is 1,263,376 bytes, with 65,044 bytes static RAM
+and 1,142,966 bytes linker-reported flash.
+
 Verify a downloaded firmware file's workflow provenance with:
 
 ```powershell

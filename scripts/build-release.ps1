@@ -64,6 +64,7 @@ $gp = Get-GitPolicy -RepoRoot $repoRoot -Commit $git.Commit -RelPath 'scripts/re
 $policy = $gp.Object
 $policySha = $gp.Sha256
 $envNames = @($policy.environments | ForEach-Object { $_.name })
+$pioCoreDir = Set-PolicyPlatformIoCoreDir -Policy $policy -Require
 
 # ===========================================================================
 # 1. PlatformIO must be EXACTLY the pinned version.
@@ -81,6 +82,7 @@ if ($pioExit -ne 0 -or "$pioVersion".Trim() -ne $expectedPio) {
   throw "PlatformIO $($policy.pins.platformio_core) is required; found: $pioVersion (exit $pioExit)"
 }
 Write-Ok "PlatformIO $($policy.pins.platformio_core)"
+Write-Ok "Canonical PlatformIO core: $pioCoreDir"
 
 # ===========================================================================
 # 2. Git: HEAD exists, clean tracked+index, no untracked, no remote in the
@@ -139,6 +141,7 @@ Write-Ok ".pio removed"
 Write-Step "Source gates"
 $gateResults = New-Object System.Collections.Generic.List[object]
 foreach ($g in $policy.required_source_gates) {
+  [void](Set-PolicyPlatformIoCoreDir -Policy $policy -Require)
   $gateScript = Join-Path $repoRoot ($g.script -replace '/', '\')
   if (-not (Test-Path $gateScript)) { throw "Required gate script not found: $gateScript" }
   Write-Host "  --- $($g.id) ($($g.script)) ---"
@@ -159,9 +162,11 @@ $buildInfo = @{}
 foreach ($name in $envNames) {
   $buildDir = Join-Path $pioDir "build\$name"
   Write-Host "  Building $name ..."
+  [void](Set-PolicyPlatformIoCoreDir -Policy $policy -Require)
   $buildLog = (& $pio run -e $name 2>&1 | Out-String)
   if ($LASTEXITCODE -ne 0) { Write-Host $buildLog; throw "Build failed for env '$name'." }
   Write-Host "  Merging $name ..."
+  [void](Set-PolicyPlatformIoCoreDir -Policy $policy -Require)
   $mergeLog = (& $pio run -t merge -e $name 2>&1 | Out-String)
   if ($LASTEXITCODE -ne 0) { Write-Host $mergeLog; throw "Merge failed for env '$name'." }
   $buildInfo[$name] = [ordered]@{ buildDir = $buildDir; buildLog = $buildLog; mergeLog = $mergeLog }
@@ -280,6 +285,7 @@ Write-Step "Current-head ELF/binary proofs"
 # A cold PlatformIO installation does not contain the RISC-V toolchain until a
 # firmware environment has been built. Resolve nm here, after all five builds,
 # rather than during preflight so a clean CI runner remains self-bootstrapping.
+[void](Set-PolicyPlatformIoCoreDir -Policy $policy -Require)
 $nmTool = Resolve-RiscvTool $policy.toolchain_tools.nm
 Write-Ok "Pinned nm: $nmTool"
 $envElf = @{}; $envBin = @{}; $envMerged = @{}
@@ -308,6 +314,7 @@ if ($failed.Count -gt 0) {
 #     the worktree after the initial check).
 # ===========================================================================
 Write-Step "Stage release package"
+[void](Set-PolicyPlatformIoCoreDir -Policy $policy -Require)
 $git2 = Get-RepoGitState $repoRoot
 if (($git2.Commit -ne $sha) -or ($git2.Branch -ne $git.Branch) -or $git2.HasRemote -or $git2.TrackedDirty -or ($git2.UntrackedCount -gt 0)) {
   throw ("Git state changed after gates/build (source-gate/build TOCTOU): now commit=$($git2.ShortCommit) branch='$($git2.Branch)' remote=$($git2.HasRemote) tracked_dirty=$($git2.TrackedDirty) untracked=$($git2.UntrackedCount); expected commit=$($git.ShortCommit) branch='$($git.Branch)' clean/no-remote. Aborting before publishing.")
@@ -417,6 +424,7 @@ $manifest = [ordered]@{
   policy_sha256 = $policySha
   pins          = [ordered]@{
     platformio_core              = $policy.pins.platformio_core
+    platformio_core_dir          = $policy.pins.platformio_core_dir
     platformio_core_verified     = ("$pioVersion".Trim())
     platform                     = $policy.pins.platform
     framework                    = $policy.pins.framework

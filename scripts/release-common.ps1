@@ -395,11 +395,50 @@ function Get-GitPolicy {
 function Resolve-PlatformIoCoreDir {
   [OutputType([string])]
   param()
-  if ($env:PLATFORMIO_CORE_DIR -and (Test-Path $env:PLATFORMIO_CORE_DIR)) {
+  if ($env:PLATFORMIO_CORE_DIR) {
     return (Get-FullPathSafe $env:PLATFORMIO_CORE_DIR)
   }
   $default = Join-Path $env:USERPROFILE '.platformio'
   return (Get-FullPathSafe $default)
+}
+
+function Set-PolicyPlatformIoCoreDir {
+  # Firmware runtime diagnostics embed framework __FILE__ strings. Their bytes
+  # therefore depend on the absolute PlatformIO package root unless every
+  # certified build uses the same path. Bind and apply that canonical path from
+  # tracked policy before any PlatformIO command runs.
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory)]$Policy,
+    [switch]$Require
+  )
+
+  $pins = Get-PsObjectProperty $Policy 'pins'
+  $raw = ''
+  if ($pins) { $raw = [string](Get-PsObjectProperty $pins 'platformio_core_dir') }
+  if ([string]::IsNullOrWhiteSpace($raw)) {
+    if ($Require) { throw "Policy pins.platformio_core_dir is required for reproducible firmware builds." }
+    return $null
+  }
+  if ($raw -notmatch '^[A-Za-z]:[\\/][^:*?"<>|]*$') {
+    throw "Policy pins.platformio_core_dir must be an absolute Windows path: $raw"
+  }
+
+  $expectedText = ($raw -replace '/', '\').TrimEnd('\')
+  $expected = Get-FullPathSafe $expectedText
+  if ($env:PLATFORMIO_CORE_DIR) {
+    $actualText = ([string]$env:PLATFORMIO_CORE_DIR -replace '/', '\').TrimEnd('\')
+    $actual = Get-FullPathSafe $actualText
+    if (($actual -cne $expected) -or ($actualText -cne $expectedText)) {
+      throw "PLATFORMIO_CORE_DIR must exactly match policy '$expectedText'; found '$actualText'."
+    }
+  }
+  if ((Test-Path -LiteralPath $expected) -and (Test-IsReparsePoint $expected)) {
+    throw "Canonical PlatformIO core is a symlink/junction/reparse point: $expected"
+  }
+
+  $env:PLATFORMIO_CORE_DIR = $expectedText
+  return $expected
 }
 
 function Resolve-PlatformIoExe {
@@ -1253,6 +1292,9 @@ function Test-ReleasePackage {
   } else {
     $policy = $Policy
   }
+  if ($null -eq $ProofRecomputer) {
+    [void](Set-PolicyPlatformIoCoreDir -Policy $policy)
+  }
 
   # -- 1. Path safety ---------------------------------------------------------
   $pkgFull = Get-FullPathSafe $PackagePath
@@ -1356,7 +1398,7 @@ function Test-ReleasePackage {
   $pins = Get-PsObjectProperty $manifest 'pins'
   $expPins = $policy.pins
   $pinExpectedOk = $true
-  foreach ($fld in @('platformio_core', 'platform', 'framework', 'framework_arduinoespressif32', 'toolchain_riscv32_esp', 'tool_esptoolpy', 'board', 'mcu', 'flash_size', 'app_offset')) {
+  foreach ($fld in @('platformio_core', 'platformio_core_dir', 'platform', 'framework', 'framework_arduinoespressif32', 'toolchain_riscv32_esp', 'tool_esptoolpy', 'board', 'mcu', 'flash_size', 'app_offset')) {
     if (([string](Get-PsObjectProperty $pins $fld)) -ne ([string](Get-PsObjectProperty $expPins $fld))) { $pinExpectedOk = $false }
   }
   # platformio_core_verified is the EXACT `pio --version` banner string proven at
@@ -1367,7 +1409,7 @@ function Test-ReleasePackage {
   foreach ($dp in $expPins.dependencies.PSObject.Properties) {
     if (([string](Get-PsObjectProperty $manDeps $dp.Name)) -ne [string]$dp.Value) { $pinExpectedOk = $false }
   }
-  Add-Check 'pins-expected-match-policy' $pinExpectedOk "manifest expected pins (core/verified banner/platform/framework/framework-pkg/toolchain/esptool/board/mcu/flash_size/app_offset + dependencies) must equal policy pins"
+  Add-Check 'pins-expected-match-policy' $pinExpectedOk "manifest expected pins (core/core-dir/verified banner/platform/framework/framework-pkg/toolchain/esptool/board/mcu/flash_size/app_offset + dependencies) must equal policy pins"
 
   $obs = Get-PsObjectProperty $pins 'observed'
   $obsOk = ($null -ne $obs)
@@ -1709,7 +1751,7 @@ function New-MinimalReleasePackage {
   $mgSha = Get-Sha256HexOfBytes $mergedBytes
   $elfSha = $elfShaHex
   $pinsCommon = [ordered]@{
-    platformio_core = '0.0.0'; platform = 'fxplatform@1.2.3'; framework = 'arduino'
+    platformio_core = '0.0.0'; platformio_core_dir = 'D:/pio-core'; platform = 'fxplatform@1.2.3'; framework = 'arduino'
     framework_arduinoespressif32 = 'fx-fw'; toolchain_riscv32_esp = 'fx-tc'; tool_esptoolpy = 'fx-esptool'
     board = 'fxboard'; mcu = 'fxmcu'; flash_size = '4MB'; app_offset = '0x10000'
     dependencies = $deps
@@ -1718,7 +1760,7 @@ function New-MinimalReleasePackage {
     schema = 'plane-radar/release-policy'; schema_version = 1
     local_only = [ordered]@{ require_no_git_remote = $true; release_root_relative = 'release' }
     pins = [ordered]@{
-      platformio_core = '0.0.0'; platform = 'fxplatform@1.2.3'; framework = 'arduino'
+      platformio_core = '0.0.0'; platformio_core_dir = 'D:/pio-core'; platform = 'fxplatform@1.2.3'; framework = 'arduino'
       framework_arduinoespressif32 = 'fx-fw'; toolchain_riscv32_esp = 'fx-tc'; tool_esptoolpy = 'fx-esptool'
       board = 'fxboard'; mcu = 'fxmcu'; flash_size = '4MB'; app_offset = '0x10000'
       dependencies = $deps
@@ -1778,7 +1820,7 @@ function New-MinimalReleasePackage {
     local_only = [ordered]@{ no_remote = $true; release_path = "release/$Commit" }
     policy_sha256 = $policySha
     pins = [ordered]@{
-      platformio_core = '0.0.0'; platformio_core_verified = 'PlatformIO Core, version 0.0.0'
+      platformio_core = '0.0.0'; platformio_core_dir = 'D:/pio-core'; platformio_core_verified = 'PlatformIO Core, version 0.0.0'
       platform = 'fxplatform@1.2.3'; framework = 'arduino'
       framework_arduinoespressif32 = 'fx-fw'; toolchain_riscv32_esp = 'fx-tc'; tool_esptoolpy = 'fx-esptool'
       board = 'fxboard'; mcu = 'fxmcu'; flash_size = '4MB'; app_offset = '0x10000'

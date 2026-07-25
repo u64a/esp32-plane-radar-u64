@@ -22,7 +22,10 @@
        unflag and -g0 flag propagate to all five release envs.
     3. The native / native-diag / native-gfx test envs do NOT strip debug info
        (they are separate envs and must keep their symbols/DWARF for tests).
-    4. The tracked release-policy.json carries the reproducibility + app_descriptor
+    4. The tracked release-policy.json pins the canonical PlatformIO core path
+       used for framework __FILE__ strings, and build-release applies it before
+       invoking PlatformIO.
+    5. The tracked release-policy.json carries the reproducibility + app_descriptor
        sections and an exact firmware_elf SHA-256 anchor + size for every env, so
        the ELF proof input is Git-policy anchored and its embedded-SHA binding
        offset has tracked provenance.
@@ -105,7 +108,7 @@ foreach ($e in $nativeEnvs) {
   Assert-True "[env:$e] keeps debug info (no -g0 / -ggdb unflag)" (-not $stripped)
 }
 
-# -- 4. Tracked policy carries the ELF anchors + provenance -----------------
+# -- 4/5. Canonical package root + tracked ELF anchors/provenance ------------
 . "$PSScriptRoot\release-common.ps1"
 $git = Get-RepoGitState $repoRoot
 if (-not (Test-GitCommitPresent -RepoRoot $repoRoot -Commit $git.Commit)) {
@@ -113,6 +116,12 @@ if (-not (Test-GitCommitPresent -RepoRoot $repoRoot -Commit $git.Commit)) {
 }
 $gp = Get-GitPolicy -RepoRoot $repoRoot -Commit $git.Commit -RelPath 'scripts/release-policy.json'
 $policy = $gp.Object
+
+$coreDirPin = [string](Get-PsObjectProperty $policy.pins 'platformio_core_dir')
+Assert-True "policy pins canonical PlatformIO core dir D:/pio-core" ($coreDirPin -ceq 'D:/pio-core')
+$releaseBuilderText = Get-Content -Raw (Join-Path $repoRoot 'scripts\build-release.ps1')
+$corePolicyCalls = [regex]::Matches($releaseBuilderText, 'Set-PolicyPlatformIoCoreDir\s+-Policy\s+\$policy\s+-Require').Count
+Assert-True "build-release repeatedly reasserts policy PlatformIO core" ($corePolicyCalls -ge 6)
 
 $repro = Get-PsObjectProperty $policy 'reproducibility'
 Assert-True "policy has reproducibility section" ($null -ne $repro)

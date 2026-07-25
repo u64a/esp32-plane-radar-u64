@@ -17,6 +17,8 @@ jobs:
     name: Certified firmware
     runs-on: windows-2022
     timeout-minutes: 90
+    env:
+      PLATFORMIO_CORE_DIR: D:\pio-core
 
     steps:
       - name: Check out pull request merge commit
