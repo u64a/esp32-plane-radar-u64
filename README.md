@@ -2,9 +2,29 @@
 
 <img width="800" height="450" alt="plane-radar" src="https://github.com/user-attachments/assets/716d0992-dab8-47ba-8f1a-2aec7f607419" />
 
-**3D printed case (STL + assembly):** [MakerWorld](https://makerworld.com/en/models/2872376-esp32-plane-radar-live-ads-b-on-a-round-display#profileId-3207083) · **Firmware (original/upstream project releases, reference for the original project; this private local hardening copy does not publish there):** [Releases](https://github.com/MatixYo/ESP32-Plane-Radar/releases)
+**Original project:** [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar) · **Original releases:** [GitHub Releases](https://github.com/MatixYo/ESP32-Plane-Radar/releases) · **3D printed case (STL + assembly):** [MakerWorld](https://makerworld.com/en/models/2872376-esp32-plane-radar-live-ads-b-on-a-round-display#profileId-3207083)
 
 Firmware for an **ESP32-C3 Super Mini** and a **1.28″ round GC9A01** display (240×240). Shows a circular **ADS-B radar** around your configured location, with a **temporary, secured Wi‑Fi setup portal** for first-time setup.
+
+## Project origin and differences
+
+This repository is a hardened derivative of
+[MatixYo's ESP32 Plane Radar](https://github.com/MatixYo/ESP32-Plane-Radar).
+The original concept, hardware integration, display design, and firmware
+baseline are credited to MatixYo. The original MIT copyright and permission
+notice are retained in [LICENSE](LICENSE). This repository is independently
+maintained and is not an official upstream release.
+
+Major differences from the upstream baseline:
+
+| Area | This repository |
+|------|-----------------|
+| Wi‑Fi provisioning | Replaces WiFiManager provisioning with a temporary WPA2 captive portal, a per-session password shown only on the display, CSRF protection, bounded routes, credential trial-before-commit, and power-loss-safe settings transactions |
+| Network security | Adds pinned CA roots, hostname and certificate verification, trusted SNTP time, a CA-authenticated persisted time floor, and fail-closed TLS behavior |
+| ADS-B handling | Adds bounded HTTP/JSON decoding, deterministic nearest-64 retention, strict transport limits, completion-relative polling, retry backoff, and stale/offline lifecycle states |
+| Runtime and display | Corrects radar/runway geometry, adds range/unit/runway settings, redraw-on-change behavior, and an optional evaluation-only ADS-B worker while keeping the default firmware synchronous |
+| Privacy and attack surface | Restricts runtime egress to ADS-B HTTPS, SNTP, and LAN-provided DNS/DHCP; removes OTA, mDNS, telemetry, and permanent LAN listeners |
+| Verification and releases | Adds 606 native/headless test cases, 21 reviewed rendering goldens, policy/tamper gates, pinned build variants, reproducible firmware artifacts, package verification, and a hardware-acceptance checklist |
 
 ## What it does
 
@@ -904,12 +924,15 @@ The updated **worker policy gate** (`verify-adsb-worker-policy.ps1`) now covers 
 
 The default release image is **`supermini/firmware-merged.bin`**, produced inside
 a reproducible, re-verifiable release package entirely locally by
-`scripts/build-release.ps1` (no remote, no CI, no publication). See
+`scripts/build-release.ps1`. Source can be hosted in a Git remote, but the
+certification policy intentionally requires the independent checkout used for
+a release build to have no configured remotes; there is no CI or automated
+artifact publication. See
 [Phase 12 local release pipeline and hardware handoff](#phase-12-local-release-pipeline-and-hardware-handoff)
 for the full pipeline, the manifest/checksum/proof layout, and the hardware
 evidence workflow.
 
-Build + merge + proof + publish all five envs to `release/<sha>/`:
+Build + merge + proof + package all five envs under `release/<sha>/`:
 
 ```powershell
 .\scripts\build-release.ps1
@@ -943,8 +966,11 @@ in favour of this Windows/local pipeline.
 
 ## Phase 12 local release pipeline and hardware handoff
 
-Everything here runs **locally**: no remote, no GitHub Actions, no publication.
-Release artifacts stay under the git-ignored `release/` directory.
+Everything here runs **locally**: no GitHub Actions and no automated artifact
+publication. Release artifacts stay under the git-ignored `release/`
+directory. Although the source repository can have an `origin`, certified
+release generation must run from a separate, clean repository copy with all
+Git remotes removed; the fail-closed release policy verifies that condition.
 
 ### Build a release (`scripts/build-release.ps1`)
 
@@ -1374,9 +1400,11 @@ Renders in memory and compares exact LF bytes to checked-in files. Exits 0 if id
 
 **Generated files:** `include/data/large_airports.h` and `src/data/large_airports_data.cpp` are committed checked-in with LF line endings (enforced by `.gitattributes`). They contain a stable provenance comment block (commit/SHA-256/lengths/blob SHAs/license URL/filter schema version) and must not be edited manually.
 
-### Local-only release policy
+### Local release policy
 
-`.github/workflows/` is **intentionally absent** — there are no CI/CD workflows, no automated publishing, and no remote infrastructure. All verification, gate, and release operations run locally:
+`.github/workflows/` is **intentionally absent** — there are no CI/CD workflows
+or automated releases. Source hosting is separate from certification: all
+verification, gate, and release operations run locally:
 
 ```powershell
 .\scripts\verify-airport-data.ps1              # Phase 11: OurAirports provenance gate (20 invariants)
@@ -1387,7 +1415,10 @@ Renders in memory and compares exact LF bytes to checked-in files. Exits 0 if id
 
 The `scripts/native-test.ps1` script runs both Phase 11 live gates (`verify-airport-data.ps1` and `verify-egress-policy.ps1`) fail-fast in its current PowerShell process before any PlatformIO tests; it does not run gate self-tests.
 
-No remote is added, no releases are published, and no GitHub Actions workflows are introduced by this project.
+The configured source remote is not used by these scripts. A certified release
+must be generated from an independent clean checkout with no configured Git
+remotes; release artifacts remain local unless a maintainer deliberately
+publishes them, and no GitHub Actions workflows are introduced by this project.
 
 ### Phase 11 native tests and gate summary
 
