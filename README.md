@@ -1,5 +1,8 @@
 # Plane Radar
 
+[![Certified Firmware CI](https://github.com/NZCypher819/esp32-plane-radar-u64/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/NZCypher819/esp32-plane-radar-u64/actions/workflows/ci.yml)
+[![Firmware Release](https://github.com/NZCypher819/esp32-plane-radar-u64/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/NZCypher819/esp32-plane-radar-u64/actions/workflows/release.yml)
+
 <img width="800" height="450" alt="plane-radar" src="https://github.com/user-attachments/assets/716d0992-dab8-47ba-8f1a-2aec7f607419" />
 
 **Original project:** [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar) · **Original releases:** [GitHub Releases](https://github.com/MatixYo/ESP32-Plane-Radar/releases) · **3D printed case (STL + assembly):** [MakerWorld](https://makerworld.com/en/models/2872376-esp32-plane-radar-live-ads-b-on-a-round-display#profileId-3207083)
@@ -926,11 +929,36 @@ The default release image is **`supermini/firmware-merged.bin`**, produced insid
 a reproducible, re-verifiable release package entirely locally by
 `scripts/build-release.ps1`. Source can be hosted in a Git remote, but the
 certification policy intentionally requires the independent checkout used for
-a release build to have no configured remotes; there is no CI or automated
-artifact publication. See
+a release build to have no configured remotes. See
 [Phase 12 local release pipeline and hardware handoff](#phase-12-local-release-pipeline-and-hardware-handoff)
 for the full pipeline, the manifest/checksum/proof layout, and the hardware
 evidence workflow.
+
+### GitHub CI and releases
+
+Generated firmware is **not committed to `main`**. The repository uses two
+least-privilege GitHub Actions workflows:
+
+- Pull requests to protected `main` run the complete certified build against
+  the proposed merge commit.
+- Every commit merged to `main` generates an immutable Actions artifact
+  containing the default merged firmware, its SHA-256, the full certified
+  package, manifest, checksums, and binary proof.
+- A `v*` tag pointing to a commit contained in `main` runs the same build and
+  publishes those files as an immutable GitHub Release.
+
+Workflow dependencies are pinned to full commit SHAs. The release job removes
+its checkout's Git remote before certification, uses only the pinned local
+release pipeline, creates a Sigstore-backed GitHub artifact attestation, and
+does not receive repository write permission. Only the tag-only publishing job
+receives `contents: write`.
+
+Verify a downloaded firmware file's workflow provenance with:
+
+```powershell
+gh attestation verify .\plane-radar-esp32c3-*-firmware-merged.bin `
+  --repo NZCypher819/esp32-plane-radar-u64
+```
 
 Build + merge + proof + package all five envs under `release/<sha>/`:
 
@@ -966,11 +994,12 @@ in favour of this Windows/local pipeline.
 
 ## Phase 12 local release pipeline and hardware handoff
 
-Everything here runs **locally**: no GitHub Actions and no automated artifact
-publication. Release artifacts stay under the git-ignored `release/`
-directory. Although the source repository can have an `origin`, certified
-release generation must run from a separate, clean repository copy with all
-Git remotes removed; the fail-closed release policy verifies that condition.
+The certification logic itself runs **locally inside an isolated checkout**.
+Release artifacts are first staged under the git-ignored `release/` directory.
+Although the source repository has an `origin`, certified release generation
+removes all Git remotes before the build; the fail-closed release policy
+verifies that condition. GitHub Actions may then upload the already-certified
+package without changing its contents.
 
 ### Build a release (`scripts/build-release.ps1`)
 
@@ -1402,9 +1431,10 @@ Renders in memory and compares exact LF bytes to checked-in files. Exits 0 if id
 
 ### Local release policy
 
-`.github/workflows/` is **intentionally absent** — there are no CI/CD workflows
-or automated releases. Source hosting is separate from certification: all
-verification, gate, and release operations run locally:
+Source hosting and artifact transport are separate from certification. The
+tracked GitHub Actions workflows invoke the same local scripts used by an
+operator; all verification, gates, and firmware generation occur inside the
+isolated checkout:
 
 ```powershell
 .\scripts\verify-airport-data.ps1              # Phase 11: OurAirports provenance gate (20 invariants)
@@ -1417,8 +1447,8 @@ The `scripts/native-test.ps1` script runs both Phase 11 live gates (`verify-airp
 
 The configured source remote is not used by these scripts. A certified release
 must be generated from an independent clean checkout with no configured Git
-remotes; release artifacts remain local unless a maintainer deliberately
-publishes them, and no GitHub Actions workflows are introduced by this project.
+remotes. CI uploads only the resulting certified files; `v*` tags deliberately
+publish them as GitHub Release assets.
 
 ### Phase 11 native tests and gate summary
 

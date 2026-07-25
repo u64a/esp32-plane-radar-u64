@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Phase 12 fail-closed, ALWAYS-CERTIFIED LOCAL release builder for the ESP32-C3
+  Phase 12 fail-closed, ALWAYS-CERTIFIED release builder for the ESP32-C3
   Plane Radar firmware.
 
 .DESCRIPTION
@@ -11,7 +11,7 @@
   There are NO certification bypasses. Every run unconditionally:
     * requires PlatformIO Core EXACTLY the pinned version;
     * requires git HEAD, a clean tracked/index worktree, NO untracked files, and
-      NO git remote (the repo is intentionally local-only);
+      NO git remote in the isolated certification checkout;
     * publishes strictly to <repo>/release/<40-hex HEAD>/ (no override);
     * deletes .pio ONCE and freshly builds + merges exactly the five envs;
     * runs EVERY required source gate;
@@ -83,10 +83,11 @@ if ($pioExit -ne 0 -or "$pioVersion".Trim() -ne $expectedPio) {
 Write-Ok "PlatformIO $($policy.pins.platformio_core)"
 
 # ===========================================================================
-# 2. Git: HEAD exists, clean tracked+index, no untracked, no remote (ALWAYS).
+# 2. Git: HEAD exists, clean tracked+index, no untracked, no remote in the
+#    isolated certification checkout (ALWAYS).
 # ===========================================================================
 if ($git.HasRemote) {
-  throw "A git remote is configured ($($git.RemoteCount)); this repository must stay local-only. Aborting."
+  throw "A git remote is configured ($($git.RemoteCount)); certified releases require an isolated no-remote checkout. Aborting."
 }
 if ($git.TrackedDirty) {
   throw "The tracked/index worktree is not clean:`n$($git.TrackedLines -join "`n")"

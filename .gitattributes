@@ -5,3 +5,9 @@ src/data/large_airports_data.cpp    text eol=lf
 # Phase 12 golden render images are byte-exact fixtures: treat as binary so no
 # platform ever normalizes line endings and corrupts the exact-comparison gate.
 test/golden/*.bmp                   binary
+
+# Repository automation and policy files must remain byte-stable across hosts.
+.github/**/*.yml                    text eol=lf
+.github/**/*.yaml                   text eol=lf
+.github/CODEOWNERS                  text eol=lf
+SECURITY.md                         text eol=lf

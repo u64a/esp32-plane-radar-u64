@@ -1,11 +1,11 @@
 {
   "schema": "plane-radar/release-policy",
   "schema_version": 1,
-  "description": "Approved local-only release policy for the ESP32-C3 Plane Radar firmware. scripts/build-release.ps1 and scripts/verify-release.ps1 both load this file; it is the single tracked source of truth for the pinned toolchain, the five release environments, their EXACT approved resource/file sizes, the required source gates, and the default-artifact identity. Any intentional change to an approved size or pin MUST edit this tracked file in the same commit.",
+  "description": "Approved isolated-checkout release policy for the ESP32-C3 Plane Radar firmware. scripts/build-release.ps1 and scripts/verify-release.ps1 both load this file; it is the single tracked source of truth for the pinned toolchain, the five release environments, their EXACT approved resource/file sizes, the required source gates, and the default-artifact identity. Any intentional change to an approved size or pin MUST edit this tracked file in the same commit.",
   "local_only": {
     "require_no_git_remote": true,
     "release_root_relative": "release",
-    "note": "The repository is intentionally remote-free. Release artifacts stay local and ignored under release/."
+    "note": "Source may be hosted remotely, but a certified release must run in an isolated checkout with no configured Git remote. Release artifacts are staged under ignored release/ before explicit CI upload or local use."
   },
   "pins": {
     "platformio_core": "6.1.19",

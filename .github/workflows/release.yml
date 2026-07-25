@@ -1,0 +1,149 @@
+name: Firmware Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build certified firmware
+    runs-on: windows-2022
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require main or a version tag from main
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch" -and
+              $env:GITHUB_REF -ne "refs/heads/main") {
+            throw "Manual release builds must run from main."
+          }
+
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            git fetch --no-tags origin main
+            git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+            if ($LASTEXITCODE -ne 0) {
+              throw "Version tags must point to a commit contained in main."
+            }
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          check-latest: false
+
+      - name: Install pinned build tools
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --requirement requirements-dev.txt
+          .\scripts\setup-native-toolchain.ps1
+
+      - name: Isolate certification checkout
+        shell: pwsh
+        run: |
+          git switch --force-create main $env:GITHUB_SHA
+          git remote remove origin
+          $dirty = @(git status --porcelain=v1 --untracked-files=all)
+          if ($dirty.Count -ne 0) {
+            throw "Certification checkout is dirty:`n$($dirty -join "`n")"
+          }
+
+      - name: Build and verify certified firmware
+        shell: pwsh
+        run: |
+          .\scripts\build-release.ps1
+          .\scripts\verify-release.ps1 -Path "release\$env:GITHUB_SHA"
+
+      - name: Prepare downloadable files
+        shell: pwsh
+        run: |
+          $releasePath = "release\$env:GITHUB_SHA"
+          $shortSha = $env:GITHUB_SHA.Substring(0, 12)
+          $firmwareName = "plane-radar-esp32c3-$shortSha-firmware-merged.bin"
+          $packageName = "plane-radar-$shortSha-certified-package.zip"
+
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item "$releasePath\supermini\firmware-merged.bin" "dist\$firmwareName"
+          Copy-Item "$releasePath\manifest.json" "dist\manifest.json"
+          Copy-Item "$releasePath\CHECKSUMS.sha256" "dist\CHECKSUMS.sha256"
+          Copy-Item "$releasePath\binary-proof.json" "dist\binary-proof.json"
+          Copy-Item "$releasePath\binary-proof.txt" "dist\binary-proof.txt"
+          Compress-Archive -Path "$releasePath\*" -DestinationPath "dist\$packageName"
+
+          $hash = (Get-FileHash "dist\$firmwareName" -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD "dist\$firmwareName.sha256"),
+            "$hash  $firmwareName`n",
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Attest firmware provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            dist/*.bin
+            dist/*.zip
+
+      - name: Upload certified firmware
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: certified-firmware-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download certified firmware
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: certified-firmware-${{ github.sha }}
+          path: dist
+
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; refusing to replace immutable assets." >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --generate-notes \
+            --title "Plane Radar $GITHUB_REF_NAME"
