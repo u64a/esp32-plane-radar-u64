@@ -296,9 +296,11 @@ bool isFormUrlEncoded(const char* v, uint16_t len) {
   }
   trimSpaces(v, &param_start, &param_len);
   // Find '=' inside the parameter.
+  const uint16_t param_end =
+      static_cast<uint16_t>(param_start + param_len);
   uint16_t eq = param_start;
   bool has_eq = false;
-  for (; eq < param_start + param_len; ++eq) {
+  for (; eq < param_end; ++eq) {
     if (v[eq] == '=') {
       has_eq = true;
       break;
@@ -310,7 +312,7 @@ bool isFormUrlEncoded(const char* v, uint16_t len) {
   uint16_t name_start = param_start;
   uint16_t name_len = static_cast<uint16_t>(eq - param_start);
   uint16_t val_start = static_cast<uint16_t>(eq + 1);
-  uint16_t val_len = static_cast<uint16_t>(param_start + param_len - val_start);
+  uint16_t val_len = static_cast<uint16_t>(param_end - val_start);
   trimSpaces(v, &name_start, &name_len);
   trimSpaces(v, &val_start, &val_len);
   if (!ciEqualLit(v + name_start, name_len, "charset")) {

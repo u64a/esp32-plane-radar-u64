@@ -116,6 +116,7 @@ FormParseResult urlFormParse(const char* body, uint16_t body_len,
     while (i < body_len && body[i] != '&') {
       ++i;
     }
+    const uint16_t seg_end = i;
     const uint16_t seg_len = static_cast<uint16_t>(i - seg_start);
     const bool had_sep = (i < body_len);
     if (had_sep) {
@@ -131,15 +132,15 @@ FormParseResult urlFormParse(const char* body, uint16_t body_len,
 
     // Split the segment at its first '='.
     uint16_t eq = seg_start;
-    while (eq < seg_start + seg_len && body[eq] != '=') {
+    while (eq < seg_end && body[eq] != '=') {
       ++eq;
     }
-    if (eq == seg_start + seg_len) {
+    if (eq == seg_end) {
       return FormParseResult::MalformedPair;  // no '='
     }
     const uint16_t key_len = static_cast<uint16_t>(eq - seg_start);
     const uint16_t val_len =
-        static_cast<uint16_t>(seg_start + seg_len - (eq + 1));
+        static_cast<uint16_t>(seg_end - (eq + 1));
     if (key_len == 0) {
       return FormParseResult::MalformedPair;  // empty key
     }

@@ -63,11 +63,11 @@ void test_over_long_span_truncates_to_capacity_without_terminator() {
 
 void test_empty_and_null_span_terminate_at_zero() {
   unsigned char dst[32];
-  memset(dst, kFill, sizeof(dst));
+  dst[0] = kFill;
   TEST_ASSERT_EQUAL_UINT32(0, core::wifiFieldCopy(dst, sizeof(dst), "ignored", 0));
   TEST_ASSERT_EQUAL_UINT8(0, dst[0]);
 
-  memset(dst, kFill, sizeof(dst));
+  dst[0] = kFill;
   TEST_ASSERT_EQUAL_UINT32(0, core::wifiFieldCopy(dst, sizeof(dst), nullptr, 5));
   TEST_ASSERT_EQUAL_UINT8(0, dst[0]);
 }
