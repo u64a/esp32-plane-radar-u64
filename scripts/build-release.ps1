@@ -119,9 +119,7 @@ if (-not (Test-PathInside -Base $releaseRoot -Candidate $targetChild)) {
 if ((Split-Path $targetChild -Leaf) -ne $sha) {
   throw "Publish leaf must equal the HEAD commit: $targetChild"
 }
-$nmTool = Resolve-RiscvTool $policy.toolchain_tools.nm
 Write-Ok "Publish target: release/$sha"
-Write-Ok "Pinned nm: $nmTool"
 
 if ((Test-Path $targetChild) -and -not $Force) {
   throw "release/$sha already exists. Re-run with -Force to replace ONLY that exact validated path."
@@ -279,6 +277,11 @@ Write-Ok "LovyanGFX=$($observed.dependencies['lovyan03/LovyanGFX']) ArduinoJson=
 #    Any failing invariant aborts BEFORE staging/publishing.
 # ===========================================================================
 Write-Step "Current-head ELF/binary proofs"
+# A cold PlatformIO installation does not contain the RISC-V toolchain until a
+# firmware environment has been built. Resolve nm here, after all five builds,
+# rather than during preflight so a clean CI runner remains self-bootstrapping.
+$nmTool = Resolve-RiscvTool $policy.toolchain_tools.nm
+Write-Ok "Pinned nm: $nmTool"
 $envElf = @{}; $envBin = @{}; $envMerged = @{}
 foreach ($name in $envNames) {
   $bd = $buildInfo[$name].buildDir
