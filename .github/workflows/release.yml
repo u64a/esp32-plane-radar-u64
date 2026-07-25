@@ -115,7 +115,7 @@ jobs:
           name: certified-firmware-${{ github.sha }}
           path: dist/*
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
 
   publish:
     name: Publish GitHub release

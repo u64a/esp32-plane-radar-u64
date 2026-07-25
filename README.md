@@ -941,11 +941,15 @@ least-privilege GitHub Actions workflows:
 
 - Pull requests to protected `main` run the complete certified build against
   the proposed merge commit.
-- Every commit merged to `main` generates an immutable Actions artifact
+- Every commit merged to `main` generates a one-day immutable Actions artifact
   containing the default merged firmware, its SHA-256, the full certified
   package, manifest, checksums, and binary proof.
 - A `v*` tag pointing to a commit contained in `main` runs the same build and
-  publishes those files as an immutable GitHub Release.
+  publishes those files as a durable, immutable GitHub Release.
+
+The short Actions-artifact retention limits storage exposure on the public
+repository. Versioned release assets remain available from GitHub Releases
+after the transient workflow artifact expires.
 
 Workflow dependencies are pinned to full commit SHAs. The release job removes
 its checkout's Git remote before certification, uses only the pinned local
