@@ -52,6 +52,11 @@ The screen shows progressive prompts during a hold (“Release now to configure 
 
 The portal is a **temporary, WPA2‑secured SoftAP** at a fixed `192.168.4.1`. It opens automatically on first boot (no stored credentials) and on demand via the configure gesture. It runs for **5 minutes**, then closes; it is **never** a permanent LAN service.
 
+The closed HTTP allow-list includes the standard Android, Apple, and Windows
+captive checks, including Windows `connecttest.txt` and `/redirect`; every
+noncanonical route response is token-free and redirects only to the fixed portal
+address.
+
 **First-time setup** (no saved Wi‑Fi):
 
 1. The device screen shows the **network name** (`PlaneRadar-XXYYZZ`) and a **one‑time password** — join that Wi‑Fi with the shown password
@@ -961,8 +966,8 @@ Certified Windows builds also use the policy-bound PlatformIO package root
 `D:\pio-core`. Arduino framework diagnostics embed absolute `__FILE__` strings
 in loadable firmware, so fixing this package path is required for byte-identical
 local and GitHub runner output; a different core path is rejected before build.
-The canonical default image is 1,263,376 bytes, with 65,044 bytes static RAM
-and 1,142,970 bytes linker-reported flash.
+The canonical default image is 1,263,408 bytes, with 65,044 bytes static RAM
+and 1,142,994 bytes linker-reported flash.
 
 Verify a downloaded firmware file's workflow provenance with:
 

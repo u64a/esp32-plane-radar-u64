@@ -20,7 +20,7 @@ param(
 #
 # It proves, from source alone:
 #   1. No WiFiManager/OTA/mDNS/broad-WebServer surface (dependency or code).
-#   2. The captive HTTP route set is exactly the 10 allowed method/path pairs,
+#   2. The captive HTTP route set is exactly the 11 allowed method/path pairs,
 #      with the WiFiManager/OTA deny-list intact and no wildcard/prefix route.
 #   3. Exactly one production listener (the AP-bound WiFiServer + DNSServer in
 #      config_portal.cpp), one services::portal::start caller (wifi_setup.cpp),
@@ -241,7 +241,8 @@ function Invoke-ProvisioningGate {
   $expectedRoutes = @(
     "GET /", "POST /save", "GET /generate_204", "GET /gen_204",
     "GET /hotspot-detect.html", "GET /ncsi.txt", "GET /connecttest.txt",
-    "GET /canonical.html", "GET /success.txt", "GET /library/test/success.html"
+    "GET /redirect", "GET /canonical.html", "GET /success.txt",
+    "GET /library/test/success.html"
   )
   $methodMap = @{ "Get" = "GET"; "Post" = "POST"; "Put" = "PUT"; "Delete" = "DELETE"; "Head" = "HEAD" }
   $actualRoutes = @()
@@ -259,7 +260,7 @@ function Invoke-ProvisioningGate {
   if ($missing.Count -gt 0) { Fail "kRoutes is missing required route(s): $($missing -join '; ')" }
   if ($extra.Count -gt 0) { Fail "kRoutes contains unexpected route(s): $($extra -join '; ')" }
   if ($routesBody -match "\*") { Fail "kRoutes contains a wildcard '*' route path (only exact routes allowed)." }
-  Ok "kRoutes is exactly the 10 allowed GET /, POST /save, and 8 captive-probe pairs."
+  Ok "kRoutes is exactly the 11 allowed GET /, POST /save, and 9 captive-OS pairs."
 
   if ($router.Skeleton -notmatch "exactEqual\s*\(\s*path") {
     Fail "http_router no longer matches routes via exactEqual(path,...): a prefix/wildcard match may have been introduced."

@@ -15,7 +15,7 @@
 //
 // It feeds core::HttpRequestParser one buffer at a time, resolves every request
 // through core::httpRouteResolve (never by raw path), and answers only the fixed
-// closed route set: Root, Save, RedirectToPortal, the eight captive probes, and
+// closed route set: Root, Save, RedirectToPortal, the nine captive OS routes, and
 // truthful 4xx/5xx for everything else. Responses are bounded and allocation-free
 // (one fixed buffer, sent through non-blocking lwip_send with a bounded deadline
 // that also aborts the moment the original portal session deadline expires).

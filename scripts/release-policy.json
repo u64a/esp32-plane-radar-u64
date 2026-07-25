@@ -97,11 +97,11 @@
       "role": "default-release",
       "evaluation_only": false,
       "options": { "worker": false, "diagnostics": false, "log_level": 2 },
-      "resources": { "ram": 65044, "flash": 1142970, "firmware_bin": 1197840, "merged_bin": 1263376, "firmware_elf": 12274468 },
+      "resources": { "ram": 65044, "flash": 1142994, "firmware_bin": 1197872, "merged_bin": 1263408, "firmware_elf": 12274468 },
       "sha256": {
-        "firmware_elf": "31d89ec2d26d76d7abdeaf894c1e4afb4fa3f693fb997d58fd5ebed8887eec5b",
-        "firmware_bin": "588a6cf08b2bf00008e8266712b1ee88b33845fd2d7fa7c0ed4cff8ad01e3a33",
-        "merged_bin": "da15334546a1faba2e0fb3c66ce6eba1bf904d8314a03baaad7a0813ed66d9e0"
+        "firmware_elf": "0c3142bc9ff0171e30e38a4bcfda03c5fd2013cc842f96d239d42b01f6bc20a2",
+        "firmware_bin": "9f2891f7cbf6d29e678473894b0e8d9288b074d64f7f51f7c429a419a9964264",
+        "merged_bin": "7f69402dbfa890b6f3c52738efecb8f8791b93cdc6d990b52bc8b19f1557174d"
       }
     },
     {
@@ -109,11 +109,11 @@
       "role": "evaluation",
       "evaluation_only": true,
       "options": { "worker": true, "diagnostics": false, "log_level": 2 },
-      "resources": { "ram": 73924, "flash": 1145844, "firmware_bin": 1201920, "merged_bin": 1267456, "firmware_elf": 12281004 },
+      "resources": { "ram": 73924, "flash": 1145868, "firmware_bin": 1201952, "merged_bin": 1267488, "firmware_elf": 12281004 },
       "sha256": {
-        "firmware_elf": "074e0349b6470c543f559311c321cc660ae87ec3becd825db4a7057e2abfb865",
-        "firmware_bin": "de28e5935afc59387f73ab47515a63d7190d8d67f53a81e237a7eb44fa772f59",
-        "merged_bin": "7396d9da3ff84baaa04b6228bad5506ac71a93700788de0e21bd47bb1a964429"
+        "firmware_elf": "e7c9eb75f6cc0f3726215a0eece79c3c4fcbea44e9614a386dab3b966c73eecd",
+        "firmware_bin": "3f98551b2ad3abad19ea3f4d59cea1de0ec682e68cbf15035f43fd210173e08d",
+        "merged_bin": "8392ebe26b7dd9624f74f11c777285ecdbb42d1e1aa6f93a7dbf9c4a5bd747d8"
       }
     },
     {
@@ -121,11 +121,11 @@
       "role": "evaluation",
       "evaluation_only": true,
       "options": { "worker": false, "diagnostics": false, "log_level": 0 },
-      "resources": { "ram": 64916, "flash": 1137866, "firmware_bin": 1191968, "merged_bin": 1257504, "firmware_elf": 12265532 },
+      "resources": { "ram": 64916, "flash": 1137890, "firmware_bin": 1191984, "merged_bin": 1257520, "firmware_elf": 12265532 },
       "sha256": {
-        "firmware_elf": "094ddb7884772e55d253960ba5476725b38484c687f4a88e209826686bb39f08",
-        "firmware_bin": "d481e5d3b979bdab44e902a5abe2aee486bd4da564a5b447c361f43602bb47ad",
-        "merged_bin": "410c8913a87222110194e6e3d65bfd82d7cdf8363a4c58c84076208c05a81d06"
+        "firmware_elf": "c124733c72bba9322b06c45dab4fa4adf5b6b6ea8d8fce6288cb1d6076a442c8",
+        "firmware_bin": "4c5835346b66d79553cf4e17bc554bd84443a70cdd4a6426c8511f91232f531f",
+        "merged_bin": "29910cb61d93d8384ffcb3b6a734c0c465f15ddbb0b0b79b8b2ca1a8e4fbba39"
       }
     },
     {
@@ -133,11 +133,11 @@
       "role": "evaluation",
       "evaluation_only": true,
       "options": { "worker": false, "diagnostics": true, "log_level": 2 },
-      "resources": { "ram": 65052, "flash": 1143584, "firmware_bin": 1198560, "merged_bin": 1264096, "firmware_elf": 12275468 },
+      "resources": { "ram": 65052, "flash": 1143608, "firmware_bin": 1198592, "merged_bin": 1264128, "firmware_elf": 12275468 },
       "sha256": {
-        "firmware_elf": "40da21c719da93329716b1d17d44e761b2c1a6af4cc59478347611790d11053a",
-        "firmware_bin": "55e5aca802a2291beeb84cab90c2f0fd77c03c0a1e9884aff68234667cf34402",
-        "merged_bin": "1869fdc6929586278f81c90fe76f8a37573ffc0bcd8c304b6339c37316667bad"
+        "firmware_elf": "d6332062498ba9871638a996c37273dca90bc14029469cdf2bfe34eac90a68d0",
+        "firmware_bin": "7f6b8acd297e32cbbdd22123e4889e423a5d64ab30592d19c75846fb2b8e1959",
+        "merged_bin": "a85884c49e44c33a2ff904be150495ae81f7cd4558fbcace2b168e0e1efa2b45"
       }
     },
     {
@@ -145,11 +145,11 @@
       "role": "evaluation",
       "evaluation_only": true,
       "options": { "worker": true, "diagnostics": true, "log_level": 2 },
-      "resources": { "ram": 73948, "flash": 1146612, "firmware_bin": 1202816, "merged_bin": 1268352, "firmware_elf": 12282204 },
+      "resources": { "ram": 73948, "flash": 1146636, "firmware_bin": 1202848, "merged_bin": 1268384, "firmware_elf": 12282204 },
       "sha256": {
-        "firmware_elf": "0934bc51221ce48ff427b3c8d8629ecd734a4c10baa9ece0444051746c66a8fe",
-        "firmware_bin": "c6a2cda25b8a35a8d1a171bbfcd11d8b433c588778389362fb29b2a43b1c8ea3",
-        "merged_bin": "a7041686b672c4736f1c1844a1b6f205398a2028396ce7ffbd0fff6a8e6a5e0e"
+        "firmware_elf": "0ecf785dcb0c454b6787e79366ae1554a8e6ecc8a2737c8cc8c741012f47eccc",
+        "firmware_bin": "0a6d90ae32c30c19461323920380d811e4705f9e92b0b04c2d1f32f55057dea4",
+        "merged_bin": "e1fe8b3719a3b7ac6f6a451bb0fe22e3d25cfeb4c462d6860698402bc395d482"
       }
     }
   ],

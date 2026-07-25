@@ -61,6 +61,7 @@ constexpr RouteEntry kRoutes[] = {
     {HttpMethod::Get, "/hotspot-detect.html", HttpRoute::CaptiveHotspotDetect},
     {HttpMethod::Get, "/ncsi.txt", HttpRoute::CaptiveNcsi},
     {HttpMethod::Get, "/connecttest.txt", HttpRoute::CaptiveConnectTest},
+    {HttpMethod::Get, "/redirect", HttpRoute::RedirectToPortal},
     {HttpMethod::Get, "/canonical.html", HttpRoute::CaptiveCanonical},
     {HttpMethod::Get, "/success.txt", HttpRoute::CaptiveSuccessTxt},
     {HttpMethod::Get, "/library/test/success.html",

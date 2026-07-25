@@ -42,8 +42,9 @@ enum class HttpRoute : uint8_t {
   None = 0,
   Root,                   // GET / (canonical Host): the setup form
   Save,                   // POST /save (canonical Host): candidate submission
-  RedirectToPortal,       // GET / (noncanonical/absent Host): fixed 302 to the
-                          // portal authority (no token, no body)
+  RedirectToPortal,       // GET / with a noncanonical/absent Host, or Windows
+                          // GET /redirect: fixed 302 to the portal authority
+                          // (no token, no body)
   CaptiveGenerate204,     // GET /generate_204
   CaptiveGen204,          // GET /gen_204
   CaptiveHotspotDetect,   // GET /hotspot-detect.html
