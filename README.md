@@ -52,11 +52,6 @@ The screen shows progressive prompts during a hold (“Release now to configure 
 
 The portal is a **temporary, WPA2‑secured SoftAP** at a fixed `192.168.4.1`. It opens automatically on first boot (no stored credentials) and on demand via the configure gesture. It runs for **5 minutes**, then closes; it is **never** a permanent LAN service.
 
-The closed HTTP allow-list includes the standard Android, Apple, and Windows
-captive checks, including Windows `connecttest.txt` and `/redirect`; every
-noncanonical route response is token-free and redirects only to the fixed portal
-address.
-
 **First-time setup** (no saved Wi‑Fi):
 
 1. The device screen shows the **network name** (`PlaneRadar-XXYYZZ`) and a **one‑time password** — join that Wi‑Fi with the shown password
@@ -516,6 +511,34 @@ This env is for prototype evaluation and hardware validation only; it is
 **not** the default release firmware until the hardware-only gates in
 [Hardware-only acceptance gates](#hardware-only-acceptance-gates) pass.
 
+### Web flasher (browser-based flashing)
+
+A self-contained web flasher is included at `docs/index.html`. It uses
+[esptool-js](https://github.com/espressif/esptool-js) (Web Serial API) to
+flash the merged firmware directly from a browser — no tools installed.
+
+**Requirements:** Chrome, Edge, or Opera (Web Serial API required).
+
+**How it works:**
+
+1. The page auto-resolves the latest GitHub Release `firmware-merged.bin` via
+   the GitHub API (or falls back to a direct release asset URL)
+2. Click **Connect** and select the ESP32-C3 serial port
+3. Click **Flash Firmware** — the binary is downloaded and flashed to address
+   `0x0` with a progress bar
+4. The device resets automatically when flashing completes
+
+**To host on GitHub Pages:**
+
+1. Push to `main`
+2. Go to **Settings → Pages**
+3. Source: **Deploy from a branch**, branch `main`, folder `/docs`
+4. The flasher is live at
+   `https://<username>.github.io/esp32-plane-radar-u64-main/`
+
+**Before first use:** update the `owner` and `repo` constants in
+`docs/index.html` to match your GitHub username and repository name.
+
 ### Native tests
 
 Native tests use PlatformIO's Unity runner and do not require ESP32 hardware or
@@ -946,28 +969,17 @@ least-privilege GitHub Actions workflows:
 
 - Pull requests to protected `main` run the complete certified build against
   the proposed merge commit.
-- Every commit merged to `main` generates a one-day immutable Actions artifact
+- Every commit merged to `main` generates an immutable Actions artifact
   containing the default merged firmware, its SHA-256, the full certified
   package, manifest, checksums, and binary proof.
 - A `v*` tag pointing to a commit contained in `main` runs the same build and
-  publishes those files as a durable, immutable GitHub Release.
-
-The short Actions-artifact retention limits storage exposure on the public
-repository. Versioned release assets remain available from GitHub Releases
-after the transient workflow artifact expires.
+  publishes those files as an immutable GitHub Release.
 
 Workflow dependencies are pinned to full commit SHAs. The release job removes
 its checkout's Git remote before certification, uses only the pinned local
 release pipeline, creates a Sigstore-backed GitHub artifact attestation, and
 does not receive repository write permission. Only the tag-only publishing job
 receives `contents: write`.
-
-Certified Windows builds also use the policy-bound PlatformIO package root
-`D:\pio-core`. Arduino framework diagnostics embed absolute `__FILE__` strings
-in loadable firmware, so fixing this package path is required for byte-identical
-local and GitHub runner output; a different core path is rejected before build.
-The canonical default image is 1,263,408 bytes, with 65,044 bytes static RAM
-and 1,142,994 bytes linker-reported flash.
 
 Verify a downloaded firmware file's workflow provenance with:
 
@@ -991,7 +1003,9 @@ pio run -t merge -e supermini
 ```
 
 Flash + verify the default merged image (put the board in download mode: hold
-**BOOT**, tap **RESET**), or use a Web-Serial flasher such as
+**BOOT**, tap **RESET**), or use the project's
+[web flasher](#web-flasher-browser-based-flashing) (`docs/index.html`) or a
+general-purpose Web-Serial flasher such as
 [esptool-js](https://espressif.github.io/esptool-js/) at offset **0x0**. Use the
 **pinned** PlatformIO Python + `esptool.py` and pass the device serial port
 explicitly (`<COMx>`, e.g. `COM5`):

@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Plane Radar - Web Flasher</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --surface: #1e293b;
+      --border: #334155;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-hover: #7dd3fc;
+      --danger: #ef4444;
+      --success: #22c55e;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    .container {
+      width: 100%;
+      max-width: 640px;
+      padding: 2rem;
+    }
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 700;
+      margin-bottom: 0.25rem;
+    }
+    .subtitle {
+      color: var(--muted);
+      margin-bottom: 2rem;
+      font-size: 0.95rem;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      margin-bottom: 1rem;
+    }
+    .card h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 1rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-size: 0.75rem;
+    }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 1rem;
+      font-size: 0.9rem;
+    }
+    .status .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--danger);
+      flex-shrink: 0;
+    }
+    .status.connected .dot { background: var(--success); }
+    select, input[type="text"] {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.5rem 0.75rem;
+      font-size: 0.9rem;
+      width: 100%;
+      margin-bottom: 0.75rem;
+    }
+    select:focus, input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      padding: 0.6rem 1.25rem;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s, opacity 0.15s;
+      width: 100%;
+      margin-bottom: 0.5rem;
+    }
+    .btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: var(--bg);
+    }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+    .btn-danger {
+      background: var(--danger);
+      color: white;
+    }
+    .btn-danger:hover:not(:disabled) { background: #dc2626; }
+    .btn-secondary {
+      background: var(--border);
+      color: var(--text);
+    }
+    .btn-secondary:hover:not(:disabled) { background: #475569; }
+    .progress-wrap {
+      margin: 0.75rem 0;
+      display: none;
+    }
+    .progress-wrap.active { display: block; }
+    .progress-bar-bg {
+      background: var(--bg);
+      border-radius: 999px;
+      height: 8px;
+      overflow: hidden;
+    }
+    .progress-bar {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 999px;
+      width: 0%;
+      transition: width 0.2s;
+    }
+    .progress-label {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-top: 0.35rem;
+      text-align: right;
+    }
+    #log {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem;
+      font-family: "Cascadia Code", "Fira Code", monospace;
+      font-size: 0.8rem;
+      height: 180px;
+      overflow-y: auto;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .log-error { color: var(--danger); }
+    .log-success { color: var(--success); }
+    .log-info { color: var(--muted); }
+    .log-step { color: var(--accent); }
+    .requirements {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-top: 1rem;
+      line-height: 1.6;
+    }
+    .requirements a { color: var(--accent); text-decoration: none; }
+    .requirements a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Plane Radar Flasher</h1>
+    <p class="subtitle">Flash firmware to your ESP32-C3 Super Mini from the browser</p>
+
+    <div class="card">
+      <h2>Firmware</h2>
+      <label for="firmwareUrl" style="font-size:0.85rem; color:var(--muted); display:block; margin-bottom:0.35rem;">Firmware URL</label>
+      <input type="text" id="firmwareUrl" value="" placeholder="Loading latest release..." />
+      <label for="baudrate" style="font-size:0.85rem; color:var(--muted); display:block; margin-bottom:0.35rem;">Baud Rate</label>
+      <select id="baudrate">
+        <option value="921600">921600</option>
+        <option value="460800" selected>460800</option>
+        <option value="230400">230400</option>
+        <option value="115200">115200</option>
+      </select>
+    </div>
+
+    <div class="card">
+      <h2>Device</h2>
+      <div class="status" id="status">
+        <span class="dot"></span>
+        <span id="statusText">Not connected</span>
+      </div>
+      <div id="connectSection">
+        <button class="btn btn-primary" id="btnConnect">Connect to ESP32</button>
+      </div>
+      <div id="flashSection" style="display:none;">
+        <button class="btn btn-primary" id="btnFlash">Flash Firmware</button>
+        <div class="progress-wrap" id="progressWrap">
+          <div class="progress-bar-bg">
+            <div class="progress-bar" id="progressBar"></div>
+          </div>
+          <div class="progress-label" id="progressLabel">0%</div>
+        </div>
+        <button class="btn btn-secondary" id="btnErase">Erase Flash</button>
+        <button class="btn btn-danger" id="btnDisconnect">Disconnect</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Log</h2>
+      <div id="log"></div>
+    </div>
+
+    <p class="requirements">
+      Requires <strong>Chrome</strong>, <strong>Edge</strong>, or <strong>Opera</strong> with Web Serial API support.
+      <br />
+      Firmware source: <a href="https://github.com/espressif/esptool-js" target="_blank">esptool-js</a> by Espressif.
+    </p>
+  </div>
+
+  <script type="module">
+    import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.6.0/bundle.js";
+
+    const FIRMWARE_URL_INPUT = document.getElementById("firmwareUrl");
+    const BAUDRATE_SELECT = document.getElementById("baudrate");
+    const STATUS_EL = document.getElementById("status");
+    const STATUS_TEXT = document.getElementById("statusText");
+    const CONNECT_SECTION = document.getElementById("connectSection");
+    const FLASH_SECTION = document.getElementById("flashSection");
+    const PROGRESS_WRAP = document.getElementById("progressWrap");
+    const PROGRESS_BAR = document.getElementById("progressBar");
+    const PROGRESS_LABEL = document.getElementById("progressLabel");
+    const LOG_EL = document.getElementById("log");
+
+    const btnConnect = document.getElementById("btnConnect");
+    const btnFlash = document.getElementById("btnFlash");
+    const btnErase = document.getElementById("btnErase");
+    const btnDisconnect = document.getElementById("btnDisconnect");
+
+    let device = null;
+    let transport = null;
+    let esploader = null;
+    let chipName = null;
+
+    function log(msg, cls) {
+      const span = document.createElement("span");
+      if (cls) span.className = cls;
+      span.textContent = msg + "\n";
+      LOG_EL.appendChild(span);
+      LOG_EL.scrollTop = LOG_EL.scrollHeight;
+    }
+
+    function setStatus(text, connected) {
+      STATUS_TEXT.textContent = text;
+      STATUS_EL.className = connected ? "status connected" : "status";
+    }
+
+    function setProgress(pct) {
+      PROGRESS_BAR.style.width = pct + "%";
+      PROGRESS_LABEL.textContent = Math.round(pct) + "%";
+    }
+
+    const terminal = {
+      clean() { LOG_EL.innerHTML = ""; },
+      writeLine(data) { log(data, "log-info"); },
+      write(data) { log(data, "log-info"); },
+    };
+
+    async function resolveLatestFirmware() {
+      const owner = "NZCypher819";
+      const repo = "esp32-plane-radar-u64";
+      try {
+        const resp = await fetch(
+          `https://api.github.com/repos/${owner}/${repo}/releases/latest`
+        );
+        if (!resp.ok) throw new Error("No releases found");
+        const data = await resp.json();
+        const asset = data.assets.find((a) =>
+          a.name.includes("firmware-merged.bin")
+        );
+        if (!asset) throw new Error("No firmware-merged.bin in latest release");
+        FIRMWARE_URL_INPUT.value = asset.browser_download_url;
+        log("Resolved latest release: " + data.tag_name, "log-step");
+      } catch (e) {
+        FIRMWARE_URL_INPUT.value =
+          `https://github.com/${owner}/${repo}/releases/latest/download/firmware-merged.bin`;
+        log("Could not auto-resolve latest release, using default URL", "log-info");
+      }
+    }
+
+    resolveLatestFirmware();
+
+    btnConnect.onclick = async () => {
+      try {
+        log("Requesting serial port...", "log-step");
+        device = await navigator.serial.requestPort();
+        transport = new Transport(device);
+        const baudrate = parseInt(BAUDRATE_SELECT.value);
+
+        esploader = new ESPLoader({
+          transport,
+          baudrate,
+          terminal,
+        });
+
+        chipName = await esploader.main();
+        log("Connected to: " + chipName, "log-success");
+        setStatus("Connected to " + chipName, true);
+
+        CONNECT_SECTION.style.display = "none";
+        FLASH_SECTION.style.display = "block";
+      } catch (e) {
+        log("Connection failed: " + e.message, "log-error");
+      }
+    };
+
+    btnFlash.onclick = async () => {
+      const url = FIRMWARE_URL_INPUT.value.trim();
+      if (!url) {
+        log("No firmware URL specified", "log-error");
+        return;
+      }
+
+      try {
+        btnFlash.disabled = true;
+        PROGRESS_WRAP.classList.add("active");
+        setProgress(0);
+        log("Downloading firmware...", "log-step");
+
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error("Download failed: " + resp.status);
+        const buf = await resp.arrayBuffer();
+        const data = new Uint8Array(buf);
+        log("Downloaded " + data.length + " bytes", "log-success");
+
+        setProgress(10);
+        log("Flashing...", "log-step");
+
+        await esploader.writeFlash({
+          fileArray: [{ data, address: 0x0 }],
+          flashSize: "keep",
+          flashMode: "keep",
+          flashFreq: "keep",
+          compress: true,
+          reportProgress: (fileIndex, written, total) => {
+            const pct = 10 + (written / total) * 90;
+            setProgress(pct);
+          },
+        });
+
+        setProgress(100);
+        log("Flash complete!", "log-success");
+        log("Resetting device...", "log-step");
+        await esploader.hardReset();
+        log("Done. Device is running.", "log-success");
+      } catch (e) {
+        log("Flash failed: " + e.message, "log-error");
+      } finally {
+        btnFlash.disabled = false;
+        setTimeout(() => PROGRESS_WRAP.classList.remove("active"), 2000);
+      }
+    };
+
+    btnErase.onclick = async () => {
+      try {
+        btnErase.disabled = true;
+        log("Erasing flash...", "log-step");
+        await esploader.eraseFlash();
+        log("Flash erased.", "log-success");
+      } catch (e) {
+        log("Erase failed: " + e.message, "log-error");
+      } finally {
+        btnErase.disabled = false;
+      }
+    };
+
+    btnDisconnect.onclick = async () => {
+      try {
+        if (transport) await transport.disconnect();
+      } catch (_) {}
+      device = null;
+      transport = null;
+      esploader = null;
+      chipName = null;
+      setStatus("Not connected", false);
+      CONNECT_SECTION.style.display = "block";
+      FLASH_SECTION.style.display = "none";
+      log("Disconnected.", "log-info");
+    };
+  </script>
+</body>
+</html>
