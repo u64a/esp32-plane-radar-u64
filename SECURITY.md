@@ -9,7 +9,7 @@ should be treated as supported.
 ## Reporting a vulnerability
 
 Do not open a public issue for a suspected vulnerability. Use
-[GitHub private vulnerability reporting](https://github.com/NZCypher819/esp32-plane-radar-u64/security/advisories/new)
+[GitHub private vulnerability reporting](https://github.com/u64a/esp32-plane-radar-u64/security/advisories/new)
 so details and proof-of-concept material remain private until a fix is ready.
 
 Please include the affected commit or release, hardware variant, impact,

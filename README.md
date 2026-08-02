@@ -1,7 +1,7 @@
 # Plane Radar
 
-[![Certified Firmware CI](https://github.com/NZCypher819/esp32-plane-radar-u64/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/NZCypher819/esp32-plane-radar-u64/actions/workflows/ci.yml)
-[![Firmware Release](https://github.com/NZCypher819/esp32-plane-radar-u64/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/NZCypher819/esp32-plane-radar-u64/actions/workflows/release.yml)
+[![Certified Firmware CI](https://github.com/u64a/esp32-plane-radar-u64/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/u64a/esp32-plane-radar-u64/actions/workflows/ci.yml)
+[![Firmware Release](https://github.com/u64a/esp32-plane-radar-u64/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/u64a/esp32-plane-radar-u64/actions/workflows/release.yml)
 
 <img width="800" height="450" alt="plane-radar" src="https://github.com/user-attachments/assets/716d0992-dab8-47ba-8f1a-2aec7f607419" />
 
@@ -985,7 +985,7 @@ Verify a downloaded firmware file's workflow provenance with:
 
 ```powershell
 gh attestation verify .\plane-radar-esp32c3-*-firmware-merged.bin `
-  --repo NZCypher819/esp32-plane-radar-u64
+  --repo u64a/esp32-plane-radar-u64
 ```
 
 Build + merge + proof + package all five envs under `release/<sha>/`:
